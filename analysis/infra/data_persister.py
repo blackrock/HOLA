@@ -21,8 +21,8 @@ from pyarrow import Table
 from pyarrow.parquet import ParquetDataset, write_to_dataset
 
 set_option("display.width", 3000)
-set_option("max_columns", 80)
-set_option("max_colwidth", None)
+set_option("display.max_columns", 80)
+set_option("display.max_colwidth", None)
 
 
 class Analysis(SchemaModel):
