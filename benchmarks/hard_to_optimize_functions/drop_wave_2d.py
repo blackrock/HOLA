@@ -18,7 +18,7 @@ import numpy.typing as npt
 
 def drop_wave(x1: float, x2: float) -> float:
     """https://www.sfu.ca/~ssurjano/drop.html."""
-    sq_sum = x1 ** 2 + x2 ** 2
+    sq_sum = x1**2 + x2**2
     numerator = 1 + np.cos(12 * np.sqrt(sq_sum))
     denominator = 0.5 * sq_sum + 2
     return cast(float, -numerator / denominator)

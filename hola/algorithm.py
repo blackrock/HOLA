@@ -200,7 +200,7 @@ class HOLA:  # pylint: disable=too-many-instance-attributes
         self.objective_scalarizer = ObjectiveScalarizer(self.objectives_config)
         self.leaderboard = Leaderboard(self.param_transformer, self.objective_scalarizer)
         # Sampling params
-        self.min_samples = max((num_params ** 2) if min_samples is None else min_samples, 10 * num_params)
+        self.min_samples = max((num_params**2) if min_samples is None else min_samples, 10 * num_params)
         self.top_frac = top_frac
         # Samplers
         self.sampler_explore: Sampler

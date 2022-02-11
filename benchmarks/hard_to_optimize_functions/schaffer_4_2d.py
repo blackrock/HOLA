@@ -16,8 +16,8 @@ import numpy.typing as npt
 
 def schaffer_4(x1: float, x2: float) -> float:
     """https://www.sfu.ca/~ssurjano/schaffer4.html."""
-    numerator = np.cos(np.sin(np.abs(x1 ** 2 - x2 ** 2))) ** 2 - 0.5
-    denominator = (1 + 0.001 * (x1 ** 2 + x2 ** 2)) ** 2
+    numerator = np.cos(np.sin(np.abs(x1**2 - x2**2))) ** 2 - 0.5
+    denominator = (1 + 0.001 * (x1**2 + x2**2)) ** 2
     return cast(float, 0.5 + numerator / denominator)
 
 

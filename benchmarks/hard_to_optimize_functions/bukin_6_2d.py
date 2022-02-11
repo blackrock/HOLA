@@ -18,7 +18,7 @@ import numpy.typing as npt
 
 def bukin_6(x1: float, x2: float) -> float:
     """https://www.sfu.ca/~ssurjano/bukin6.html."""
-    res = 100 * np.sqrt(np.abs(x2 - 0.01 * x1 ** 2)) + 0.01 * np.abs(x1 + 10)
+    res = 100 * np.sqrt(np.abs(x2 - 0.01 * x1**2)) + 0.01 * np.abs(x1 + 10)
     return cast(float, res)
 
 

@@ -16,7 +16,7 @@ import numpy.typing as npt
 
 def cross_in_tray(x1: float, x2: float) -> float:
     """https://www.sfu.ca/~ssurjano/crossit.html."""
-    res = -0.0001 * (np.abs(100 - np.sqrt(x1 ** 2 + x2 ** 2) / np.pi) + 1) ** 0.1
+    res = -0.0001 * (np.abs(100 - np.sqrt(x1**2 + x2**2) / np.pi) + 1) ** 0.1
     return cast(float, res)
 
 

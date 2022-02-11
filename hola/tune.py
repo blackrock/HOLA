@@ -29,7 +29,7 @@ def tune(
     objectives: ObjectivesSpec,
     num_runs: int = 100,
     n_jobs: int = 1,
-    min_samples: int | None = None
+    min_samples: int | None = None,
 ) -> Tuner:
     """
     :param func: multi-objective function to minimize, takes in float arguments and returns a dictionary

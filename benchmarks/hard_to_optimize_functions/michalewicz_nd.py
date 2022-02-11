@@ -24,6 +24,6 @@ def michalewicz(x: Union[float, Iterable[float]], m: float = 10) -> float:
             raise AssertionError("Invalid shape")
     else:
         n_dimensions = 1
-    terms = [np.sin(x) * np.power(np.sin(i * x ** 2 / np.pi), 2 * m) for i in range(1, n_dimensions + 1)]
+    terms = [np.sin(x) * np.power(np.sin(i * x**2 / np.pi), 2 * m) for i in range(1, n_dimensions + 1)]
     res = -np.sum(terms)
     return cast(float, res)

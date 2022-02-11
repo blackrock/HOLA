@@ -18,14 +18,14 @@ def branin(
     x1: float,
     x2: float,
     a: float = 1,
-    b: float = 5.1 / (4 * np.pi ** 2),
+    b: float = 5.1 / (4 * np.pi**2),
     c: float = 5 / np.pi,
     r: float = 6,
     s: float = 10,
     t: float = 1 / (8 * np.pi),
 ) -> float:
     """https://www.sfu.ca/~ssurjano/branin.html."""
-    res = a * (x2 - b * x1 ** 2 + c * x1 - r) ** 2 + s * (1 - t) * np.cos(x1) + s
+    res = a * (x2 - b * x1**2 + c * x1 - r) ** 2 + s * (1 - t) * np.cos(x1) + s
     return cast(float, res)
 
 
