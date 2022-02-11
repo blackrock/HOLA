@@ -16,7 +16,7 @@ import numpy.typing as npt
 
 def holder_table(x1: float, x2: float) -> float:
     """https://www.sfu.ca/~ssurjano/holder.html."""
-    res = -np.abs(np.sin(x1) * np.cos(x2) * np.exp(np.abs(1 - np.sqrt(x1 ** 2 + x2 ** 2) / np.pi)))
+    res = -np.abs(np.sin(x1) * np.cos(x2) * np.exp(np.abs(1 - np.sqrt(x1**2 + x2**2) / np.pi)))
     return cast(float, res)
 
 

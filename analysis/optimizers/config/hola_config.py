@@ -67,7 +67,7 @@ class HolaConfig:  # pylint: disable=too-many-instance-attributes
         # pylint: disable=too-many-branches,too-many-return-statements,too-many-statements
         if configuration == 1:
             return cls(
-                min_samples=max(n_dim ** 2, 20),
+                min_samples=max(n_dim**2, 20),
                 configuration=configuration,
                 optimizer="hola",
                 gmm_sampler="sobol",
@@ -103,7 +103,7 @@ class HolaConfig:  # pylint: disable=too-many-instance-attributes
             )
         if configuration == 4:
             return cls(
-                min_samples=max(n_dim ** 2, 20),
+                min_samples=max(n_dim**2, 20),
                 configuration=configuration,
                 optimizer="hola",
                 gmm_sampler="uniform",
@@ -127,7 +127,7 @@ class HolaConfig:  # pylint: disable=too-many-instance-attributes
             )
         if configuration == 6:
             return cls(
-                min_samples=max(n_dim ** 2, 20),
+                min_samples=max(n_dim**2, 20),
                 configuration=configuration,
                 optimizer="hola",
                 gmm_sampler="uniform",
@@ -163,7 +163,7 @@ class HolaConfig:  # pylint: disable=too-many-instance-attributes
             )
         if configuration == 9:  # bad
             return cls(
-                min_samples=max(n_dim ** 2, 20),
+                min_samples=max(n_dim**2, 20),
                 configuration=configuration,
                 optimizer="hola",
                 gmm_sampler="uniform",
@@ -175,7 +175,7 @@ class HolaConfig:  # pylint: disable=too-many-instance-attributes
             )
         if configuration == 10:  # bad
             return cls(
-                min_samples=max(n_dim ** 2, 20),
+                min_samples=max(n_dim**2, 20),
                 configuration=configuration,
                 optimizer="hola",
                 gmm_sampler="uniform",

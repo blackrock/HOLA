@@ -28,7 +28,7 @@ def _rastrigin_term(x: Iterable[float]) -> npt.NDArray[np.floating]:
 
 def _rastrigin_term(x: Union[float, Iterable[float]]) -> Union[float, npt.NDArray[np.floating]]:
     x_array: Union[float, npt.NDArray[np.floating]] = np.array(x) if isinstance(x, Iterable) else x
-    return x_array ** 2 - 10 * np.cos(2 * np.pi * x_array)
+    return x_array**2 - 10 * np.cos(2 * np.pi * x_array)
 
 
 def rastrigin(x: Union[float, Iterable[float]]) -> float:
