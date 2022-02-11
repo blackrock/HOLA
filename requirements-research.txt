@@ -1,0 +1,8 @@
+returns
+hyperopt
+pymoo
+scikit-optimize
+pandera
+pyarrow
+ray[tune]
+plotly

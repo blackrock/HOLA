@@ -1,0 +1,88 @@
+[tool.isort]
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+line_length = 120
+
+[tool.pylint.MASTER]
+extension-pkg-whitelist = "pydantic"
+
+[tool.pylint.FORMAT]
+max-line-length = 120
+disable = [
+    "E0401", # import-error
+
+    "C0114", # missing-module-docstring
+    "C0115", # missing-class-docstring
+    "C0116", # missing-function-docstring
+    "C0321", # multiple-statements
+
+    "W1202", # logging-format-interpolation
+    "W1203", # logging-fstring-interpolation
+    "W0511", # fixme_ (and todo_)
+
+    "R0913", # too-many-arguments
+    "R0903", # too-few-public-methods
+    "R0901", # too-many-ancestors
+
+    "C0236", # bad-whitespace - will be deprecated soon
+    "C0326", # bad-continuation - will be deprecated soon
+
+    "no-member", # TEMPORARY, pylint 2.7.2 throws lots of false positives
+    "unsubscriptable-object", # TEMPORARY, pylint 2.7.4 throws false positives with Generic ABCs
+]
+
+[tool.pylint.BASIC]
+good-names = [
+    "T",
+    "T_co",
+    "S",
+    "F",
+    "df",
+    "i",
+    "j",
+    "db",
+    "ax",
+    "qa",
+    "s3",
+    "x",
+    "y",
+    "xs",
+    "ts",
+    "x1",
+    "x2",
+    "t",
+    "a",
+    "b",
+    "c",
+    "d",
+    "f",
+    "n",
+    "on",
+    "by",
+    "u",
+    "r",
+    "s",
+    "m",
+    "dd",
+    "r2",
+]
+
+
+[tool.pylint.SIMILARITIES]
+# Min similarity lines=15, sometimes the (overloaded) signatures can be more than 6 lines long. 15 should be enough.
+min-similarity-lines = 10
+ignore-comments = "yes"
+ignore-docstrings = "yes"
+ignore-imports = "yes"
+
+[tool.pytest.ini_options]
+addopts = "--cov=hola --doctest-modules -vv --durations=3 --cache-clear --cov-fail-under=65"
+
+[tool.black]
+line-length = 120
+
+[tool.bandit]
+skips = ["B101"]

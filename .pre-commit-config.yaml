@@ -1,0 +1,68 @@
+exclude: (^asv_bench|setup.py|requirements-dev.txt)
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v3.3.0
+    hooks:
+      - id: check-ast
+        description: Simply check whether files parse as valid python
+      - id: check-case-conflict
+        description: Check for files that would conflict in case-insensitive filesystems
+      - id: check-docstring-first
+        description: Checks for a common error of placing code before the docstring.
+      - id: check-merge-conflict
+        description: Check for files that contain merge conflict strings
+      - id: check-yaml
+        description: Attempts to load all yaml files to verify syntax
+      - id: debug-statements
+        description: Check for debugger imports and py37+ breakpoint() calls in python source
+      - id: end-of-file-fixer
+        description: Makes sure files end in a newline and only a newline
+      - id: trailing-whitespace
+        description: Trims trailing whitespace
+      - id: mixed-line-ending
+        description: Replaces or checks mixed line ending
+
+  - repo: https://github.com/myint/docformatter
+    rev: ''
+    hooks:
+      - id: docformatter
+        args: [ "--wrap-summaries=120", "--wrap-descriptions=120" ]
+
+  - repo: https://github.com/pre-commit/mirrors-isort
+    rev: ''
+    hooks:
+      - id: isort
+        args: ["--settings-path pyproject.toml"]
+
+  - repo: https://github.com/ikamensh/flynt
+    rev: ''
+    hooks:
+        - id: flynt
+
+  - repo: https://github.com/psf/black
+    rev: ''
+    hooks:
+      - id: black
+        args: ["-l 120"]
+
+  - repo: https://github.com/pycqa/pylint
+    rev: ''
+    hooks:
+      - id: pylint
+        args: ["--disable=import-error"]
+        exclude: (^docs/|^scripts)
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: ''
+    hooks:
+      - id: mypy
+        entry: mypy .
+        pass_filenames: false
+        additional_dependencies:
+        - pydantic
+        - numpy
+        - returns
+        - types-click
+        - types-pyyaml
+        - types-pkg_resources

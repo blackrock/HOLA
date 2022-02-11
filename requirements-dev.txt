@@ -1,0 +1,33 @@
+# type check
+mypy
+
+# format
+isort[colors]
+docformatter
+autoflake
+flynt
+nbstripout
+black[jupyter]
+
+# lint
+flake8
+flake8-markdown
+flake8-nb
+pydocstyle
+pylint
+bandit
+shellcheck-py
+yamllint
+rstcheck
+# shfmt-py
+
+# test
+pytest>=5.3.0
+pytest-cov
+
+
+# multi-env
+# nox
+
+# requirements
+pipreqs

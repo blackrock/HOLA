@@ -1,0 +1,166 @@
+#!/usr/bin/env python
+# pylint: disable=unused-argument
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+from wsgiref import simple_server
+
+import falcon
+
+from hola.algorithm import HOLA
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "-d",
+    "--dir",
+    default=".",
+    help="Directory to look for previous simulation results,\
+or to save new simulation results, must contain a laho_params.json and laho_objectives.json file\
+optionally can contain a laho_results.csv file to restore a previous experiment",
+)
+parser.add_argument("-p", "--port", default="8675", type=int)
+parser.add_argument("-m", "--min_samples", default=0, type=int)
+
+args = parser.parse_args()
+
+
+class HomeResource:
+    def __init__(self, laho: HOLA):
+        self.laho = laho
+
+    def on_get(self, req, resp):
+        self.laho.leaderboard.sort_samples()
+        table = self.laho.get_leaderboard().to_html()
+
+        html = f"<html><body>{table}</body></html>"
+
+        resp.text = html
+        resp.content_type = falcon.MEDIA_HTML
+        resp.status = falcon.HTTP_200
+        return resp
+
+
+class ReportRequestResource:
+    def __init__(self, laho: HOLA, output_file: str | Path):
+        self.laho = laho
+        self.output_file = output_file
+
+    def on_get(self, req, resp, num_samples=None):
+        if num_samples is None:
+            p = self.laho.sample()
+            resp.media = p
+        else:
+            samps = [self.laho.sample() for i in range(num_samples)]
+            resp.media = samps
+        resp.status = falcon.HTTP_200
+        resp.content_type = falcon.MEDIA_JSON
+        return resp
+
+    def on_post(self, req, resp, num_samples=None):
+        # data = req.media
+        data = json.load(req.bounded_stream)
+        print("data", data)
+        if isinstance(data, list):
+            for t in data:
+                params = t["params"]
+                objs = t["objectives"]
+                print(params, objs)
+                self.laho.add_run(objs, params)
+            self.laho.save(self.output_file)
+        elif isinstance(data, dict):
+            params = data.get("params")
+            objs = data.get("objectives")
+            if params is not None and objs is not None:
+                self.laho.add_run(objs, params)
+                self.laho.save(self.output_file)
+        if num_samples is None:
+            p = self.laho.sample()
+            resp.media = p
+        else:
+            samps = [self.laho.sample() for i in range(num_samples)]
+            resp.media = samps
+        resp.content_type = falcon.MEDIA_JSON
+        resp.status = falcon.HTTP_200
+        return resp
+
+
+class ExperimentResource:
+    def __init__(self, laho: HOLA):
+        self.laho = laho
+
+    def on_get(self, req, resp):
+        resp.media = {"params_config": self.laho.params_config, "objectives_config": self.laho.leaderboard.obj_config}
+        resp.status = falcon.HTTP_200
+        resp.content_type = falcon.MEDIA_JSON
+        return resp
+
+    def on_post(self, req, resp):
+        # data = req.media
+        data = json.load(req.bounded_stream)
+        objs_config = data.get("objectives_config")
+
+        self.laho.set_objectives(objs_config)  # Used to be obj_config from outer cope
+        resp.status = falcon.HTTP_200
+        resp.content_type = falcon.MEDIA_JSON
+
+        return resp
+
+
+class ParamResource:
+    def __init__(self, laho: HOLA):
+        self.laho = laho
+
+    def on_get(self, req, resp):
+        resp.media = self.laho.get_best_params()
+        resp.status = falcon.HTTP_200
+        resp.content_type = falcon.MEDIA_JSON
+
+        return resp
+
+
+if __name__ == "__main__":
+    OUTPUT_DIR = os.path.abspath(args.dir)
+
+    if not os.path.isdir(OUTPUT_DIR):
+        raise RuntimeError(f"output directory {OUTPUT_DIR} does not exist or is not a directory")
+
+    PARAMS_FILE = os.path.join(OUTPUT_DIR, "laho_params.json")
+    OBJ_FILE = os.path.join(OUTPUT_DIR, "laho_objectives.json")
+
+    if not os.path.isfile(PARAMS_FILE):
+        raise RuntimeError(f"Hyper-parameter config file {PARAMS_FILE} does not exist")
+
+    with open(PARAMS_FILE, "r", encoding="utf-8") as f:
+        params_config = json.load(f)
+
+    if not os.path.isfile(OBJ_FILE):
+        raise RuntimeError(f"Hyper-parameter config file {OBJ_FILE} does not exist")
+
+    with open(OBJ_FILE, "r", encoding="utf-8") as f:
+        obj_config = json.load(f)
+
+    min_samples = args.min_samples if args.min_samples > 0 else None
+
+    experiment = HOLA(params_config, obj_config, min_samples=min_samples)
+
+    RESULTS_FILE = os.path.join(OUTPUT_DIR, "laho_results.csv")
+    if os.path.isfile(RESULTS_FILE):
+        experiment.load(RESULTS_FILE)
+
+    app = application = falcon.App()
+    app.add_route("/", HomeResource(experiment))
+    app.add_route("/report_request", ReportRequestResource(experiment, RESULTS_FILE))
+    app.add_route("/report_request/{num_samples:int}", ReportRequestResource(experiment, RESULTS_FILE))
+
+    app.add_route("/experiment", ExperimentResource(experiment))
+    app.add_route("/param", ParamResource(experiment))
+
+    server = simple_server.make_server("127.0.0.1", args.port, app)
+    server.timeout = 1
+    print(f"listening on port {args.port}...")
+
+    while True:
+        server.handle_request()

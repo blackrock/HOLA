@@ -1,0 +1,59 @@
+---
+trigger:
+  branches:
+    include:
+      - "*"
+
+schedules:
+  - cron: "12 3 * * 1,4"
+    displayName: Bi-weekly check
+    branches:
+      include:
+        - master
+    always: true
+
+pool:
+  name: default
+  demands:
+    - python3
+
+
+stages:
+  - stage: install_deps
+    dependsOn: []
+    displayName: "CI"
+    jobs:
+      - job: static_analysis
+        displayName: Static Analysis
+        steps:
+          - template: ../templates/pyenv_install.yml
+          - script: |
+              set +x
+              which pip
+              which python
+              echo "##vso[task.setvariable variable=PYTHONPATH].env:${PYTHONPATH}"
+              echo "##vso[task.setvariable variable=PATH].env/bin:${PATH}"
+              make env # extra_pip_flags="--target .env"
+            displayName: pip install
+          - script: |
+              echo $PYTHONPATH
+              echo $PATH
+              make lint
+            displayName: lint
+      - job: tests
+        displayName: Tests
+        steps:
+          - template: ../templates/pyenv_install.yml
+          - script: |
+              set +x
+              which pip
+              which python
+              echo "##vso[task.setvariable variable=PYTHONPATH].env:${PYTHONPATH}"
+              echo "##vso[task.setvariable variable=PATH].env/bin:${PATH}"
+              make env extra_pip_flags="--target .env"
+            displayName: pip install
+          - script: |
+              echo $PYTHONPATH
+              echo $PATH
+              make test
+            displayName: test

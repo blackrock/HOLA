@@ -1,0 +1,12 @@
+{
+    "r_squared":{
+        "target":1.0,
+        "limit":0.0,
+        "priority":2.0
+    },
+    "abs_error":{
+        "target":0,
+        "limit":1000,
+        "priority":0.5
+    }
+}

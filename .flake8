@@ -1,0 +1,9 @@
+[flake8]
+exclude = .git,__pycache__
+max-line-length = 120
+extend-ignore = E203
+
+[flake8_nb]
+exclude = .git,__pycache__
+max-line-length = 120
+extend-ignore = E203

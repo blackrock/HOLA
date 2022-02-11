@@ -1,0 +1,25 @@
+parameters:
+  - name: python_version
+    type: string
+    default: 3.8.12
+
+steps:
+  - script: |
+      echo "##vso[task.setvariable variable=PYENV_ROOT]$(pwd)/ci_pyenv"
+      echo "##vso[task.setvariable variable=PYENV_BIN]$(pwd)/ci_pyenv/bin/pyenv"
+    displayName: set pyenv env vars
+  - script: |
+      set +x
+      echo $PYENV_ROOT
+      echo $PYENV_BIN
+      git clone https://github.com/pyenv/pyenv $PYENV_ROOT
+      /usr/bin/scl enable devtoolset-7 -- $PYENV_BIN install ${{ parameters.python_version }}
+    displayName: pyenv install
+  - script: |
+      set +x
+      ls $PYENV_ROOT/versions/${{ parameters.python_version }}/bin
+      $PYENV_ROOT/versions/${{ parameters.python_version }}/bin/python --version
+    displayName: check python
+  - script: |
+      echo "##vso[task.setvariable variable=PATH]$PYENV_ROOT/versions/${{ parameters.python_version }}/bin:${PATH}"
+    displayName: add python to path
