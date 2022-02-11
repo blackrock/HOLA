@@ -1,7 +1,7 @@
 ONPY=hola/ tests/ benchmarks/ analysis/
 ONNB=notebooks/
 ONSH=*.sh
-ONYML=.azuredevops *.yaml
+ONYML=.azuredevops .github *.yaml
 
 BLACK_FLAGS=--config pyproject.toml
 ISORT_FLAGS=--settings-path pyproject.toml
