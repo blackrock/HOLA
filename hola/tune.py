@@ -125,8 +125,8 @@ def _func_helper(pool_args: _PoolArgs) -> dict[str, float]:
 
 def safe_n_components(proposed_n_components: int, min_samples: int, top_frac: float) -> int:
     max_components = int(min_samples * top_frac)
-    if max_components == 0:
-        return 1
+    if max_components <= 1:
+        return 2
     if max_components < proposed_n_components:
         return max_components
     return proposed_n_components

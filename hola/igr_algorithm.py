@@ -93,20 +93,22 @@ class IterativeGridRefinement:
         self.spacing = spacing
 
     def tune(
-        self, func: Callable[[Iterable[float]], TNum] | Callable[[Sequence[float]], TNum], max_generations: int
+        self, func: Callable[[Iterable[float]], TNum] | Callable[[Sequence[float]], TNum], max_iterations: int
     ) -> Evaluation[TNum]:
         """Tune the given function, stopping after max_generations generations.
 
         A generation calls func many times.
         """
         hypercube = Hypercube.unit(self.params_config)
-        print("IRG number of iterations:", self.get_number_of_iterations(max_generations))
+        max_generations = self.get_number_of_generations(max_iterations)
+        assert self.get_number_of_iterations(max_generations) >= max_iterations
+        iteration = 0
         params_tried: set[tuple[float, ...]] = set()
+        evaluations: MutableMapping[Generation, list[Evaluation]] = defaultdict(list)
         for generation in range(max_generations):
             # Find lattices in the normalized hypercube
             norm_samples = hypercube.get_lattices(self.spacing)
             # Map params back to their domain and evaluate the function
-            evaluations: MutableMapping[Generation, list[Evaluation]] = defaultdict(list)
             for sample in norm_samples:
                 denorm_params = {
                     param_name: config.transform_param(sample[param_name])
@@ -117,6 +119,11 @@ class IterativeGridRefinement:
                     res = func(params_to_try)
                     evaluations[generation].append(Evaluation(denorm_params, res))
                     params_tried.add(params_to_try)
+                    iteration += 1
+                    if iteration >= max_iterations:
+                        return self.get_best_evaluation(evaluations)
+            if not evaluations[generation]:
+                break
             best_evaluation_in_generation = min(evaluations[generation])
             # Shrink hypercube around the normalized best params of this generation
             hypercube = hypercube.shrink_around(
@@ -126,8 +133,17 @@ class IterativeGridRefinement:
                 },
                 self.spacing,
             )
-        return min(min(evals) for evals in evaluations.values())
+        return self.get_best_evaluation(evaluations)
 
     def get_number_of_iterations(self, max_generations: int) -> int:
-        """Used to probe the number of iterations since IRG is defined in terms of generations."""
+        """Used to probe the number of iterations since IGR is defined in terms of generations."""
         return cast(int, (self.spacing + 1) ** self.num_params * max_generations)
+
+    def get_number_of_generations(self, max_iterations: int) -> int:
+        """Used to find the number of generations since IGR refines in generations."""
+        res = max_iterations // ((self.spacing + 1) ** self.num_params)
+        return cast(int, res + 1)
+
+    @staticmethod
+    def get_best_evaluation(evaluations: MutableMapping[Generation, list[Evaluation]]) -> Evaluation:
+        return min(min(evals) for evals in evaluations.values() if evals)
