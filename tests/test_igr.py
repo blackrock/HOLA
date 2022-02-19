@@ -75,12 +75,11 @@ def test_igr_tune() -> None:
         return x[0] ** 2 + 2 * x[0] * x[1] + x[1] ** 2
 
     params = {f"x{i}": ParamConfig(min=-10, max=10) for i in range(1, 3)}
-    assert IterativeGridRefinement(params, spacing=2).tune(quadratic, max_generations=1) == Evaluation(
-        params={"x1": -10.0, "x2": 10.0}, val=0.0
-    )
-    assert IterativeGridRefinement(params, spacing=4).tune(quadratic, max_generations=3) == Evaluation(
-        params={"x1": -9.6875, "x2": 9.6875}, val=0.0
-    )
-    assert IterativeGridRefinement(params, spacing=10).tune(quadratic, max_generations=3) == Evaluation(
+    igr1 = IterativeGridRefinement(params, spacing=2)
+    assert igr1.tune(quadratic, max_iterations=9) == Evaluation(params={"x1": -10.0, "x2": 10.0}, val=0.0)
+    igr2 = IterativeGridRefinement(params, spacing=4)
+    assert igr2.tune(quadratic, max_iterations=75) == Evaluation(params={"x1": -9.6875, "x2": 9.6875}, val=0.0)
+    igr3 = IterativeGridRefinement(params, spacing=10)
+    assert igr3.tune(quadratic, max_iterations=363) == Evaluation(
         params={"x1": -9.91, "x2": 9.909999999999997}, val=-1.4210854715202004e-14
     )

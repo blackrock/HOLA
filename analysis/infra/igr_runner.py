@@ -70,21 +70,13 @@ def get_igr_values() -> pat.DataFrame[Analysis]:
     for bench in BENCHMARKS:
         print(f"Function: {bench.func}")
         tuner = IterativeGridRefinement(bench.params, spacing=4)
-        for generations in [1, 2, 3, 4, 8, 12, 20]:
-            best = tuner.tune(bench.func, max_generations=generations)
-            dfs.append(
-                Analysis.build_row(
-                    bench.name, "IGR", 0, tuner.get_number_of_iterations(generations), best.val, str(best.params)
-                )
-            )
+        for iterations in [25, 50, 75, 100, 200, 300, 500, 1000]:
+            best = tuner.tune(bench.func, max_iterations=iterations)
+            dfs.append(Analysis.build_row(bench.name, "IGR", 0, iterations, best.val, str(best.params)))
         tuner = IterativeGridRefinement(bench.params, spacing=9)
-        for generations in [1, 2, 3, 5]:
-            best = tuner.tune(bench.func, max_generations=generations)
-            dfs.append(
-                Analysis.build_row(
-                    bench.name, "IGR", 1, tuner.get_number_of_iterations(generations), best.val, str(best.params)
-                )
-            )
+        for iterations in [25, 50, 75, 100, 200, 300, 500, 1000]:
+            best = tuner.tune(bench.func, max_iterations=iterations)
+            dfs.append(Analysis.build_row(bench.name, "IGR", 1, iterations, best.val, str(best.params)))
     df = concat(dfs, ignore_index=True)
     return cast(pat.DataFrame[Analysis], df)
 

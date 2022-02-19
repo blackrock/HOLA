@@ -20,27 +20,28 @@ from analysis.infra.data_persister import Analysis2
 DEFAULT_DIRECTORY = Path(__file__).parents[1] / "plots"
 
 
+RENAMING = {
+    "GA @ 3": "GeneticAlgo",
+    "NelderMead @ 0": "NelderMead",
+    "hooke @ 0": "HookeJeeves",
+    "random_search @ 0": "RandSearch",
+    "random_search @ 1": "RandSearchX2",
+    "sobol @ 0": "Sobol",
+    "hola @ 49": "HOLA",
+    "tpe @ 0": "TPE",
+    "PSO @ 0": "PSO",
+    "IGR @ 0": "IGR",
+}
+
+
 def prepare_data(df: pat.DataFrame[Analysis2]) -> DataFrame:
     # RandomSearch Config 1 is double budget -> on the plot make it the same
     double_budget = (df["optimizer"] == "random_search") & (df["configuration"] == 1)
     df.loc[double_budget, "num_iterations"] /= 2
 
     df["optimizer_cfg"] = df["optimizer"] + " @ " + df["configuration"].astype(str)
-    df = df.sort_values(["benchmark", "num_iterations"])
-    df["num_iterations"] = df["num_iterations"].astype(str)  # Make num iterations appear as categorical
-    df = df.replace(
-        {
-            "GA @ 1": "GeneticAlgo",
-            "NelderMead @ 0": "NelderMead",
-            "hooke @ 0": "HookeJeeves",
-            "random_search @ 0": "RandSearch",
-            "random_search @ 1": "RandSearchX2",
-            "sobol @ 0": "Sobol",
-            "hola @ 49": "HOLA",
-            "tpe @ 0": "TPE",
-            "PSO @ 0": "PSO",
-        }
-    )
+    df = df.replace(RENAMING).sort_values(["benchmark", "num_iterations", "optimizer_cfg"])
+    df["num_iterations"] = df["num_iterations"].astype(int).astype(str)  # Make num iterations appear as categorical
     return df
 
 
@@ -68,7 +69,7 @@ def generate_box_plots_by_num_iterations_per_benchmark(
         )
         fig.write_html(directory / f"{key}.html")
         fig.update_layout(width=1200, height=500, autosize=False)
-        fig.write_image(directory / f"{key}.svg")
+        fig.write_image(directory / f"{key}.jpg", scale=10)
 
 
 def generate_box_plots_per_benchmark_and_num_iterations(

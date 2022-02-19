@@ -25,4 +25,6 @@ class GAConfig:
             return cls(pop_size=5, configuration=config)
         if config == 2:
             return cls(pop_size=10, configuration=config)
+        if config == 3:
+            return cls(pop_size=25, configuration=config)
         raise ValueError(f"Invalid config number for {cls}")

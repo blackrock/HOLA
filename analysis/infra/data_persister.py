@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import pandera as pa
 import pandera.typing as pat
@@ -83,10 +84,8 @@ class ResearchDataset:
         return compute_stats(self.read_data())
 
 
-def compute_stats(df: pat.DataFrame[Analysis2]) -> DataFrame:
-    group = df.groupby([Analysis.benchmark, Analysis.num_iterations, Analysis.optimizer, Analysis.configuration])[
-        Analysis.best
-    ]
+def compute_stats(df: pat.DataFrame[Analysis2], col: str = Analysis2.best) -> DataFrame:
+    group = df.groupby([Analysis.benchmark, Analysis.num_iterations, Analysis.optimizer, Analysis.configuration])[col]
     return DataFrame(
         {
             "mean": group.mean(),
@@ -96,3 +95,24 @@ def compute_stats(df: pat.DataFrame[Analysis2]) -> DataFrame:
             "median": group.median(),
         }
     )
+
+
+def normalize(
+    data: pat.DataFrame[Analysis2],
+    by: Iterable[str] | None = (Analysis2.benchmark, Analysis2.num_iterations),
+    on: str = Analysis2.best,
+) -> DataFrame:
+    scored = data.copy()
+    min_col, max_col = f"min_of_{on}", f"max_of_{on}"
+    group = scored.groupby(list(by) if by is not None else None)[on]
+    scored[min_col], scored[max_col] = group.transform("min"), group.transform("max")
+    scored["score"] = (scored[on] - scored[min_col]) / (scored[max_col] - scored[min_col])
+    return scored.drop(columns=[min_col, max_col])
+
+
+def compute_stats_of_normalized(data: pat.DataFrame[Analysis2]) -> DataFrame:
+    score_stats = compute_stats(normalize(data), col="score").reset_index()
+    df = score_stats.pivot(index=["num_iterations", "optimizer", "configuration"], columns="benchmark", values="mean")
+    df["mean_of_scores"] = df.mean(axis=1)
+    df = df.sort_values(["num_iterations", "mean_of_scores"], ascending=[False, True])
+    return df
