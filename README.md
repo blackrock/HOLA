@@ -7,7 +7,7 @@ existing code.
 
 ## Installation
 ```bash
-pip install git+ssh://git@ssh.dev.azure.com/v3/1A4D/AI%20Labs/hola
+pip install git+https://github.com/blackrock/HOLA.git
 ```
 
 ## Example
