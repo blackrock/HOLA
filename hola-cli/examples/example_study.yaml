@@ -1,0 +1,46 @@
+# Example study configuration showing all parameter types.
+
+space:
+  learning_rate:
+    type: continuous
+    min: 0.0001
+    max: 0.1
+    scale: log10
+
+  num_layers:
+    type: discrete
+    min: 1
+    max: 10
+
+  optimizer:
+    type: categorical
+    choices:
+      - adam
+      - sgd
+      - rmsprop
+      - adamw
+
+  momentum:
+    type: continuous
+    min: 0.5
+    max: 0.99
+
+objectives:
+  - field: loss
+    type: minimize
+    priority: 1.0
+  - field: latency
+    type: minimize
+    target: 100
+    limit: 500
+    priority: 0.5
+
+strategy:
+  type: gmm               # "gmm" (default), "sobol", or "random"
+  refit_interval: 20
+
+# Optional: automatic checkpointing
+# checkpoint:
+#   directory: ./checkpoints
+#   interval: 50
+#   max_checkpoints: 5

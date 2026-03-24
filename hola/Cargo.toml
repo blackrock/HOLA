@@ -1,0 +1,33 @@
+[package]
+name = "hola"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[features]
+default = []
+server = ["axum", "tokio-stream", "tower-http"]
+
+[dependencies]
+opt_engine = { version = "0.1.0", path = "../opt_engine" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+rand = "0.9"
+chrono = "0.4"
+axum = { version = "0.8", optional = true }
+tokio-stream = { version = "0.1", features = ["sync"], optional = true }
+tower-http = { version = "0.6.8", features = ["cors", "fs"], optional = true }
+
+[dev-dependencies]
+opt_engine = { version = "0.1.0", path = "../opt_engine" }
+serde_yaml = "0.9"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+hyper = "1"
+
+# Enable server feature in tests so we can test the REST API
+[dev-dependencies.hola]
+path = "."
+features = ["server"]

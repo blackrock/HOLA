@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = [
+    "opt_engine",
+    "hola",
+    "hola-py",
+    "hola-cli",
+]
