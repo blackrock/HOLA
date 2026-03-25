@@ -96,11 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             hola::server::serve(engine, port, dashboard.as_deref()).await?;
         }
-        Commands::Worker {
-            server,
-            exec,
-            mode,
-        } => {
+        Commands::Worker { server, exec, mode } => {
             let exec_mode = mode == "exec";
             eprintln!("Worker connecting to {server} ({mode} mode)...");
             eprintln!("Will execute: {exec}");
