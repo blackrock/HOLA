@@ -25,7 +25,7 @@ jobs:
             target: x86_64
           - os: ubuntu-latest
             target: aarch64
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64
           - os: macos-latest
             target: aarch64
@@ -98,7 +98,7 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             artifact: hola-linux-aarch64
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact: hola-macos-x86_64
           - os: macos-latest
