@@ -72,7 +72,7 @@ Hover over a point to see the trial ID and metric values.
 We display all parameter dimensions as parallel vertical axes,
 with each trial drawn as a line connecting its parameter values.
 Categorical parameters show their choice labels on the axis. Line
-color reflects trial quality---better trials are brighter. The
+color reflects trial quality; better trials are brighter. The
 best trial is highlighted in teal.
 
 ### Trial table

@@ -25,7 +25,7 @@ import pathlib
 import random
 import time
 
-from hola import (
+from hola_opt import (
     Categorical,
     Gmm,
     Integer,

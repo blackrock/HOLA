@@ -41,14 +41,15 @@ enum Commands {
     },
     /// Run a worker that polls the server for trials.
     ///
-    /// By default (HTTP callback mode), the worker asks the server for a trial,
-    /// sets HOLA_SERVER, HOLA_TRIAL_ID, and HOLA_PARAMS env vars, then runs
+    /// In "callback" mode (the default), the worker sets HOLA_SERVER,
+    /// HOLA_TRIAL_ID, and HOLA_PARAMS environment variables, then runs
     /// your --exec command. The command is responsible for calling
-    /// POST /api/tell to report results. If the command exits with non-zero
-    /// status, the worker cancels the trial.
+    /// POST /api/tell to report results. If the command exits with
+    /// non-zero status, the worker cancels the trial.
     ///
-    /// With --legacy, the worker parses stdout as JSON metrics and reports
-    /// them back to the server (the old behavior).
+    /// In "exec" mode, the worker runs the command, parses its stdout
+    /// as a JSON metrics object, and reports the result on the
+    /// command's behalf.
     Worker {
         /// URL of the HOLA server (e.g. http://localhost:8000).
         #[arg(long)]
@@ -56,10 +57,9 @@ enum Commands {
         /// Command to execute for each trial.
         #[arg(long)]
         exec: String,
-        /// Use legacy mode: pass params via HOLA_PARAMS, parse stdout as JSON
-        /// metrics, and report back to the server on behalf of the script.
-        #[arg(long)]
-        legacy: bool,
+        /// Worker mode: "callback" (default) or "exec".
+        #[arg(long, default_value = "callback")]
+        mode: String,
     },
 }
 
@@ -99,13 +99,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Worker {
             server,
             exec,
-            legacy,
+            mode,
         } => {
-            if legacy {
-                eprintln!("Worker connecting to {server} (legacy mode)...");
-            } else {
-                eprintln!("Worker connecting to {server} (HTTP callback mode)...");
-            }
+            let exec_mode = mode == "exec";
+            eprintln!("Worker connecting to {server} ({mode} mode)...");
             eprintln!("Will execute: {exec}");
 
             let client = reqwest::Client::new();
@@ -119,9 +116,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let params = trial.get("params").cloned().unwrap_or_default();
                         let trial_id = trial.get("trial_id").and_then(|v| v.as_u64()).unwrap_or(0);
 
-                        if legacy {
-                            // Legacy mode: pass params via env, parse stdout as JSON,
-                            // worker does the tell.
+                        if exec_mode {
+                            // Exec mode: run command, parse stdout as
+                            // JSON metrics, report on the script's behalf.
                             let output = std::process::Command::new("sh")
                                 .arg("-c")
                                 .arg(&exec)
@@ -150,8 +147,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         } else {
-                            // HTTP callback mode: script is responsible for calling
-                            // POST /api/tell itself. Worker just provides env vars.
+                            // Callback mode (default): script calls
+                            // POST /api/tell itself via HOLA_SERVER.
                             let status = std::process::Command::new("sh")
                                 .arg("-c")
                                 .arg(&exec)

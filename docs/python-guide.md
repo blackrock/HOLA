@@ -36,7 +36,7 @@ The Python API exposes these classes:
 All classes are imported from the `hola` module.
 
 ```python
-from hola import (
+from hola_opt import (
     Study, Space, Trial, CompletedTrial,
     Real, Integer, Categorical,
     Minimize, Maximize,
@@ -509,7 +509,7 @@ forwards all calls as HTTP requests. The server holds the
 leaderboard and strategy state.
 
 ```python
-from hola import Study
+from hola_opt import Study
 
 remote = Study.connect("http://localhost:8000")
 

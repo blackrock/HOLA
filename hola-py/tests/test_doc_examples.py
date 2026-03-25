@@ -97,11 +97,11 @@ _BLOCKS = list(_collect_doc_blocks())
 
 def _make_hola_namespace() -> dict:
     """Build a namespace with all hola exports pre-imported."""
-    import hola
+    import hola_opt
 
     ns: dict = {}
-    for name in hola.__all__:
-        ns[name] = getattr(hola, name)
+    for name in hola_opt.__all__:
+        ns[name] = getattr(hola_opt, name)
     return ns
 
 

@@ -11,7 +11,7 @@ We publish pre-built wheels so you do not need a Rust toolchain.
 pip automatically selects the right wheel for your platform.
 
 ```bash
-pip install hola --extra-index-url https://blackrock.github.io/HOLA/simple/
+pip install hola-opt --extra-index-url https://blackrock.github.io/HOLA/simple/
 ```
 
 We support Python 3.10+ on Linux (x86_64, aarch64), macOS (Intel,
@@ -54,7 +54,7 @@ This example minimizes the 1D Forrester function, a standard
 benchmark with a known minimum of $-6.0267$ at $x = 0.7572$.
 
 ```python
-from hola import Study, Space, Real, Minimize
+from hola_opt import Study, Space, Real, Minimize
 
 # Define a 1D parameter space
 study = Study(
@@ -111,10 +111,11 @@ hola serve hola-cli/examples/example_study.yaml --port 8000
 hola worker --server http://localhost:8000 --exec "python my_training.py"
 ```
 
-The worker receives trial parameters via the `HOLA_PARAMS`
-environment variable (a JSON string) and must print a JSON metrics
-object to stdout. See the [CLI Guide](cli-guide.md) for details
-on writing worker scripts.
+The worker sets `HOLA_SERVER`, `HOLA_TRIAL_ID`, and `HOLA_PARAMS`
+environment variables, then runs your command. Your script reads
+its parameters from `HOLA_PARAMS` and calls `POST /api/tell` on
+the server to report results. See the [CLI Guide](cli-guide.md)
+for details on writing worker scripts.
 
 ## Verification
 

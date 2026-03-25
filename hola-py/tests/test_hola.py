@@ -26,7 +26,7 @@ import pytest
 
 
 def test_continuous_attributes():
-    from hola import Real
+    from hola_opt import Real
 
     c = Real(min=0.0, max=1.0)
     assert c.min == 0.0
@@ -35,7 +35,7 @@ def test_continuous_attributes():
 
 def test_log10_attributes():
     """Log10 stores actual values (not exponents)."""
-    from hola import Real
+    from hola_opt import Real
 
     log_p = Real(min=1e-4, max=0.1, scale="log10")
     assert abs(log_p.min - 1e-4) < 1e-12
@@ -43,7 +43,7 @@ def test_log10_attributes():
 
 
 def test_discrete_attributes():
-    from hola import Integer
+    from hola_opt import Integer
 
     d = Integer(min=1, max=10)
     assert d.min == 1
@@ -51,7 +51,7 @@ def test_discrete_attributes():
 
 
 def test_minimize_attributes():
-    from hola import Minimize
+    from hola_opt import Minimize
 
     m = Minimize(field="loss", priority=1.0)
     assert m.field == "loss"
@@ -61,7 +61,7 @@ def test_minimize_attributes():
 
 
 def test_maximize_attributes():
-    from hola import Maximize
+    from hola_opt import Maximize
 
     m = Maximize(field="acc", target=0.95, limit=0.5, priority=2.0)
     assert m.field == "acc"
@@ -71,14 +71,14 @@ def test_maximize_attributes():
 
 
 def test_space_builder():
-    from hola import Integer, Real, Space
+    from hola_opt import Integer, Real, Space
 
     space = Space(lr=Real(1e-4, 0.1, scale="log10"), layers=Integer(1, 10), weight=Real(0.0, 1.0))
     assert space is not None
 
 
 def test_space_bad_param_type():
-    from hola import Space
+    from hola_opt import Space
 
     with pytest.raises(ValueError):
         Space(x="not a param type")  # type: ignore[arg-type]
@@ -90,7 +90,7 @@ def test_space_bad_param_type():
 
 
 def test_study_creation():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
     assert study.trial_count() == 0
@@ -98,7 +98,7 @@ def test_study_creation():
 
 
 def test_study_ask_returns_trial():
-    from hola import Minimize, Real, Space, Study, Trial
+    from hola_opt import Minimize, Real, Space, Study, Trial
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
     t = study.ask()
@@ -109,7 +109,7 @@ def test_study_ask_returns_trial():
 
 
 def test_study_monotonic_ids():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
     t0 = study.ask()
@@ -121,7 +121,7 @@ def test_study_monotonic_ids():
 
 
 def test_study_params_in_bounds():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
     for _ in range(20):
@@ -131,7 +131,7 @@ def test_study_params_in_bounds():
 
 
 def test_study_tell_increments_count():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
     t0 = study.ask()
@@ -143,7 +143,7 @@ def test_study_tell_increments_count():
 
 
 def test_study_best():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
     t0 = study.ask()
@@ -160,7 +160,7 @@ def test_study_best():
 
 
 def test_study_unknown_trial_raises():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
     with pytest.raises(ValueError):
@@ -173,7 +173,7 @@ def test_study_unknown_trial_raises():
 
 
 def test_study_strategy_random():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")], strategy="random")
     t = study.ask()
@@ -182,7 +182,7 @@ def test_study_strategy_random():
 
 
 def test_study_strategy_sobol():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")], strategy="sobol")
     t = study.ask()
@@ -191,7 +191,7 @@ def test_study_strategy_sobol():
 
 
 def test_study_strategy_gmm():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")], strategy="gmm")
     t = study.ask()
@@ -205,7 +205,7 @@ def test_study_strategy_gmm():
 
 
 def test_study_multi_param():
-    from hola import Integer, Minimize, Real, Space, Study
+    from hola_opt import Integer, Minimize, Real, Space, Study
 
     study = Study(
         space=Space(
@@ -227,7 +227,7 @@ def test_study_multi_param():
 
 
 def test_study_with_objectives():
-    from hola import Maximize, Minimize, Real, Space, Study
+    from hola_opt import Maximize, Minimize, Real, Space, Study
 
     study = Study(
         space=Space(x=Real(0.0, 1.0)),
@@ -244,7 +244,7 @@ def test_study_with_objectives():
 
 
 def test_trial_repr():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
     t = study.ask()
@@ -259,7 +259,7 @@ def test_trial_repr():
 
 
 def test_study_connect_returns_study():
-    from hola import Study
+    from hola_opt import Study
 
     # Study.connect() returns a Study object (connection is lazy)
     remote = Study.connect("http://localhost:9999")
@@ -275,21 +275,21 @@ def test_study_connect_returns_study():
 
 
 def test_categorical_attributes():
-    from hola import Categorical
+    from hola_opt import Categorical
 
     c = Categorical(choices=["adam", "sgd", "rmsprop"])
     assert c.choices == ["adam", "sgd", "rmsprop"]
 
 
 def test_space_with_categorical():
-    from hola import Categorical, Real, Space
+    from hola_opt import Categorical, Real, Space
 
     space = Space(opt=Categorical(["adam", "sgd"]), lr=Real(0.0, 1.0))
     assert space is not None
 
 
 def test_study_categorical_ask_tell():
-    from hola import Categorical, Minimize, Space, Study
+    from hola_opt import Categorical, Minimize, Space, Study
 
     study = Study(
         space=Space(opt=Categorical(["adam", "sgd", "rmsprop"])), objectives=[Minimize("loss")]
@@ -302,7 +302,7 @@ def test_study_categorical_ask_tell():
 
 
 def test_study_categorical_all_in_bounds():
-    from hola import Categorical, Minimize, Space, Study
+    from hola_opt import Categorical, Minimize, Space, Study
 
     study = Study(space=Space(algo=Categorical(["a", "b", "c"])), objectives=[Minimize("loss")])
     for _ in range(20):
@@ -312,7 +312,7 @@ def test_study_categorical_all_in_bounds():
 
 
 def test_study_categorical_mixed_space():
-    from hola import Categorical, Integer, Minimize, Real, Space, Study
+    from hola_opt import Categorical, Integer, Minimize, Real, Space, Study
 
     study = Study(
         space=Space(
@@ -336,7 +336,7 @@ def test_study_categorical_mixed_space():
 
 
 def test_study_run_basic():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
 
@@ -348,7 +348,7 @@ def test_study_run_basic():
 
 
 def test_study_run_returns_self():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
 
@@ -358,7 +358,7 @@ def test_study_run_returns_self():
 
 
 def test_study_run_chain_best():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
 
@@ -370,7 +370,7 @@ def test_study_run_chain_best():
 
 
 def test_study_run_bad_return_raises():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
 
@@ -379,7 +379,7 @@ def test_study_run_bad_return_raises():
 
 
 def test_study_run_parallel():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
 
@@ -391,7 +391,7 @@ def test_study_run_parallel():
 
 
 def test_study_run_parallel_default_workers():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
 
@@ -401,7 +401,7 @@ def test_study_run_parallel_default_workers():
 
 
 def test_study_run_sequential_explicit():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
 
@@ -415,7 +415,7 @@ def test_study_run_sequential_explicit():
 
 
 def test_seed_determinism():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     def run_with_seed(seed):
         study = Study(
@@ -436,7 +436,7 @@ def test_seed_determinism():
 
 
 def test_different_seeds_differ():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     def first_param(seed):
         study = Study(
@@ -456,7 +456,7 @@ def test_different_seeds_differ():
 
 
 def test_pareto_front_multi_objective():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(
         space=Space(x=Real(0.0, 1.0)),
@@ -484,7 +484,7 @@ def test_pareto_front_multi_objective():
 
 
 def test_pareto_front_scalar_returns_empty():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(
         space=Space(x=Real(0.0, 1.0)),
@@ -501,7 +501,7 @@ def test_pareto_front_scalar_returns_empty():
 
 
 def test_trials_returns_all():
-    from hola import Minimize, Real, Space, Study
+    from hola_opt import Minimize, Real, Space, Study
 
     study = Study(
         space=Space(x=Real(0.0, 1.0)),

@@ -175,7 +175,7 @@ curl http://localhost:8000/api/top_k?k=5
 
 ### GET /api/pareto_front
 
-Get the Pareto front---the set of non-dominated trials---for
+Get the Pareto front (the set of non-dominated trials) for
 multi-objective studies.
 
 **Query parameters**
@@ -265,7 +265,7 @@ Get all completed trials.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `sorted_by` | string | `"index"` | Sort order---`"index"` (insertion order) or `"rank"` |
+| `sorted_by` | string | `"index"` | Sort order: `"index"` (insertion order) or `"rank"` |
 | `include_infeasible` | boolean | true | Whether to include infeasible trials |
 
 **Response (200)**

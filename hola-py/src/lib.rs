@@ -1184,7 +1184,7 @@ fn py_to_json(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
 // =============================================================================
 
 #[pymodule]
-fn hola(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn hola_opt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Real>()?;
     m.add_class::<Integer>()?;
     m.add_class::<Categorical>()?;

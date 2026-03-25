@@ -25,7 +25,7 @@ import tempfile
 import pytest
 from conftest import http_json
 
-from hola import Study
+from hola_opt import Study
 
 # ==========================================================================
 # REST API Endpoint Tests

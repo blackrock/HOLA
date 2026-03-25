@@ -32,7 +32,7 @@ jobs:
           - os: windows-latest
             target: x64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: actions/setup-python@v5
         with:
@@ -47,8 +47,8 @@ jobs:
       - name: Bundle dashboard into wheel
         shell: bash
         run: |
-          mkdir -p hola-py/hola/dashboard
-          cp dashboard/index.html dashboard/styles.css dashboard/app.js hola-py/hola/dashboard/
+          mkdir -p hola-py/hola_opt/dashboard
+          cp dashboard/index.html dashboard/styles.css dashboard/app.js hola-py/hola_opt/dashboard/
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -69,7 +69,7 @@ jobs:
     name: Source distribution
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
@@ -108,7 +108,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: hola-windows-x86_64.exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -172,8 +172,8 @@ jobs:
         shell: bash
         run: |
           pip install dist/*.whl --find-links dist/
-          python -c "from hola import Study, Space, Real, Minimize; print('Import OK')"
-          python -c "from hola import dashboard_dir; assert dashboard_dir().exists(), 'Dashboard not bundled'"
+          python -c "from hola_opt import Study, Space, Real, Minimize; print('Import OK')"
+          python -c "from hola_opt import dashboard_dir; assert dashboard_dir().exists(), 'Dashboard not bundled'"
 
   # ── Create GitHub Release ───────────────────────────────
   release:
@@ -181,7 +181,7 @@ jobs:
     needs: [build-wheels, build-sdist, build-cli, test-wheels]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -203,14 +203,14 @@ jobs:
     needs: [release]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Generate PEP 503 simple index
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p index/simple/hola
+          mkdir -p index/simple/hola-opt
 
           # Collect wheel/sdist download URLs from all stable GitHub releases.
           # gh release view returns browser-downloadable URLs in .assets[].url.
@@ -228,17 +228,17 @@ jobs:
               echo "  <a href=\"${url}\">${filename}</a><br/>"
             done < /tmp/asset_urls.txt
             echo '</body></html>'
-          } > index/simple/hola/index.html
+          } > index/simple/hola-opt/index.html
 
           # Build the root index page
           cat > index/simple/index.html <<'ROOTHTML'
           <!DOCTYPE html><html><body>
-            <a href="hola/">hola</a>
+            <a href="hola-opt/">hola-opt</a>
           </body></html>
           ROOTHTML
 
           echo "Generated index with $(wc -l < /tmp/asset_urls.txt) assets"
-          cat index/simple/hola/index.html
+          cat index/simple/hola-opt/index.html
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
