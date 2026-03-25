@@ -23,7 +23,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm64
             target: aarch64
           - os: macos-15-intel
             target: x86_64
@@ -95,7 +95,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: hola-linux-x86_64
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm64
             target: aarch64-unknown-linux-gnu
             artifact: hola-linux-aarch64
           - os: macos-15-intel
@@ -117,7 +117,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && matrix.os != 'ubuntu-24.04-arm64'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
