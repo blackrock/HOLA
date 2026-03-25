@@ -3,7 +3,7 @@
 
 """Verify .pyi stubs match the runtime API to prevent drift."""
 
-import hola
+import hola_opt as hola
 
 EXPECTED_CLASSES = [
     "Real",

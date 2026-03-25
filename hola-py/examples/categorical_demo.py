@@ -16,7 +16,7 @@ together in a single study, simulating an optimizer hyperparameter
 search problem.
 """
 
-from hola import Categorical, Integer, Minimize, Real, Space, Study
+from hola_opt import Categorical, Integer, Minimize, Real, Space, Study
 
 
 def simulated_training(params: dict) -> dict:

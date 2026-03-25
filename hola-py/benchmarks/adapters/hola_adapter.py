@@ -26,7 +26,7 @@ from benchmarks.problems.registry import (
     MultiObjectiveProblem,
     SingleObjectiveProblem,
 )
-from hola import Minimize, Real, Space, Study
+from hola_opt import Minimize, Real, Space, Study
 
 
 class HolaSingleObjectiveAdapter:

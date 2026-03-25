@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "hola"
+name = "hola-opt"
 version = "0.1.0"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
@@ -24,7 +24,7 @@ line-length = 100
 select = ["E", "F", "I", "W", "UP", "B", "SIM"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["hola"]
+known-first-party = ["hola_opt"]
 
 [dependency-groups]
 dev = [

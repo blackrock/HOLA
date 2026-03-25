@@ -21,7 +21,7 @@ the TLP formula; `group` controls which objectives are combined into
 the same Pareto axis.
 """
 
-from hola import Integer, Minimize, Real, Space, Study
+from hola_opt import Integer, Minimize, Real, Space, Study
 
 
 def model_objective(params: dict) -> dict:

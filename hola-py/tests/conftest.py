@@ -26,7 +26,7 @@ import urllib.request
 
 import pytest
 
-from hola import Categorical, Integer, Real, Space
+from hola_opt import Categorical, Integer, Real, Space
 
 # ==========================================================================
 # Reusable spaces

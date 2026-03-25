@@ -18,7 +18,7 @@ types in a realistic ML workflow.
 Ported from HOLA's analysis/optimizers/benchmarks/boosted_regressor.py.
 """
 
-from hola import Categorical, Integer, Minimize, Real, Space, Study
+from hola_opt import Categorical, Integer, Minimize, Real, Space, Study
 
 try:
     from sklearn.datasets import make_friedman1

@@ -22,7 +22,7 @@ TLP (Target-Limit-Priority) scoring normalizes each objective to [0, 1]:
 """
 
 from benchmarks.functions.single_objective import branin, forrester
-from hola import Minimize, Real, Space, Study
+from hola_opt import Minimize, Real, Space, Study
 
 
 def example_1d():

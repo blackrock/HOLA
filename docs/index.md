@@ -35,7 +35,7 @@ dashboard can connect from any language or machine.
 
 **Persistence.**
 :   Atomic JSON checkpoints that capture the full engine
-    state---leaderboard, strategy, and configuration.
+    state: leaderboard, strategy, and configuration.
 
 **Distributed execution.**
 :   REST API with SSE streaming for real-time updates across
@@ -44,11 +44,11 @@ dashboard can connect from any language or machine.
 ## Quick Start
 
 ```bash
-pip install hola --extra-index-url https://blackrock.github.io/HOLA/simple/
+pip install hola-opt --extra-index-url https://blackrock.github.io/HOLA/simple/
 ```
 
 ```python
-from hola import Study, Space, Real, Integer, Categorical, Minimize
+from hola_opt import Study, Space, Real, Integer, Categorical, Minimize
 
 study = Study(
     space=Space(

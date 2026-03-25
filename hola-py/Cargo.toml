@@ -5,7 +5,7 @@ edition = "2024"
 license = "Apache-2.0"
 
 [lib]
-name = "hola"
+name = "hola_opt"
 crate-type = ["cdylib"]
 
 [dependencies]

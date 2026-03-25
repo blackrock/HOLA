@@ -138,7 +138,8 @@ def test_worker_completes_trials(cli_binary, tmp_path):
                 "worker",
                 "--server",
                 url,
-                "--legacy",
+                "--mode",
+                "exec",
                 "--exec",
                 "echo '{\"loss\": 0.5}'",
             ],
@@ -187,7 +188,7 @@ def test_worker_receives_params_env(cli_binary, tmp_path):
         )
 
         worker = subprocess.Popen(
-            [cli_binary, "worker", "--server", url, "--legacy", "--exec", exec_cmd],
+            [cli_binary, "worker", "--server", url, "--mode", "exec", "--exec", exec_cmd],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )

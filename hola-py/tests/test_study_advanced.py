@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from hola import Categorical, Integer, Maximize, Minimize, Real, Space, Study
+from hola_opt import Categorical, Integer, Maximize, Minimize, Real, Space, Study
 
 # ==========================================================================
 # Error Paths

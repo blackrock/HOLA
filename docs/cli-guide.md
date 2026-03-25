@@ -3,7 +3,7 @@
 For multi-machine or language-agnostic deployments, we
 provide a CLI that runs an optimization server and dispatches
 work to any number of workers. For single-machine use, the
-Python `Study` class is simpler---see the
+Python `Study` class is simpler; see the
 [Python Guide](python-guide.md).
 
 The `hola` CLI has two subcommands.
@@ -16,10 +16,10 @@ UI from a local directory with the `--dashboard` flag.
 
 **`hola worker`.** A loop that polls the server for trials,
 executes your command for each one, and handles trial
-lifecycle. By default it uses HTTP callback mode, where the
-script is responsible for reporting results back to the server
-via `POST /api/tell`. If the script exits with non-zero
-status, the worker cancels the trial automatically.
+lifecycle. By default it uses callback mode, where the script
+is responsible for reporting results back to the server via
+`POST /api/tell`. If the script exits with non-zero status,
+the worker cancels the trial automatically.
 
 ## YAML Configuration
 
@@ -215,15 +215,15 @@ the [REST API](rest-api.md).
 hola worker --server http://localhost:8000 --exec "python train.py"
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--server` | URL of the HOLA server |
-| `--exec` | Shell command to execute for each trial |
-| `--legacy` | Use legacy mode. The worker parses stdout as JSON and reports results on behalf of the script. |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--server` | required | URL of the HOLA server |
+| `--exec` | required | Shell command to execute for each trial |
+| `--mode` | `callback` | Worker mode: `"callback"` or `"exec"` |
 
-### Default mode (HTTP callback)
+### Callback mode (default)
 
-In the default mode, the worker loop works as follows.
+In callback mode, the worker loop works as follows.
 
 1. `POST /api/ask` to get a trial from the server
 2. Run the `--exec` command via `sh -c` with three
@@ -241,20 +241,20 @@ In the default mode, the worker loop works as follows.
 If the server is unreachable, the worker retries every
 5 seconds.
 
-### Legacy mode
+### Exec mode
 
-With the `--legacy` flag, the worker reverts to the old
-behavior.
+With `--mode exec`, the worker runs the command and handles
+reporting on its behalf.
 
 1. `POST /api/ask` to get a trial
 2. Run the `--exec` command with `HOLA_PARAMS` set
-3. Parse the command's stdout as JSON metrics
-4. `POST /api/tell` to report the result on behalf of the
-   script
+3. Parse the command's stdout as a JSON metrics object
+4. `POST /api/tell` to report the result
 5. Repeat
 
 ```bash
-hola worker --server http://localhost:8000 --exec "python train.py" --legacy
+hola worker --server http://localhost:8000 \
+  --exec "python train.py" --mode exec
 ```
 
 ### The `HOLA_PARAMS` environment variable
@@ -269,16 +269,16 @@ HOLA_PARAMS='{"learning_rate": 0.001, "num_layers": 5, "optimizer": "adam", "mom
 Each invocation of the `--exec` command runs in its own
 `sh -c` process, so `HOLA_PARAMS` (along with `HOLA_SERVER`
 and `HOLA_TRIAL_ID`) is per-process. Multiple concurrent
-workers are safe---each worker's script sees only its own
+workers are safe: each worker's script sees only its own
 trial's parameters.
 
 ### Worker Script Examples
 
-#### Python (HTTP callback mode, stdlib only)
+#### Python (callback mode, stdlib only)
 
 ```python
 #!/usr/bin/env python3
-# train.py - worker script for HOLA (HTTP callback mode)
+# train.py - worker script for HOLA (callback mode)
 import json
 import os
 import urllib.request
@@ -307,11 +307,11 @@ req = urllib.request.Request(
 urllib.request.urlopen(req)
 ```
 
-#### Bash (HTTP callback mode, curl)
+#### Bash (callback mode, curl)
 
 ```bash
 #!/bin/bash
-# train.sh - worker script for HOLA (HTTP callback mode)
+# train.sh - worker script for HOLA (callback mode)
 
 # Parse parameters with jq
 LR=$(echo "$HOLA_PARAMS" | jq -r '.learning_rate')
@@ -326,7 +326,7 @@ curl -s -X POST "$HOLA_SERVER/api/tell" \
   -d "{\"trial_id\": $HOLA_TRIAL_ID, \"metrics\": {\"loss\": $LOSS}}"
 ```
 
-#### Python (HTTP callback mode, hola Python client)
+#### Python (callback mode, hola Python client)
 
 If you have the `hola` Python package installed, you can use
 `Study.connect()` for a nicer API.
@@ -336,7 +336,7 @@ If you have the `hola` Python package installed, you can use
 # train.py - worker script using the hola Python client
 import json
 import os
-from hola import Study
+from hola_opt import Study
 
 params = json.loads(os.environ["HOLA_PARAMS"])
 trial_id = int(os.environ["HOLA_TRIAL_ID"])
@@ -350,11 +350,11 @@ latency = measure_latency()
 remote.tell(trial_id, {"loss": loss, "latency": latency})
 ```
 
-#### Python (legacy mode)
+#### Python (exec mode)
 
 ```python
 #!/usr/bin/env python3
-# train.py - worker script for HOLA (legacy mode: stdout JSON)
+# train.py - worker script for HOLA (exec mode: stdout JSON)
 import json
 import os
 import sys
@@ -367,12 +367,12 @@ print("Training started...", file=sys.stderr)
 loss = train_model(**params)
 latency = measure_latency()
 
-# Print metrics as JSON to stdout - the worker will parse and report them
+# Print metrics as JSON to stdout
 print(json.dumps({"loss": loss, "latency": latency}))
 ```
 
 !!! important
-    In legacy mode, the worker script must print **only** a
+    In exec mode, the worker script must print **only** a
     JSON object to stdout. Any other stdout output will cause
     a parse error. Use stderr for logging.
 
@@ -400,7 +400,7 @@ server handles concurrent ask/tell requests safely.
 You can also connect from Python on any machine.
 
 ```python
-from hola import Study
+from hola_opt import Study
 
 remote = Study.connect("http://machine-a:8000")
 trial = remote.ask()
@@ -430,7 +430,7 @@ See the [Dashboard Guide](dashboard.md) for details.
 
 ### What gets saved
 
-A leaderboard checkpoint saves all completed trials---their
+A leaderboard checkpoint saves all completed trials: their
 parameters, metrics, and scores. A full checkpoint
 additionally saves strategy state (e.g. GMM model parameters).
 We use JSON as the checkpoint format.
@@ -473,8 +473,8 @@ checkpoint:
   load_from: ./checkpoints/checkpoint_000100.json
 ```
 
-On startup, the server loads the leaderboard---trial
-history---from the specified checkpoint file. We then refit
-the strategy from the loaded data, so optimization resumes
-with full knowledge of previous trials. This is useful for
-continuing a study after a server restart or crash.
+On startup, the server loads the leaderboard (trial history)
+from the specified checkpoint file. We then refit the strategy
+from the loaded data, so optimization resumes with full
+knowledge of previous trials. This is useful for continuing a
+study after a server restart or crash.
