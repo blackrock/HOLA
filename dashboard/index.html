@@ -1,0 +1,164 @@
+<!--
+Copyright 2026 BlackRock, Inc.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HOLA dashboard</title>
+  <meta name="description" content="Real-time optimization dashboard for HOLA">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+
+  <div id="app">
+    <!-- Status Bar -->
+    <div id="status-bar">
+      <span class="logo">◈ HOLA</span>
+      <div class="status-item">
+        <span class="dot" id="sse-dot"></span>
+        <span id="mode-label">Disconnected</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Trials</span>
+        <span id="stat-trials">0</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Best</span>
+        <span id="stat-best">—</span>
+      </div>
+      <div class="status-item">
+        <span class="label">Last</span>
+        <span id="stat-last-time">—</span>
+      </div>
+      <div style="flex:1"></div>
+      <div id="connect-panel">
+        <input type="text" id="server-url" placeholder="http://localhost:8000" />
+        <button id="btn-connect" onclick="connectToServer()">Connect</button>
+        <button class="secondary" onclick="document.getElementById('file-input').click()">Load File</button>
+        <input type="file" id="file-input" accept=".json" onchange="loadCheckpointFile(event)" />
+      </div>
+    </div>
+
+    <!-- Empty State (shown when no data loaded) -->
+    <div id="empty-state" class="card empty-state">
+      <div class="icon">◈</div>
+      <h2 style="font-weight:600; color:var(--text-1)">No data loaded</h2>
+      <p>Connect to a running HOLA server to view live optimization progress, or load a checkpoint file for offline
+        analysis.</p>
+      <div class="actions">
+        <button onclick="connectToServer()">Connect to Server</button>
+        <button class="secondary" onclick="document.getElementById('file-input').click()">Load Checkpoint</button>
+      </div>
+    </div>
+
+    <!-- Main content (hidden until data loaded) -->
+    <div id="main-content" style="display:none">
+      <!-- Charts Row -->
+      <div class="row">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Convergence</span>
+          </div>
+          <div class="chart-container" id="convergence-chart"></div>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Pareto Scatter</span>
+          </div>
+          <div class="axis-selectors">
+            <label>X <select id="pareto-x"></select></label>
+            <label>Y <select id="pareto-y"></select></label>
+          </div>
+          <div style="position:relative">
+            <canvas id="pareto-canvas" width="600" height="280"></canvas>
+            <div id="pareto-tooltip"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Parallel Coordinates -->
+      <div class="card" id="parallel-card">
+        <div class="card-header">
+          <span class="card-title">Parallel Coordinates</span>
+        </div>
+        <canvas id="parallel-canvas" width="1200" height="200"></canvas>
+      </div>
+
+      <!-- Trial Table -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Trials</span>
+          <span style="font-size:0.75rem;color:var(--text-2)" id="table-count"></span>
+        </div>
+        <div class="table-wrapper">
+          <table id="trial-table">
+            <thead id="trial-thead">
+              <tr></tr>
+            </thead>
+            <tbody id="trial-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Controls Row -->
+      <div class="row">
+        <div class="card" id="objectives-card">
+          <div class="card-header">
+            <span class="card-title">Objectives</span>
+            <div style="display:flex;gap:6px;align-items:center">
+              <button onclick="previewObjectives()">Preview</button>
+              <button class="secondary" onclick="resetObjectives()">Reset</button>
+              <button id="btn-apply-obj" onclick="applyObjectives()" disabled>Apply to server</button>
+              <span id="preview-badge" style="display:none;font-size:0.7rem;padding:2px 8px;background:var(--orange);color:var(--bg-0);border-radius:4px;font-weight:600">PREVIEW</span>
+            </div>
+          </div>
+          <p style="font-size:0.78rem;color:var(--text-2);margin-bottom:8px">
+            <b>Preview</b> rescalarizes trials in the browser only---the server and its sampling logic are not affected.
+            <b>Apply to server</b> sends the new objectives to the server, rescalarizes all trials server-side,
+            and changes the objectives used for future sampling.
+          </p>
+          <div id="objectives-list"></div>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Checkpoints</span>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+            <button class="secondary" onclick="document.getElementById('file-input').click()">Open checkpoint</button>
+            <button class="secondary" id="btn-save-ckpt" onclick="saveCheckpoint()" disabled>Save server state</button>
+            <button class="secondary" onclick="exportData()">Download trials</button>
+          </div>
+          <p style="font-size:0.78rem;color:var(--text-2)">
+            <b>Save server state</b> writes a full checkpoint (trials + strategy) to disk on the server.
+            <b>Download trials</b> saves only the trial data visible here as a JSON file in your browser.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+
+</html>

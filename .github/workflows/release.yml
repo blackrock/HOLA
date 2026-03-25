@@ -1,0 +1,249 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  pages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Python wheels (abi3 — one per platform) ─────────────
+  build-wheels:
+    name: Wheel (${{ matrix.os }} ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+          - os: ubuntu-latest
+            target: aarch64
+          - os: macos-13
+            target: x86_64
+          - os: macos-latest
+            target: aarch64
+          - os: windows-latest
+            target: x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up QEMU
+        if: matrix.target == 'aarch64' && runner.os == 'Linux'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Bundle dashboard into wheel
+        shell: bash
+        run: |
+          mkdir -p hola-py/hola/dashboard
+          cp dashboard/index.html dashboard/styles.css dashboard/app.js hola-py/hola/dashboard/
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+          working-directory: hola-py
+
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: hola-py/dist/*.whl
+
+  # ── Source distribution ─────────────────────────────────
+  build-sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: hola-py
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: hola-py/dist/*.tar.gz
+
+  # ── CLI binaries ────────────────────────────────────────
+  build-cli:
+    name: CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: hola-linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: hola-linux-aarch64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: hola-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: hola-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: hola-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build CLI binary
+        run: cargo build --release --target ${{ matrix.target }} -p hola-cli
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Package binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/hola ${{ matrix.artifact }}
+          tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/hola.exe ${{ matrix.artifact }}
+          Compress-Archive -Path ${{ matrix.artifact }} -DestinationPath ${{ matrix.artifact }}.zip
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.artifact }}
+          path: |
+            *.tar.gz
+            *.zip
+
+  # ── Wheel smoke test ────────────────────────────────────
+  test-wheels:
+    name: Test wheel (${{ matrix.os }})
+    needs: [build-wheels]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Install and test
+        shell: bash
+        run: |
+          pip install dist/*.whl --find-links dist/
+          python -c "from hola import Study, Space, Real, Minimize; print('Import OK')"
+          python -c "from hola import dashboard_dir; assert dashboard_dir().exists(), 'Dashboard not bundled'"
+
+  # ── Create GitHub Release ───────────────────────────────
+  release:
+    name: GitHub Release
+    needs: [build-wheels, build-sdist, build-cli, test-wheels]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+
+  # ── Update PEP 503 package index on GitHub Pages ───────
+  update-index:
+    name: Update Package Index
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate PEP 503 simple index
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p index/simple/hola
+
+          # Collect wheel/sdist download URLs from all stable GitHub releases.
+          # gh release view returns browser-downloadable URLs in .assets[].url.
+          gh release list --limit 100 --json tagName,isPrerelease \
+            --jq '.[] | select(.isPrerelease == false) | .tagName' | while read -r tag; do
+            gh release view "$tag" --json assets \
+              --jq '[.assets[] | select(.name | test("\\.(whl|tar\\.gz)$")) | .url] | .[]'
+          done | sort -u > /tmp/asset_urls.txt
+
+          # Build the per-package index page (PEP 503)
+          {
+            echo '<!DOCTYPE html><html><body>'
+            while IFS= read -r url; do
+              filename=$(basename "$url")
+              echo "  <a href=\"${url}\">${filename}</a><br/>"
+            done < /tmp/asset_urls.txt
+            echo '</body></html>'
+          } > index/simple/hola/index.html
+
+          # Build the root index page
+          cat > index/simple/index.html <<'ROOTHTML'
+          <!DOCTYPE html><html><body>
+            <a href="hola/">hola</a>
+          </body></html>
+          ROOTHTML
+
+          echo "Generated index with $(wc -l < /tmp/asset_urls.txt) assets"
+          cat index/simple/hola/index.html
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./index
+          destination_dir: .
+          keep_files: false

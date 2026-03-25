@@ -1,0 +1,393 @@
+/*
+Copyright 2026 BlackRock, Inc.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+/* ==========================================================================
+   Design Tokens
+   ========================================================================== */
+:root {
+  --bg-0: #0a0a0f;
+  --bg-1: #12121a;
+  --bg-2: #1a1a26;
+  --bg-3: #222233;
+  --border: #2a2a3e;
+  --border-glow: #3a3a5e;
+  --text-0: #e8e8f0;
+  --text-1: #b0b0c8;
+  --text-2: #7070a0;
+  --accent: #6c5ce7;
+  --accent-bright: #a29bfe;
+  --accent-dim: #4834d4;
+  --green: #00cec9;
+  --green-bright: #55efc4;
+  --red: #ff6b6b;
+  --orange: #fdcb6e;
+  --pareto-1: #6c5ce7;
+  --pareto-2: #00cec9;
+  --pareto-3: #fd79a8;
+  --dominated: #444466;
+  --glass-bg: rgba(18, 18, 26, 0.7);
+  --glass-border: rgba(255, 255, 255, 0.06);
+  --radius: 12px;
+  --radius-sm: 8px;
+  --shadow: 0 4px 24px rgba(0,0,0,0.4);
+  --font: 'Inter', -apple-system, sans-serif;
+  --mono: 'JetBrains Mono', monospace;
+  --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ==========================================================================
+   Reset & Base
+   ========================================================================== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 14px; }
+body {
+  font-family: var(--font);
+  background: var(--bg-0);
+  color: var(--text-0);
+  line-height: 1.5;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* ==========================================================================
+   Layout
+   ========================================================================== */
+#app {
+  max-width: 1600px;
+  margin: 0 auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.row { display: flex; gap: 16px; }
+.row > * { flex: 1; min-width: 0; }
+
+/* ==========================================================================
+   Cards (glassmorphism)
+   ========================================================================== */
+.card {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  padding: 16px;
+  backdrop-filter: blur(12px);
+  box-shadow: var(--shadow);
+  transition: border-color var(--transition);
+}
+.card:hover { border-color: var(--border-glow); }
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.card-title {
+  font-size: 0.85rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-2);
+}
+
+/* ==========================================================================
+   Status Bar
+   ========================================================================== */
+#status-bar {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 10px 20px;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 0.82rem;
+  flex-wrap: wrap;
+}
+#status-bar .logo {
+  font-weight: 700;
+  font-size: 1rem;
+  color: var(--accent-bright);
+  letter-spacing: 0.05em;
+}
+.status-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-1);
+}
+.status-item .label { color: var(--text-2); }
+.dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  transition: background var(--transition);
+}
+.dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.dot.disconnected { background: var(--red); box-shadow: 0 0 6px var(--red); }
+.dot.offline { background: var(--orange); box-shadow: 0 0 6px var(--orange); }
+
+/* ==========================================================================
+   Connection Panel
+   ========================================================================== */
+#connect-panel {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px;
+}
+#connect-panel input[type="text"] {
+  flex: 1;
+  max-width: 400px;
+  padding: 8px 14px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-0);
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  outline: none;
+  transition: border-color var(--transition);
+}
+#connect-panel input[type="text"]:focus { border-color: var(--accent); }
+
+button, .btn {
+  padding: 8px 16px;
+  background: var(--accent-dim);
+  color: var(--text-0);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  font-family: var(--font);
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition);
+  white-space: nowrap;
+}
+button:hover { background: var(--accent); }
+button:active { transform: scale(0.97); }
+button.secondary {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--text-1);
+}
+button.secondary:hover { border-color: var(--accent); color: var(--text-0); }
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ==========================================================================
+   Charts
+   ========================================================================== */
+.chart-container {
+  width: 100%;
+  min-height: 280px;
+  position: relative;
+  overflow: hidden;
+}
+.chart-container canvas { border-radius: var(--radius-sm); }
+
+/* uPlot overrides */
+.u-legend { font-family: var(--font); font-size: 0.75rem; color: var(--text-1); }
+.u-legend th { color: var(--text-2); font-weight: 500; }
+
+/* ==========================================================================
+   Pareto Scatter
+   ========================================================================== */
+.axis-selectors {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.axis-selectors label {
+  font-size: 0.75rem;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+select {
+  padding: 4px 8px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-0);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  outline: none;
+  cursor: pointer;
+}
+select:focus { border-color: var(--accent); }
+
+/* ==========================================================================
+   Trial Table
+   ========================================================================== */
+.table-wrapper {
+  max-height: 400px;
+  overflow-y: auto;
+  border-radius: var(--radius-sm);
+}
+.table-wrapper::-webkit-scrollbar { width: 6px; }
+.table-wrapper::-webkit-scrollbar-track { background: var(--bg-2); }
+.table-wrapper::-webkit-scrollbar-thumb {
+  background: var(--border-glow);
+  border-radius: 3px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+thead { position: sticky; top: 0; z-index: 1; }
+th {
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 8px 10px;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  transition: color var(--transition);
+}
+th:hover { color: var(--accent-bright); }
+th.sorted-asc::after { content: ' ▲'; font-size: 0.7em; }
+th.sorted-desc::after { content: ' ▼'; font-size: 0.7em; }
+td {
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+tr { transition: background var(--transition); }
+tr:hover { background: rgba(108, 92, 231, 0.08); }
+tr.best-row {
+  background: rgba(108, 92, 231, 0.12);
+  border-left: 3px solid var(--accent);
+}
+
+/* ==========================================================================
+   Objective Controls
+   ========================================================================== */
+.objective-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+  flex-wrap: wrap;
+}
+.objective-row:last-child { border-bottom: none; }
+.obj-field {
+  font-family: var(--mono);
+  font-weight: 500;
+  color: var(--accent-bright);
+  min-width: 80px;
+}
+.obj-type {
+  font-size: 0.75rem;
+  color: var(--text-2);
+  padding: 2px 8px;
+  background: var(--bg-3);
+  border-radius: 4px;
+}
+input[type="range"] {
+  -webkit-appearance: none;
+  width: 120px;
+  height: 4px;
+  background: var(--bg-3);
+  border-radius: 2px;
+  outline: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  transition: box-shadow var(--transition);
+}
+input[type="range"]::-webkit-slider-thumb:hover {
+  box-shadow: 0 0 8px var(--accent);
+}
+input[type="number"] {
+  width: 80px;
+  padding: 4px 8px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-0);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  outline: none;
+}
+input[type="number"]:focus { border-color: var(--accent); }
+
+/* File input */
+input[type="file"] { display: none; }
+
+/* ==========================================================================
+   Empty State
+   ========================================================================== */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 20px;
+  color: var(--text-2);
+  text-align: center;
+  gap: 16px;
+}
+.empty-state .icon {
+  font-size: 3rem;
+  opacity: 0.3;
+}
+.empty-state p { max-width: 400px; line-height: 1.6; }
+.empty-state .actions { display: flex; gap: 12px; margin-top: 8px; }
+
+/* ==========================================================================
+   Pareto Tooltip
+   ========================================================================== */
+#pareto-tooltip {
+  display: none;
+  position: absolute;
+  pointer-events: none;
+  padding: 8px 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--border-glow);
+  border-radius: var(--radius-sm);
+  color: var(--text-0);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  line-height: 1.5;
+  box-shadow: var(--shadow);
+  z-index: 10;
+  white-space: nowrap;
+}
+#pareto-tooltip.visible { display: block; }
+
+/* ==========================================================================
+   Responsive
+   ========================================================================== */
+@media (max-width: 900px) {
+  .row { flex-direction: column; }
+}

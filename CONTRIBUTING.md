@@ -1,66 +1,83 @@
 # Contributing to HOLA
 
-## Filing issues
-
-When filing an issue, make sure to answer these five questions:
-
-1. What version of Python are you using (`python --version`)?
-2. What did you do?
-3. What did you expect to see?
-4. What did you see instead?
-
-## Report a Bug
-
-Open an issue. Please include descriptions of the following:
-
-- Observations
-- Expectations
-- Steps to reproduce
-
-## Contributing code
-
-In general, this project follows Python project conventions. Please make sure you've linted, formatted, and run your
-tests before submitting a patch. To set up your working environment run `make env`. To format your code run `make fmt`,
-to lint it, run `make lint`, to test it, run `make test`.
-
-## Contribute a Bug Fix
-
-- Report the bug first
-- Create a pull request for the fix
-
-## Suggest a New Feature
-
-- Create a new issue to start a discussion around new topic. Label the issue as `new-feature`
-
-## Developer guidelines
-
-### Environment
-
-Run `make env` to build the dev/research HOLA environment. Example using `conda`:
+## Development setup
 
 ```bash
-conda create -n hola python=3.8 -y
-conda activate hola
-make env
+git clone https://github.com/blackrock/HOLA.git
+cd HOLA
+
+# Install Rust toolchain (if not already present)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Install uv (https://docs.astral.sh/uv/getting-started/installation/)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+uv sync --dev
 ```
 
-### Platforms
+## Running tests
 
-#### Linux and WSL
-On Linux and WSL everything should work out of the box.
+```bash
+# Rust tests (unit + integration)
+# --all-features compiles the server integration tests
+cargo test --workspace --all-features
 
-#### Windows
-On Windows, please use `Git Bash` and install `make` as a one off.
+# Build and test Python bindings
+cd hola-py && uv run maturin develop && cd ..
+hola-py/.venv/bin/python -m pytest hola-py/tests/ -v
 
-#### Mac
-HOLA relies heavily on the GNU version of `find` and `xargs`. Mac, by default, uses BSD rather than GNU so please
-run `brew install findutils` as a one-off to bring the GNU versions of these utils.
+# Linting
+uv run --project hola-py ruff check .
+uv run --project hola-py ruff format --check .
+uv run --project hola-py ty check .
+```
 
-### Formatting
-To format the code run `make fmt`.
+## Feature flags
 
-### Linting
-To lint the code run `make lint`.
+The `hola` crate has an optional `server` feature that enables
+the Axum REST API. The CLI crate enables it by default. When
+running `cargo test` on the workspace, use `--all-features` so
+that server integration tests compile.
 
-### Testing
-To test the code and see the coverage run `make test`.
+## Licensing and file headers
+
+We distribute all crates and the Python package under
+**Apache-2.0** (see [LICENSE-APACHE](LICENSE-APACHE) at the
+repository root). Each source file (Rust, Python, dashboard
+JS/CSS/HTML) must begin with the Apache 2.0 copyright and license
+notice (BlackRock / 2026). If you add a new file, copy the header
+from an existing file of the same type.
+
+## Code style
+
+- **Rust.** Run `cargo fmt --all` before committing. Lint with
+  `cargo clippy --workspace --all-features -- -D warnings`. We
+  enforce a maximum line width of 100 characters (`rustfmt.toml`).
+- **Python.** Lint with `uv run --project hola-py ruff check .`
+  and format with `uv run --project hola-py ruff format --check .`.
+  Type-check with `uv run --project hola-py ty check .`.
+
+## Dashboard
+
+The `dashboard/` directory contains a standalone browser UI with
+no build step.
+
+To test locally, start the server, open `dashboard/index.html` in
+a browser, and enter `http://localhost:8000` as the server URL.
+
+```bash
+cargo run -p hola-cli -- serve hola-cli/examples/example_study.yaml
+```
+
+The dashboard connects via `fetch` and `EventSource` (SSE). CORS
+is permissive by default on the server.
+
+## Pull request guidelines
+
+1. Create a feature branch from `main`
+2. Add tests for new functionality
+3. Ensure `cargo test --workspace --all-features` and
+   `hola-py/.venv/bin/python -m pytest hola-py/tests/` pass
+4. Run linters before pushing (`cargo clippy`, `cargo fmt`,
+   `ruff check`, `ruff format`)
+5. Keep PRs focused. One feature or fix per PR.

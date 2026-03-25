@@ -1,8 +1,0 @@
-pydantic
-numpy
-scipy>=1.7.3
-scikit-learn
-pandas
-falcon
-requests
-multiprocess
