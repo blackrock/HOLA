@@ -11,8 +11,8 @@
 
 import pathlib
 
-from .hola import *  # noqa: F403
-from .hola import (
+from .hola_opt import *  # noqa: F403
+from .hola_opt import (
     Categorical,
     CompletedTrial,
     Gmm,
