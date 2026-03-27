@@ -18,10 +18,10 @@ import matplotlib.pyplot as plt
 
 # Color palette for optimizers (colorblind-friendly)
 OPTIMIZER_COLORS: dict[str, str] = {
-    "HOLA (auto)": "#1f77b4",
+    "HOLA (GMM)": "#1f77b4",
     "HOLA (sobol)": "#aec7e8",
     "HOLA (random)": "#c7c7c7",
-    "HOLA MO (auto)": "#1f77b4",
+    "HOLA MO (GMM)": "#1f77b4",
     "HOLA MO (sobol)": "#aec7e8",
     "HOLA MO (random)": "#c7c7c7",
     "Random x2": "#9467bd",
@@ -42,7 +42,7 @@ def apply_paper_style() -> None:
     plt.style.use("seaborn-v0_8-whitegrid")
     mpl.rcParams.update(
         {
-            "figure.figsize": (8, 4),
+            "figure.figsize": (6.3, 3.5),
             "figure.dpi": 150,
             "savefig.dpi": 300,
             "savefig.bbox": "tight",
@@ -56,6 +56,9 @@ def apply_paper_style() -> None:
             "lines.linewidth": 1.5,
             "lines.markersize": 4,
             "grid.alpha": 0.3,
+            # PGF backend settings for font-consistent LaTeX output
+            "pgf.texsystem": "pdflatex",
+            "pgf.rcfonts": True,
         }
     )
 

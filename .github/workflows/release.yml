@@ -23,7 +23,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64
-          - os: ubuntu-24.04-arm64
+          - os: ubuntu-latest
             target: aarch64
           - os: macos-15-intel
             target: x86_64
@@ -57,6 +57,8 @@ jobs:
           args: --release --out dist
           manylinux: auto
           working-directory: hola-py
+          # ring (via rustls) needs __ARM_ARCH when cross-compiling aarch64 from x86 in manylinux Docker
+          docker-options: ${{ matrix.target == 'aarch64' && runner.os == 'Linux' && '-e CFLAGS_aarch64_unknown_linux_gnu=-D__ARM_ARCH=8' || '' }}
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
@@ -95,7 +97,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: hola-linux-x86_64
-          - os: ubuntu-24.04-arm64
+          - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             artifact: hola-linux-aarch64
           - os: macos-15-intel
@@ -117,7 +119,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu' && matrix.os != 'ubuntu-24.04-arm64'
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
@@ -126,6 +128,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} -p hola-cli
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CFLAGS_aarch64_unknown_linux_gnu: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '-D__ARM_ARCH=8' || '' }}
 
       - name: Package binary (Unix)
         if: runner.os != 'Windows'

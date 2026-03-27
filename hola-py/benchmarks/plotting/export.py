@@ -19,7 +19,8 @@ import matplotlib.pyplot as plt
 
 
 def save_figure(fig: plt.Figure, output_dir: Path, name: str) -> None:
-    """Save figure in both PDF and PNG formats."""
+    """Save figure in PDF, PNG, and PGF formats."""
     output_dir.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_dir / f"{name}.pdf", bbox_inches="tight", dpi=300)
     fig.savefig(output_dir / f"{name}.png", bbox_inches="tight", dpi=300)
+    fig.savefig(output_dir / f"{name}.pgf", bbox_inches="tight")

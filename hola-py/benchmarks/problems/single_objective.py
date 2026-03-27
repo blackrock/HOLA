@@ -39,7 +39,7 @@ _register(
         name="forrester_1d",
         func=f.forrester,
         bounds={"x": (0.0, 1.0)},
-        known_minimum=-6.0267,
+        known_minimum=-6.0207,
         description="1D, multiple local minima",
     )
 )

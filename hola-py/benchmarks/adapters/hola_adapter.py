@@ -17,6 +17,7 @@ import math
 import time
 
 import numpy as np
+from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
 from benchmarks.adapters.base import (
     MultiObjectiveResult,
@@ -113,11 +114,18 @@ class HolaMultiObjectiveAdapter:
         study.run(problem.func, budget, n_workers=1)
         wall_time = time.perf_counter() - t0
 
-        front = study.pareto_front()
-        if front:
-            pareto_array = np.array(
-                [[trial.scores[name] for name in problem.objective_names] for trial in front]
+        # Extract raw objective values from all completed trials and compute
+        # the non-dominated front externally.  Using trial.metrics (raw values)
+        # instead of trial.scores (TLP-transformed) ensures the Pareto front
+        # and downstream metrics (HV, IGD) are computed on the same scale as
+        # the external optimizers.
+        all_trials = study.trials(sorted_by="index", include_infeasible=True)
+        if all_trials:
+            raw_objectives = np.array(
+                [[t.metrics[name] for name in problem.objective_names] for t in all_trials]
             )
+            fronts = NonDominatedSorting().do(raw_objectives)
+            pareto_array = raw_objectives[fronts[0]]
         else:
             pareto_array = np.empty((0, len(problem.objective_names)))
 

@@ -101,7 +101,7 @@ def levy_13(p: dict[str, float]) -> float:
     x1, x2 = p["x1"], p["x2"]
     t1 = math.sin(3 * math.pi * x1) ** 2
     t2 = (x1 - 1) ** 2 * (1 + math.sin(3 * math.pi * x2) ** 2)
-    t3 = (x2 - 1) ** 2 * (1 + math.sin(2 * math.pi * x1) ** 2)
+    t3 = (x2 - 1) ** 2 * (1 + math.sin(2 * math.pi * x2) ** 2)
     return t1 + t2 + t3
 
 

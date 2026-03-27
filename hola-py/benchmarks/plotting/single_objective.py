@@ -33,7 +33,7 @@ def plot_normalized_means(df: pd.DataFrame, output_dir: Path, suffix: str = "") 
     budgets = sorted(scores["budget"].unique())
     optimizers = scores.groupby("optimizer")["mean_score"].mean().sort_values().index.tolist()
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(6.3, 4), layout="constrained")
     width = 0.8 / len(optimizers)
 
     for i, opt in enumerate(optimizers):
@@ -51,12 +51,18 @@ def plot_normalized_means(df: pd.DataFrame, output_dir: Path, suffix: str = "") 
     ax.set_xticklabels(budgets)
     ax.set_xlabel("Iteration budget")
     ax.set_ylabel("Mean normalized score (lower is better)")
-    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=7)
+    ax.legend(
+        bbox_to_anchor=(1.02, 1),
+        loc="upper left",
+        fontsize=7,
+        borderaxespad=0,
+    )
     ax.set_title("Average performance across benchmarks")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_dir / f"mean_normalized{suffix}.pdf")
     fig.savefig(output_dir / f"mean_normalized{suffix}.png")
+    fig.savefig(output_dir / f"mean_normalized{suffix}.pgf")
     plt.close(fig)
     print(f"Saved normalized mean plots to {output_dir}")
 
@@ -68,7 +74,7 @@ def plot_box_per_benchmark(df: pd.DataFrame, output_dir: Path) -> None:
 
     for problem_name, group in df.groupby("problem"):
         optimizers = sorted(group["optimizer"].unique())
-        fig, ax = plt.subplots(figsize=(10, 5))
+        fig, ax = plt.subplots(figsize=(6.3, 4), layout="constrained")
 
         data_by_opt = [group[group["optimizer"] == opt]["best_value"].values for opt in optimizers]
         bp = ax.boxplot(
@@ -83,10 +89,11 @@ def plot_box_per_benchmark(df: pd.DataFrame, output_dir: Path) -> None:
             patch.set_alpha(0.7)
 
         ax.set_ylabel("Best value found (lower is better)")
-        ax.set_title(f"Benchmark: {problem_name}")
+        ax.set_title(f"Benchmark: {problem_name.replace('_', ' ')}")
         plt.xticks(rotation=45, ha="right")
 
         fig.savefig(output_dir / f"box_{problem_name}.pdf")
+        fig.savefig(output_dir / f"box_{problem_name}.pgf")
         plt.close(fig)
 
     print(f"Saved per-benchmark box plots to {output_dir}")

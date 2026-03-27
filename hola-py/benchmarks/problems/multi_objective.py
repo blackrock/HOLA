@@ -145,10 +145,10 @@ for n_obj in (2, 3):
     n_dist = 4
     n_vars = k + n_dist
 
-    for variant, fn, desc in [
-        ("wfg1", wfg.wfg1, "Mixed convex/concave, biased"),
-        ("wfg4", wfg.wfg4, "Multimodal"),
-        ("wfg9", wfg.wfg9, "Non-separable, deceptive"),
+    for variant, fn, pf_fn, desc in [
+        ("wfg1", wfg.wfg1, wfg.wfg1_pareto_front, "Mixed convex/concave, biased"),
+        ("wfg4", wfg.wfg4, wfg.wfg4_pareto_front, "Multimodal"),
+        ("wfg9", wfg.wfg9, wfg.wfg9_pareto_front, "Non-separable, deceptive"),
     ]:
         _register(
             MultiObjectiveProblem(
@@ -157,6 +157,7 @@ for n_obj in (2, 3):
                 bounds=_unit_bounds(n_vars),
                 objective_names=tuple(f"f{i + 1}" for i in range(n_obj)),
                 reference_point=tuple(2.0 * (i + 1) + 1 for i in range(n_obj)),
+                true_pareto_front=pf_fn(n_obj),
                 description=f"{desc}, {n_obj} objectives",
             )
         )
