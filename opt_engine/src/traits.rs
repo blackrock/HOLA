@@ -163,7 +163,7 @@ pub trait Transformer: Send + Sync + 'static {
 ///             .iter()
 ///             .map(|(c, _)| space.to_unit_cube(c))
 ///             .collect();
-///         
+///
 ///         // Fit GMM to the samples
 ///         self.fit_from_samples(&samples, 3, 100, 1e-6, 1e-4);
 ///     }

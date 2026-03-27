@@ -29,6 +29,7 @@ def plot_hv_by_budget(df: pd.DataFrame, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for problem_name, group in df.groupby("problem"):
+        name = str(problem_name)
         fig, ax = plt.subplots(figsize=(6.3, 3.5), layout="constrained")
         budgets = sorted(group["budget"].unique())
         optimizers = sorted(group["optimizer"].unique())
@@ -44,7 +45,7 @@ def plot_hv_by_budget(df: pd.DataFrame, output_dir: Path) -> None:
         ax.set_xticklabels(budgets)
         ax.set_xlabel("Iteration budget")
         ax.set_ylabel("Hypervolume (higher is better)")
-        ax.set_title(f"{problem_name.replace('_', ' ')}")
+        ax.set_title(f"{name.replace('_', ' ')}")
         ax.legend(
             fontsize=7,
             bbox_to_anchor=(1.02, 1),
@@ -52,8 +53,8 @@ def plot_hv_by_budget(df: pd.DataFrame, output_dir: Path) -> None:
             borderaxespad=0,
         )
 
-        fig.savefig(output_dir / f"hv_{problem_name}.pdf")
-        fig.savefig(output_dir / f"hv_{problem_name}.pgf")
+        fig.savefig(output_dir / f"hv_{name}.pdf")
+        fig.savefig(output_dir / f"hv_{name}.pgf")
         plt.close(fig)
 
     print(f"Saved HV plots to {output_dir}")

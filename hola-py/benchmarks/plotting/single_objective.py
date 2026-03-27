@@ -73,6 +73,7 @@ def plot_box_per_benchmark(df: pd.DataFrame, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for problem_name, group in df.groupby("problem"):
+        name = str(problem_name)
         optimizers = sorted(group["optimizer"].unique())
         fig, ax = plt.subplots(figsize=(6.3, 4), layout="constrained")
 
@@ -89,11 +90,11 @@ def plot_box_per_benchmark(df: pd.DataFrame, output_dir: Path) -> None:
             patch.set_alpha(0.7)
 
         ax.set_ylabel("Best value found (lower is better)")
-        ax.set_title(f"Benchmark: {problem_name.replace('_', ' ')}")
+        ax.set_title(f"Benchmark: {name.replace('_', ' ')}")
         plt.xticks(rotation=45, ha="right")
 
-        fig.savefig(output_dir / f"box_{problem_name}.pdf")
-        fig.savefig(output_dir / f"box_{problem_name}.pgf")
+        fig.savefig(output_dir / f"box_{name}.pdf")
+        fig.savefig(output_dir / f"box_{name}.pgf")
         plt.close(fig)
 
     print(f"Saved per-benchmark box plots to {output_dir}")
