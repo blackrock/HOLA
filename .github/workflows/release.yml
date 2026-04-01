@@ -54,7 +54,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --release --out dist ${{ runner.os == 'Linux' && '-i python3.10' || '' }}
           manylinux: auto
           working-directory: hola-py
           # ring (via rustls) needs __ARM_ARCH when cross-compiling aarch64 from x86 in manylinux Docker
