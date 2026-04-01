@@ -26,7 +26,7 @@ dashboard can connect from any language or machine.
     (TLP) objectives with priority groups.
 
 **Flexible parameter spaces.**
-:   Continuous, integer, and categorical parameters with linear,
+:   Real, integer, and categorical parameters with linear,
     log, and log10 scales.
 
 **Real-time dashboard.**

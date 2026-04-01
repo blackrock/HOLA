@@ -102,7 +102,7 @@ def write_yaml_config(
     Uses simple string formatting to avoid pyyaml dependency.
     """
     if space is None:
-        space = {"x": {"type": "continuous", "min": 0.0, "max": 1.0}}
+        space = {"x": {"type": "real", "min": 0.0, "max": 1.0}}
 
     lines = ["space:"]
     for name, cfg in space.items():

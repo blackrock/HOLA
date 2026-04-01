@@ -162,8 +162,8 @@ class TestRestMultiParam:
 
     @pytest.mark.server_config(
         space={
-            "lr": {"type": "continuous", "min": 0.0001, "max": 0.1, "scale": "log10"},
-            "layers": {"type": "discrete", "min": 1, "max": 10},
+            "lr": {"type": "real", "min": 0.0001, "max": 0.1, "scale": "log10"},
+            "layers": {"type": "integer", "min": 1, "max": 10},
             "opt": {"type": "categorical", "choices": ["adam", "sgd", "rmsprop"]},
         },
         objectives=[{"field": "loss", "type": "minimize", "priority": 1.0}],

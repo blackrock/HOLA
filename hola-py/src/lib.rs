@@ -314,14 +314,14 @@ impl Space {
 
 fn extract_param_config(obj: &Bound<'_, PyAny>) -> PyResult<ParamConfig> {
     if let Ok(r) = obj.extract::<Real>() {
-        return Ok(ParamConfig::Continuous {
+        return Ok(ParamConfig::Real {
             min: r.min,
             max: r.max,
             scale: r.scale,
         });
     }
     if let Ok(d) = obj.extract::<Integer>() {
-        return Ok(ParamConfig::Discrete {
+        return Ok(ParamConfig::Integer {
             min: d.min,
             max: d.max,
         });

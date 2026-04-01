@@ -28,12 +28,12 @@ async fn test_dyn_engine_config_parsing() {
     let yaml_config = r#"
     space:
       learning_rate:
-        type: continuous
+        type: real
         min: 0.0001
         max: 0.1
         scale: log10
       num_layers:
-        type: discrete
+        type: integer
         min: 1
         max: 10
     objectives:
@@ -65,7 +65,7 @@ async fn test_dyn_engine_config_with_checkpoint() {
     let yaml = r#"
     space:
       x:
-        type: continuous
+        type: real
         min: 0.0
         max: 1.0
     objectives:
@@ -97,7 +97,7 @@ async fn test_dyn_engine_ask_tell_flow() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -147,7 +147,7 @@ async fn test_dyn_engine_unknown_trial_error() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -177,7 +177,7 @@ async fn test_dyn_engine_double_tell_error() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -212,7 +212,7 @@ async fn test_dyn_engine_all_param_types() {
         space: BTreeMap::from([
             (
                 "lr".to_string(),
-                ParamConfig::Continuous {
+                ParamConfig::Real {
                     min: 1e-4,
                     max: 0.1,
                     scale: "log10".to_string(),
@@ -220,7 +220,7 @@ async fn test_dyn_engine_all_param_types() {
             ),
             (
                 "layers".to_string(),
-                ParamConfig::Discrete { min: 1, max: 10 },
+                ParamConfig::Integer { min: 1, max: 10 },
             ),
             (
                 "optimizer".to_string(),
@@ -230,7 +230,7 @@ async fn test_dyn_engine_all_param_types() {
             ),
             (
                 "dropout".to_string(),
-                ParamConfig::Continuous {
+                ParamConfig::Real {
                     min: 0.0,
                     max: 0.5,
                     scale: "linear".to_string(),
@@ -296,7 +296,7 @@ async fn test_dyn_engine_ask_returns_valid_params() {
         space: BTreeMap::from([
             (
                 "lr".to_string(),
-                ParamConfig::Continuous {
+                ParamConfig::Real {
                     min: 0.001,
                     max: 1.0,
                     scale: "log10".to_string(),
@@ -304,7 +304,7 @@ async fn test_dyn_engine_ask_returns_valid_params() {
             ),
             (
                 "batch".to_string(),
-                ParamConfig::Discrete { min: 16, max: 256 },
+                ParamConfig::Integer { min: 16, max: 256 },
             ),
         ]),
         objectives: vec![ObjectiveConfig {
@@ -337,7 +337,7 @@ async fn test_dyn_engine_param_info() {
         space: BTreeMap::from([
             (
                 "lr".to_string(),
-                ParamConfig::Continuous {
+                ParamConfig::Real {
                     min: 1e-4,
                     max: 0.1,
                     scale: "log10".to_string(),
@@ -345,7 +345,7 @@ async fn test_dyn_engine_param_info() {
             ),
             (
                 "layers".to_string(),
-                ParamConfig::Discrete { min: 1, max: 10 },
+                ParamConfig::Integer { min: 1, max: 10 },
             ),
             (
                 "opt".to_string(),
@@ -372,9 +372,9 @@ async fn test_dyn_engine_param_info() {
     assert_eq!(info.len(), 3);
 
     let info_map: BTreeMap<String, _> = info.into_iter().collect();
-    assert_eq!(info_map["lr"].param_type, "continuous");
+    assert_eq!(info_map["lr"].param_type, "real");
     assert_eq!(info_map["lr"].scale, "log10");
-    assert_eq!(info_map["layers"].param_type, "discrete");
+    assert_eq!(info_map["layers"].param_type, "integer");
     assert_eq!(info_map["opt"].param_type, "categorical");
     assert_eq!(info_map["opt"].choices.as_ref().unwrap().len(), 2);
 }
@@ -389,7 +389,7 @@ async fn test_dyn_engine_strategy_types() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -421,7 +421,7 @@ async fn test_dyn_engine_strategy_types() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -453,7 +453,7 @@ async fn test_dyn_engine_strategy_types() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -484,7 +484,7 @@ async fn test_dyn_engine_scalarize_missing_field_infinity() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -519,7 +519,7 @@ async fn test_dyn_engine_scalarize_maximize() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -569,7 +569,7 @@ async fn test_dyn_engine_tlp_objectives() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -615,7 +615,7 @@ async fn test_dyn_engine_update_objectives() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -660,7 +660,7 @@ async fn test_dyn_engine_objectives_accessor() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -701,7 +701,7 @@ async fn test_dyn_engine_update_objectives_rescalarizes() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -761,7 +761,7 @@ async fn test_dyn_engine_rescalarize() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -800,7 +800,7 @@ async fn test_dyn_engine_gmm_with_refit() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -844,7 +844,7 @@ async fn test_refit_excludes_infeasible_scalar() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -894,7 +894,7 @@ async fn test_update_objectives_triggers_refit() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -960,7 +960,7 @@ async fn test_dyn_engine_leaderboard_checkpoint() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -1008,7 +1008,7 @@ async fn test_dyn_engine_full_checkpoint() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -1053,7 +1053,7 @@ async fn test_auto_strategy_default() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -1095,7 +1095,7 @@ async fn test_auto_strategy_with_explicit_exploration_budget() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -1167,7 +1167,7 @@ async fn test_seed_determinism_sobol() {
         HolaEngine::from_config(StudyConfig {
             space: BTreeMap::from([(
                 "x".to_string(),
-                ParamConfig::Continuous {
+                ParamConfig::Real {
                     min: 0.0,
                     max: 1.0,
                     scale: "linear".to_string(),
@@ -1214,7 +1214,7 @@ async fn test_seed_determinism_random() {
         HolaEngine::from_config(StudyConfig {
             space: BTreeMap::from([(
                 "x".to_string(),
-                ParamConfig::Continuous {
+                ParamConfig::Real {
                     min: 0.0,
                     max: 1.0,
                     scale: "linear".to_string(),
@@ -1264,7 +1264,7 @@ async fn test_pareto_front_multi_objective() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -1325,7 +1325,7 @@ async fn test_pareto_front_scalar_study_errors() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -1354,7 +1354,7 @@ async fn test_pareto_front_empty() {
     let config = StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),

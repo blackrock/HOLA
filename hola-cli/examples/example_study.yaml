@@ -2,13 +2,13 @@
 
 space:
   learning_rate:
-    type: continuous
+    type: real
     min: 0.0001
     max: 0.1
     scale: log10
 
   num_layers:
-    type: discrete
+    type: integer
     min: 1
     max: 10
 
@@ -21,7 +21,7 @@ space:
       - adamw
 
   momentum:
-    type: continuous
+    type: real
     min: 0.5
     max: 0.99
 

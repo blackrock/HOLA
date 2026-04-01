@@ -112,7 +112,7 @@ function loadCheckpointFile(event) {
                 const c = typeof S.trials[0].params === 'object' ? S.trials[0].params : {};
                 S.paramNames = Object.keys(c);
                 S.space = S.paramNames.map(name => ({
-                    name, type: 'continuous', min: 0, max: 1, scale: 'linear'
+                    name, type: 'real', min: 0, max: 1, scale: 'linear'
                 }));
                 // Compute actual bounds from data
                 for (const p of S.space) {

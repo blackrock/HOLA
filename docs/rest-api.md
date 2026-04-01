@@ -424,14 +424,14 @@ Get parameter space metadata.
   "params": [
     {
       "name": "learning_rate",
-      "type": "continuous",
+      "type": "real",
       "min": -4.0,
       "max": -1.0,
       "scale": "log10"
     },
     {
       "name": "num_layers",
-      "type": "discrete",
+      "type": "integer",
       "min": 1,
       "max": 10,
       "scale": null

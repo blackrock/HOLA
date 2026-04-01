@@ -29,11 +29,11 @@ async fn test_e2e_hola_engine_yaml_config() {
     let yaml = r#"
     space:
       x:
-        type: continuous
+        type: real
         min: -5.0
         max: 5.0
       y:
-        type: continuous
+        type: real
         min: -5.0
         max: 5.0
     objectives:
@@ -76,7 +76,7 @@ async fn test_e2e_checkpoint_resume_continues() {
         space: BTreeMap::from([
             (
                 "x".to_string(),
-                ParamConfig::Continuous {
+                ParamConfig::Real {
                     min: -5.0,
                     max: 5.0,
                     scale: "linear".to_string(),
@@ -84,7 +84,7 @@ async fn test_e2e_checkpoint_resume_continues() {
             ),
             (
                 "y".to_string(),
-                ParamConfig::Continuous {
+                ParamConfig::Real {
                     min: -5.0,
                     max: 5.0,
                     scale: "linear".to_string(),

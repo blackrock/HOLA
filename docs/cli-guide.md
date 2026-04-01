@@ -33,13 +33,13 @@ objectives, strategy, and optional checkpointing.
 
 space:
   learning_rate:
-    type: continuous
+    type: real
     min: 0.0001
     max: 0.1
     scale: log10
 
   num_layers:
-    type: discrete
+    type: integer
     min: 1
     max: 10
 
@@ -52,7 +52,7 @@ space:
       - adamw
 
   momentum:
-    type: continuous
+    type: real
     min: 0.5
     max: 0.99
 
@@ -85,11 +85,11 @@ strategy:
 Each parameter in the `space:` section has a `type` and
 type-specific fields.
 
-#### Continuous
+#### Real
 
 ```yaml
 temperature:
-  type: continuous
+  type: real
   min: 0.0
   max: 2.0
 ```
@@ -101,7 +101,7 @@ We default to `"linear"` scale; you can also set `"log10"` or
 
 ```yaml
 learning_rate:
-  type: continuous
+  type: real
   min: 0.0001
   max: 0.1
   scale: log10
@@ -112,11 +112,11 @@ This matches the Python API where
 `Real(1e-4, 0.1, scale="log10")` also takes actual values.
 Internally, HOLA samples uniformly in log10 space.
 
-#### Discrete
+#### Integer
 
 ```yaml
 num_layers:
-  type: discrete
+  type: integer
   min: 1
   max: 10
 ```

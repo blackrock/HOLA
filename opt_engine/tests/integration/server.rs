@@ -29,7 +29,7 @@ fn minimal_config() -> StudyConfig {
     StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),
@@ -53,7 +53,7 @@ fn multi_param_config() -> StudyConfig {
         space: BTreeMap::from([
             (
                 "lr".to_string(),
-                ParamConfig::Continuous {
+                ParamConfig::Real {
                     min: 0.001,
                     max: 1.0,
                     scale: "log10".to_string(),
@@ -61,7 +61,7 @@ fn multi_param_config() -> StudyConfig {
             ),
             (
                 "layers".to_string(),
-                ParamConfig::Discrete { min: 1, max: 10 },
+                ParamConfig::Integer { min: 1, max: 10 },
             ),
             (
                 "opt".to_string(),
@@ -242,9 +242,9 @@ async fn test_server_space_with_all_param_types() {
 
     let find =
         |name: &str| -> &serde_json::Value { params.iter().find(|p| p["name"] == name).unwrap() };
-    assert_eq!(find("lr")["type"], "continuous");
+    assert_eq!(find("lr")["type"], "real");
     assert_eq!(find("lr")["scale"], "log10");
-    assert_eq!(find("layers")["type"], "discrete");
+    assert_eq!(find("layers")["type"], "integer");
     assert_eq!(find("opt")["type"], "categorical");
 }
 
@@ -354,7 +354,7 @@ fn multi_objective_config() -> StudyConfig {
     StudyConfig {
         space: BTreeMap::from([(
             "x".to_string(),
-            ParamConfig::Continuous {
+            ParamConfig::Real {
                 min: 0.0,
                 max: 1.0,
                 scale: "linear".to_string(),

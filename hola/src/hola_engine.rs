@@ -41,7 +41,7 @@ use tokio::sync::RwLock;
 /// so it can auto-configure axis labels, scales, and choice dropdowns.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ParamInfo {
-    pub param_type: String, // "continuous", "discrete", or "categorical"
+    pub param_type: String, // "real", "integer", or "categorical"
     pub min: f64,
     pub max: f64,
     pub scale: String, // "linear", "log", "log10"
@@ -60,10 +60,10 @@ pub struct ParamInfo {
 /// [`Engine`](opt_engine::engine::Engine) with the [`SampleSpace`] /
 /// [`StandardizedSpace`] traits directly.
 enum DynDimension {
-    ContinuousLinear(ContinuousSpace<LinearScale>),
-    ContinuousLog(ContinuousSpace<LogScale>),
-    ContinuousLog10(ContinuousSpace<Log10Scale>),
-    Discrete(DiscreteSpace),
+    RealLinear(ContinuousSpace<LinearScale>),
+    RealLog(ContinuousSpace<LogScale>),
+    RealLog10(ContinuousSpace<Log10Scale>),
+    Integer(DiscreteSpace),
     Categorical(CategoricalSpace),
 }
 
@@ -71,59 +71,59 @@ enum DynDimension {
 impl DynDimension {
     fn dimensionality(&self) -> usize {
         match self {
-            Self::ContinuousLinear(s) => s.dimensionality(),
-            Self::ContinuousLog(s) => s.dimensionality(),
-            Self::ContinuousLog10(s) => s.dimensionality(),
-            Self::Discrete(s) => s.dimensionality(),
+            Self::RealLinear(s) => s.dimensionality(),
+            Self::RealLog(s) => s.dimensionality(),
+            Self::RealLog10(s) => s.dimensionality(),
+            Self::Integer(s) => s.dimensionality(),
             Self::Categorical(s) => s.dimensionality(),
         }
     }
 
     fn to_unit_cube(&self, val: &serde_json::Value) -> Option<Vec<f64>> {
         match self {
-            Self::ContinuousLinear(s) => val.as_f64().map(|v| s.to_unit_cube(&v)),
-            Self::ContinuousLog(s) => val.as_f64().map(|v| s.to_unit_cube(&v)),
-            Self::ContinuousLog10(s) => val.as_f64().map(|v| s.to_unit_cube(&v)),
-            Self::Discrete(s) => val.as_i64().map(|v| s.to_unit_cube(&v)),
+            Self::RealLinear(s) => val.as_f64().map(|v| s.to_unit_cube(&v)),
+            Self::RealLog(s) => val.as_f64().map(|v| s.to_unit_cube(&v)),
+            Self::RealLog10(s) => val.as_f64().map(|v| s.to_unit_cube(&v)),
+            Self::Integer(s) => val.as_i64().map(|v| s.to_unit_cube(&v)),
             Self::Categorical(s) => val.as_str().map(|v| s.to_unit_cube(&v.to_string())),
         }
     }
 
     fn from_unit_cube(&self, vec: &[f64]) -> Option<serde_json::Value> {
         match self {
-            Self::ContinuousLinear(s) => s.from_unit_cube(vec).map(serde_json::Value::from),
-            Self::ContinuousLog(s) => s.from_unit_cube(vec).map(serde_json::Value::from),
-            Self::ContinuousLog10(s) => s.from_unit_cube(vec).map(serde_json::Value::from),
-            Self::Discrete(s) => s.from_unit_cube(vec).map(serde_json::Value::from),
+            Self::RealLinear(s) => s.from_unit_cube(vec).map(serde_json::Value::from),
+            Self::RealLog(s) => s.from_unit_cube(vec).map(serde_json::Value::from),
+            Self::RealLog10(s) => s.from_unit_cube(vec).map(serde_json::Value::from),
+            Self::Integer(s) => s.from_unit_cube(vec).map(serde_json::Value::from),
             Self::Categorical(s) => s.from_unit_cube(vec).map(serde_json::Value::from),
         }
     }
 
     fn contains(&self, val: &serde_json::Value) -> bool {
         match self {
-            Self::ContinuousLinear(s) => val.as_f64().is_some_and(|v| s.contains(&v)),
-            Self::ContinuousLog(s) => val.as_f64().is_some_and(|v| s.contains(&v)),
-            Self::ContinuousLog10(s) => val.as_f64().is_some_and(|v| s.contains(&v)),
-            Self::Discrete(s) => val.as_i64().is_some_and(|v| s.contains(&v)),
+            Self::RealLinear(s) => val.as_f64().is_some_and(|v| s.contains(&v)),
+            Self::RealLog(s) => val.as_f64().is_some_and(|v| s.contains(&v)),
+            Self::RealLog10(s) => val.as_f64().is_some_and(|v| s.contains(&v)),
+            Self::Integer(s) => val.as_i64().is_some_and(|v| s.contains(&v)),
             Self::Categorical(s) => val.as_str().is_some_and(|v| s.contains(&v.to_string())),
         }
     }
 
     fn clamp(&self, val: &serde_json::Value) -> serde_json::Value {
         match self {
-            Self::ContinuousLinear(s) => val
+            Self::RealLinear(s) => val
                 .as_f64()
                 .map(|v| serde_json::Value::from(s.clamp(&v)))
                 .unwrap_or_else(|| val.clone()),
-            Self::ContinuousLog(s) => val
+            Self::RealLog(s) => val
                 .as_f64()
                 .map(|v| serde_json::Value::from(s.clamp(&v)))
                 .unwrap_or_else(|| val.clone()),
-            Self::ContinuousLog10(s) => val
+            Self::RealLog10(s) => val
                 .as_f64()
                 .map(|v| serde_json::Value::from(s.clamp(&v)))
                 .unwrap_or_else(|| val.clone()),
-            Self::Discrete(s) => val
+            Self::Integer(s) => val
                 .as_i64()
                 .map(|v| serde_json::Value::from(s.clamp(&v)))
                 .unwrap_or_else(|| val.clone()),
@@ -136,22 +136,22 @@ impl DynDimension {
 
     fn to_param_config(&self) -> ParamConfig {
         match self {
-            Self::ContinuousLinear(s) => ParamConfig::Continuous {
+            Self::RealLinear(s) => ParamConfig::Real {
                 min: s.min,
                 max: s.max,
                 scale: "linear".to_string(),
             },
-            Self::ContinuousLog(s) => ParamConfig::Continuous {
+            Self::RealLog(s) => ParamConfig::Real {
                 min: s.min,
                 max: s.max,
                 scale: "log".to_string(),
             },
-            Self::ContinuousLog10(s) => ParamConfig::Continuous {
+            Self::RealLog10(s) => ParamConfig::Real {
                 min: s.min,
                 max: s.max,
                 scale: "log10".to_string(),
             },
-            Self::Discrete(s) => ParamConfig::Discrete {
+            Self::Integer(s) => ParamConfig::Integer {
                 min: s.min,
                 max: s.max,
             },
@@ -163,29 +163,29 @@ impl DynDimension {
 
     fn param_info(&self) -> ParamInfo {
         match self {
-            Self::ContinuousLinear(s) => ParamInfo {
-                param_type: "continuous".into(),
+            Self::RealLinear(s) => ParamInfo {
+                param_type: "real".into(),
                 min: s.min,
                 max: s.max,
                 scale: LinearScale::name().to_string(),
                 choices: None,
             },
-            Self::ContinuousLog(s) => ParamInfo {
-                param_type: "continuous".into(),
+            Self::RealLog(s) => ParamInfo {
+                param_type: "real".into(),
                 min: s.min,
                 max: s.max,
                 scale: LogScale::name().to_string(),
                 choices: None,
             },
-            Self::ContinuousLog10(s) => ParamInfo {
-                param_type: "continuous".into(),
+            Self::RealLog10(s) => ParamInfo {
+                param_type: "real".into(),
                 min: s.min,
                 max: s.max,
                 scale: Log10Scale::name().to_string(),
                 choices: None,
             },
-            Self::Discrete(s) => ParamInfo {
-                param_type: "discrete".into(),
+            Self::Integer(s) => ParamInfo {
+                param_type: "integer".into(),
                 min: s.min as f64,
                 max: s.max as f64,
                 scale: "linear".into(),
@@ -245,42 +245,42 @@ impl DynSpace {
         }
     }
 
-    pub fn add_continuous(mut self, name: &str, min: f64, max: f64) -> Self {
+    pub fn add_real(mut self, name: &str, min: f64, max: f64) -> Self {
         Arc::get_mut(&mut self.dims)
             .expect("DynSpace is being built; refcount must be 1")
             .push((
                 name.to_string(),
-                DynDimension::ContinuousLinear(ContinuousSpace::new(min, max)),
+                DynDimension::RealLinear(ContinuousSpace::new(min, max)),
             ));
         self
     }
 
-    pub fn add_continuous_log(mut self, name: &str, min: f64, max: f64) -> Self {
+    pub fn add_real_log(mut self, name: &str, min: f64, max: f64) -> Self {
         Arc::get_mut(&mut self.dims)
             .expect("DynSpace is being built; refcount must be 1")
             .push((
                 name.to_string(),
-                DynDimension::ContinuousLog(ContinuousSpace::with_scale(min, max, LogScale)),
+                DynDimension::RealLog(ContinuousSpace::with_scale(min, max, LogScale)),
             ));
         self
     }
 
-    pub fn add_continuous_log10(mut self, name: &str, min: f64, max: f64) -> Self {
+    pub fn add_real_log10(mut self, name: &str, min: f64, max: f64) -> Self {
         Arc::get_mut(&mut self.dims)
             .expect("DynSpace is being built; refcount must be 1")
             .push((
                 name.to_string(),
-                DynDimension::ContinuousLog10(ContinuousSpace::with_scale(min, max, Log10Scale)),
+                DynDimension::RealLog10(ContinuousSpace::with_scale(min, max, Log10Scale)),
             ));
         self
     }
 
-    pub fn add_discrete(mut self, name: &str, min: i64, max: i64) -> Self {
+    pub fn add_integer(mut self, name: &str, min: i64, max: i64) -> Self {
         Arc::get_mut(&mut self.dims)
             .expect("DynSpace is being built; refcount must be 1")
             .push((
                 name.to_string(),
-                DynDimension::Discrete(DiscreteSpace::new(min, max)),
+                DynDimension::Integer(DiscreteSpace::new(min, max)),
             ));
         self
     }
@@ -488,13 +488,13 @@ impl opt_engine::traits::RefittableStrategy for DynStrategy {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ParamConfig {
-    Continuous {
+    Real {
         min: f64,
         max: f64,
         #[serde(default = "default_scale")]
         scale: String,
     },
-    Discrete {
+    Integer {
         min: i64,
         max: i64,
     },
@@ -984,7 +984,7 @@ impl HolaEngine {
         let mut space = DynSpace::new();
         for (name, param) in &config.space {
             space = match param {
-                ParamConfig::Continuous { min, max, scale } => match scale.as_str() {
+                ParamConfig::Real { min, max, scale } => match scale.as_str() {
                     "log" | "ln" => {
                         if *min <= 0.0 || *max <= 0.0 {
                             return Err(format!(
@@ -996,7 +996,7 @@ impl HolaEngine {
                                 "Parameter '{name}': min must be less than max, got min={min}, max={max}",
                             ));
                         }
-                        space.add_continuous_log(name, *min, *max)
+                        space.add_real_log(name, *min, *max)
                     }
                     "log10" => {
                         if *min <= 0.0 || *max <= 0.0 {
@@ -1009,11 +1009,11 @@ impl HolaEngine {
                                 "Parameter '{name}': min must be less than max, got min={min}, max={max}",
                             ));
                         }
-                        space.add_continuous_log10(name, *min, *max)
+                        space.add_real_log10(name, *min, *max)
                     }
-                    _ => space.add_continuous(name, *min, *max),
+                    _ => space.add_real(name, *min, *max),
                 },
-                ParamConfig::Discrete { min, max } => space.add_discrete(name, *min, *max),
+                ParamConfig::Integer { min, max } => space.add_integer(name, *min, *max),
                 ParamConfig::Categorical { choices } => {
                     space.add_categorical(name, choices.clone())
                 }
@@ -1660,8 +1660,8 @@ mod tests {
     #[test]
     fn test_dyn_space_basic() {
         let space = DynSpace::new()
-            .add_continuous("lr", 0.0, 1.0)
-            .add_discrete("layers", 1, 10);
+            .add_real("lr", 0.0, 1.0)
+            .add_integer("layers", 1, 10);
 
         assert_eq!(space.dimensionality(), 2);
 
@@ -1678,7 +1678,7 @@ mod tests {
 
     #[test]
     fn test_dyn_space_log10() {
-        let space = DynSpace::new().add_continuous_log10("lr", 1e-4, 0.1);
+        let space = DynSpace::new().add_real_log10("lr", 1e-4, 0.1);
         assert_eq!(space.dimensionality(), 1);
 
         let point = serde_json::json!({"lr": 0.01}); // 10^-2
@@ -1708,9 +1708,9 @@ mod tests {
     #[test]
     fn test_dyn_space_builder_api() {
         let space = DynSpace::new()
-            .add_continuous("x", 0.0, 1.0)
-            .add_continuous_log10("lr", 1e-4, 0.1)
-            .add_discrete("layers", 1, 10)
+            .add_real("x", 0.0, 1.0)
+            .add_real_log10("lr", 1e-4, 0.1)
+            .add_integer("layers", 1, 10)
             .add_categorical("opt", vec!["adam".into(), "sgd".into()]);
 
         assert_eq!(space.dimensionality(), 4);
@@ -1719,8 +1719,8 @@ mod tests {
     #[test]
     fn test_dyn_space_from_unit_cube_wrong_length() {
         let space = DynSpace::new()
-            .add_continuous("x", 0.0, 1.0)
-            .add_continuous("y", 0.0, 1.0);
+            .add_real("x", 0.0, 1.0)
+            .add_real("y", 0.0, 1.0);
 
         assert_eq!(space.dimensionality(), 2);
         assert!(space.from_unit_cube(&[0.5]).is_none());
@@ -1731,8 +1731,8 @@ mod tests {
     #[test]
     fn test_dyn_space_unit_cube_roundtrip() {
         let space = DynSpace::new()
-            .add_continuous("x", 0.0, 10.0)
-            .add_discrete("n", 1, 5)
+            .add_real("x", 0.0, 10.0)
+            .add_integer("n", 1, 5)
             .add_categorical("opt", vec!["a".into(), "b".into()]);
 
         let point = serde_json::json!({"x": 5.0, "n": 3, "opt": "b"});
@@ -1749,8 +1749,8 @@ mod tests {
     #[test]
     fn test_dyn_space_contains() {
         let space = DynSpace::new()
-            .add_continuous("x", 0.0, 1.0)
-            .add_discrete("n", 1, 5)
+            .add_real("x", 0.0, 1.0)
+            .add_integer("n", 1, 5)
             .add_categorical("opt", vec!["a".into(), "b".into()]);
 
         assert!(space.contains(&serde_json::json!({"x": 0.5, "n": 3, "opt": "a"})));
@@ -1762,8 +1762,8 @@ mod tests {
     #[test]
     fn test_dyn_space_clamp() {
         let space = DynSpace::new()
-            .add_continuous("x", 0.0, 1.0)
-            .add_discrete("n", 1, 5);
+            .add_real("x", 0.0, 1.0)
+            .add_integer("n", 1, 5);
 
         let clamped = space.clamp(&serde_json::json!({"x": 2.0, "n": 10}));
         assert!((clamped.get("x").unwrap().as_f64().unwrap() - 1.0).abs() < 1e-9);
@@ -1773,8 +1773,8 @@ mod tests {
     #[test]
     fn test_dyn_space_log_scales() {
         let space = DynSpace::new()
-            .add_continuous_log("lr", 0.001, 1.0)
-            .add_continuous_log10("alpha", 1e-4, 0.1);
+            .add_real_log("lr", 0.001, 1.0)
+            .add_real_log10("alpha", 1e-4, 0.1);
 
         assert_eq!(space.dimensionality(), 2);
 
@@ -1788,5 +1788,41 @@ mod tests {
         let restored = space.from_unit_cube(&unit).unwrap();
         let lr = restored.get("lr").unwrap().as_f64().unwrap();
         assert!((lr - 0.01).abs() / 0.01 < 1e-6);
+    }
+
+    #[test]
+    fn test_param_config_serde_new_names() {
+        let yaml = r#"
+            x:
+              type: real
+              min: 0.0
+              max: 1.0
+            n:
+              type: integer
+              min: 1
+              max: 10
+            opt:
+              type: categorical
+              choices: ["a", "b"]
+        "#;
+        let space: BTreeMap<String, ParamConfig> = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(space["x"], ParamConfig::Real { .. }));
+        assert!(matches!(space["n"], ParamConfig::Integer { .. }));
+        assert!(matches!(space["opt"], ParamConfig::Categorical { .. }));
+    }
+
+    #[test]
+    fn test_param_config_serializes_new_names() {
+        let config = ParamConfig::Real {
+            min: 0.0,
+            max: 1.0,
+            scale: "linear".to_string(),
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["type"], "real");
+
+        let config = ParamConfig::Integer { min: 1, max: 10 };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["type"], "integer");
     }
 }
