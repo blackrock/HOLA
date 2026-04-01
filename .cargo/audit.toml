@@ -1,0 +1,3 @@
+[advisories]
+# paste is a transitive dep via simba -> nalgebra; waiting on upstream to switch to pastey
+ignore = ["RUSTSEC-2024-0436"]
