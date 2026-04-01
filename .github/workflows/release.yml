@@ -174,7 +174,7 @@ jobs:
       - name: Install and test
         shell: bash
         run: |
-          pip install dist/*.whl --find-links dist/
+          pip install hola-opt --no-index --find-links dist/
           python -c "from hola_opt import Study, Space, Real, Minimize; print('Import OK')"
           python -c "from hola_opt import dashboard_dir; assert dashboard_dir().exists(), 'Dashboard not bundled'"
 
