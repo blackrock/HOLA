@@ -18,11 +18,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -108,15 +108,15 @@ jobs:
           - os: windows-latest
             target: x64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Set up QEMU
         if: matrix.target == 'aarch64' && runner.os == 'Linux'
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: arm64
 
@@ -137,7 +137,7 @@ jobs:
           docker-options: ${{ matrix.target == 'aarch64' && runner.os == 'Linux' && '-e CFLAGS_aarch64_unknown_linux_gnu=-D__ARM_ARCH=8' || '' }}
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: hola-py/dist/*.whl
@@ -148,7 +148,7 @@ jobs:
     needs: [validate-release]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
@@ -158,7 +158,7 @@ jobs:
           working-directory: hola-py
 
       - name: Upload sdist artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: hola-py/dist/*.tar.gz
@@ -188,7 +188,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: hola-windows-x86_64.exe
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -222,7 +222,7 @@ jobs:
           Compress-Archive -Path ${{ matrix.artifact }} -DestinationPath ${{ matrix.artifact }}.zip
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cli-${{ matrix.artifact }}
           path: |
@@ -239,12 +239,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Download wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           merge-multiple: true
@@ -265,16 +265,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
@@ -289,7 +289,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Generate PEP 503 simple index
         env:

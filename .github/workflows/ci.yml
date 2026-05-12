@@ -22,7 +22,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,15 +49,15 @@ jobs:
       matrix:
         python-version: ["3.10", "3.12"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
 
       - name: Install dev + benchmark dependencies
         run: uv sync --locked --dev --group benchmarks
