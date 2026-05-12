@@ -29,6 +29,7 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -63,14 +64,17 @@ jobs:
         working-directory: hola-py
 
       - name: Ruff format check
+        if: matrix.python-version == '3.12'
         run: uv run ruff format --check .
         working-directory: hola-py
 
       - name: Ruff lint
+        if: matrix.python-version == '3.12'
         run: uv run ruff check .
         working-directory: hola-py
 
       - name: Type check (ty)
+        if: matrix.python-version == '3.12'
         run: uv run ty check .
         working-directory: hola-py
 
