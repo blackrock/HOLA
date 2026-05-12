@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "hola-opt"
-version = "0.1.0"
+version = "1.0.1-rc5"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 classifiers = [

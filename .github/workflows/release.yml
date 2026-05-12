@@ -6,16 +6,92 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-  pages: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  validate-release:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate tag and package versions
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${TAG_NAME#v}"
+          if [[ "${TAG_NAME}" != v* || -z "${version}" || "${version}" == "${TAG_NAME}" ]]; then
+            echo "Release tags must be named v<version>; got ${TAG_NAME}" >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          main_sha="$(git rev-parse origin/main)"
+          tag_sha="$(git rev-list -n 1 "${TAG_NAME}")"
+          if [[ "${tag_sha}" != "${main_sha}" ]]; then
+            echo "Release tag ${TAG_NAME} points to ${tag_sha}, but origin/main is ${main_sha}" >&2
+            exit 1
+          fi
+
+          TAG_VERSION="${version}" python <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = os.environ["TAG_VERSION"]
+          errors: list[str] = []
+
+          pyproject = tomllib.loads(Path("hola-py/pyproject.toml").read_text())
+          if pyproject["project"]["version"] != version:
+              errors.append(
+                  f"hola-py/pyproject.toml project.version is {pyproject['project']['version']!r}, expected {version!r}"
+              )
+
+          manifests = [
+              Path("opt_engine/Cargo.toml"),
+              Path("hola/Cargo.toml"),
+              Path("hola-py/Cargo.toml"),
+              Path("hola-cli/Cargo.toml"),
+          ]
+          for manifest in manifests:
+              data = tomllib.loads(manifest.read_text())
+              package_version = data["package"]["version"]
+              if package_version != version:
+                  errors.append(f"{manifest} package.version is {package_version!r}, expected {version!r}")
+              for section in ("dependencies", "dev-dependencies"):
+                  for dep_name, dep in data.get(section, {}).items():
+                      if isinstance(dep, dict) and "path" in dep and "version" in dep and dep["version"] != version:
+                          errors.append(
+                              f"{manifest} {section}.{dep_name}.version is {dep['version']!r}, expected {version!r}"
+                          )
+              for table, deps in data.items():
+                  if not table.startswith("dev-dependencies."):
+                      continue
+                  if isinstance(deps, dict) and "path" in deps and "version" in deps and deps["version"] != version:
+                      errors.append(f"{manifest} {table}.version is {deps['version']!r}, expected {version!r}")
+
+          if errors:
+              raise SystemExit("\n".join(errors))
+          PY
+
   # ── Python wheels (abi3 — one per platform) ─────────────
   build-wheels:
     name: Wheel (${{ matrix.os }} ${{ matrix.target }})
+    needs: [validate-release]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -69,6 +145,7 @@ jobs:
   # ── Source distribution ─────────────────────────────────
   build-sdist:
     name: Source distribution
+    needs: [validate-release]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -89,6 +166,7 @@ jobs:
   # ── CLI binaries ────────────────────────────────────────
   build-cli:
     name: CLI (${{ matrix.target }})
+    needs: [validate-release]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -183,6 +261,8 @@ jobs:
     name: GitHub Release
     needs: [build-wheels, build-sdist, build-cli, test-wheels]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
 
@@ -205,23 +285,38 @@ jobs:
     name: Update Package Index
     needs: [release]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
 
       - name: Generate PEP 503 simple index
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           mkdir -p index/simple/hola-opt
 
-          # Collect wheel/sdist download URLs from all stable GitHub releases.
+          # Collect wheel/sdist download URLs from stable releases. If no stable
+          # release exists yet, index only the current prerelease so old RC assets
+          # with obsolete package versions do not remain install candidates.
           # gh release view returns browser-downloadable URLs in .assets[].url.
           gh release list --limit 100 --json tagName,isPrerelease \
-            --jq '.[] | select(.isPrerelease == false) | .tagName' | while read -r tag; do
+            --jq '.[] | select(.isPrerelease == false) | .tagName' > /tmp/index_tags.txt
+          if [[ ! -s /tmp/index_tags.txt ]]; then
+            echo "${CURRENT_TAG}" > /tmp/index_tags.txt
+          fi
+
+          while read -r tag; do
             gh release view "$tag" --json assets \
               --jq '[.assets[] | select(.name | test("\\.(whl|tar\\.gz)$")) | .url] | .[]'
-          done | sort -u > /tmp/asset_urls.txt
+          done < /tmp/index_tags.txt | sort -u > /tmp/asset_urls.txt
+
+          if [[ ! -s /tmp/asset_urls.txt ]]; then
+            echo "No wheel or sdist assets found for the package index" >&2
+            exit 1
+          fi
 
           # Build the per-package index page (PEP 503)
           {
