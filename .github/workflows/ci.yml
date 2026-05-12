@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -26,6 +29,7 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -38,8 +42,12 @@ jobs:
 
   # ── Python: build bindings + ruff + ty + pytest ───────
   python:
-    name: Python
+    name: Python (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v5
 
@@ -47,23 +55,26 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - uses: astral-sh/setup-uv@v5
 
       - name: Install dev + benchmark dependencies
-        run: uv sync --dev --group benchmarks
+        run: uv sync --locked --dev --group benchmarks
         working-directory: hola-py
 
       - name: Ruff format check
+        if: matrix.python-version == '3.12'
         run: uv run ruff format --check .
         working-directory: hola-py
 
       - name: Ruff lint
+        if: matrix.python-version == '3.12'
         run: uv run ruff check .
         working-directory: hola-py
 
       - name: Type check (ty)
+        if: matrix.python-version == '3.12'
         run: uv run ty check .
         working-directory: hola-py
 

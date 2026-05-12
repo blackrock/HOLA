@@ -1,6 +1,6 @@
 [package]
 name = "hola"
-version = "0.1.0"
+version = "1.0.1-rc5"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -9,7 +9,7 @@ default = []
 server = ["axum", "tokio-stream", "tower-http"]
 
 [dependencies]
-opt_engine = { version = "0.1.0", path = "../opt_engine" }
+opt_engine = { version = "1.0.1-rc5", path = "../opt_engine" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -20,7 +20,7 @@ tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 tower-http = { version = "0.6.8", features = ["cors", "fs"], optional = true }
 
 [dev-dependencies]
-opt_engine = { version = "0.1.0", path = "../opt_engine" }
+opt_engine = { version = "1.0.1-rc5", path = "../opt_engine" }
 serde_yaml = "0.9"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

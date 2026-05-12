@@ -4,12 +4,39 @@ on:
   schedule:
     - cron: "0 9 * * 1" # Every Monday 9am UTC
   push:
-    paths: [Cargo.lock]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
 
 jobs:
   audit:
     name: Cargo audit
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  scheduled-audit:
+    name: Scheduled cargo audit
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v5
       - uses: rustsec/audit-check@v2
