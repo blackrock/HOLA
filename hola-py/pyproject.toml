@@ -29,7 +29,7 @@ known-first-party = ["hola_opt"]
 [dependency-groups]
 dev = [
     "maturin>=1.12.6",
-    "pytest>=8.3.5",
+    "pytest>=9.0.3",
     "pytest-timeout>=2.3",
     "ruff>=0.15.4",
     "ty>=0.0.20",
