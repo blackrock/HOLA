@@ -13,7 +13,7 @@ opt_engine = { version = "1.0.1-rc5", path = "../opt_engine" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-rand = "0.9"
+rand = "0.9.3"
 chrono = "0.4"
 axum = { version = "0.8", optional = true }
 tokio-stream = { version = "0.1", features = ["sync"], optional = true }
