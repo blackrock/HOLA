@@ -202,6 +202,57 @@ async fn test_dyn_engine_double_tell_error() {
     assert!(engine.tell(t.trial_id, json!({"loss": 0.3})).await.is_err());
 }
 
+#[tokio::test]
+async fn test_dyn_engine_out_of_order_tell_preserves_public_trial_ids() {
+    let config = StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }],
+        strategy: None,
+        checkpoint: None,
+        max_trials: None,
+    };
+
+    let engine = HolaEngine::from_config(config).unwrap();
+    let t0 = engine.ask().await.unwrap();
+    let t1 = engine.ask().await.unwrap();
+
+    let completed_1 = engine
+        .tell(t1.trial_id, json!({"loss": 0.2}))
+        .await
+        .unwrap();
+    assert_eq!(completed_1.trial_id, t1.trial_id);
+    assert_eq!(completed_1.params, t1.params);
+
+    let completed_0 = engine
+        .tell(t0.trial_id, json!({"loss": 0.8}))
+        .await
+        .unwrap();
+    assert_eq!(completed_0.trial_id, t0.trial_id);
+    assert_eq!(completed_0.params, t0.params);
+
+    let ids: Vec<u64> = engine
+        .trials("index", true)
+        .await
+        .into_iter()
+        .map(|trial| trial.trial_id)
+        .collect();
+    assert_eq!(ids, vec![0, 1]);
+}
+
 // ==========================================================================
 // All parameter types
 // ==========================================================================
@@ -955,6 +1006,64 @@ async fn test_update_objectives_triggers_refit() {
 // Checkpoints
 // ==========================================================================
 
+fn scalar_checkpoint_config(max_trials: Option<usize>) -> StudyConfig {
+    StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }],
+        strategy: None,
+        checkpoint: None,
+        max_trials,
+    }
+}
+
+fn vector_checkpoint_config() -> StudyConfig {
+    StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![
+            ObjectiveConfig {
+                field: "f1".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            },
+            ObjectiveConfig {
+                field: "f2".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 2.0,
+                group: None,
+            },
+        ],
+        strategy: None,
+        checkpoint: None,
+        max_trials: None,
+    }
+}
+
 #[tokio::test]
 async fn test_dyn_engine_leaderboard_checkpoint() {
     let config = StudyConfig {
@@ -1004,6 +1113,59 @@ async fn test_dyn_engine_leaderboard_checkpoint() {
 }
 
 #[tokio::test]
+async fn test_dyn_engine_leaderboard_checkpoint_resume_uses_fresh_trial_id() {
+    let config = scalar_checkpoint_config(Some(3));
+    let engine = HolaEngine::from_config(config.clone()).unwrap();
+
+    for (expected_id, loss) in [0.5, 0.3].into_iter().enumerate() {
+        let trial = engine.ask().await.unwrap();
+        assert_eq!(trial.trial_id, expected_id as u64);
+        let completed = engine
+            .tell(trial.trial_id, json!({"loss": loss}))
+            .await
+            .unwrap();
+        assert_eq!(completed.trial_id, expected_id as u64);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lb.json");
+    engine
+        .save_leaderboard_checkpoint_to(&path, Some("2 trials"))
+        .await
+        .unwrap();
+
+    let restored = HolaEngine::from_config(config).unwrap();
+    let stale_pending = restored.ask().await.unwrap();
+    let stale_cancelled = restored.ask().await.unwrap();
+    restored.cancel(stale_cancelled.trial_id).await.unwrap();
+
+    restored.load_leaderboard_checkpoint(&path).await.unwrap();
+    assert!(
+        restored
+            .tell(stale_pending.trial_id, json!({"loss": 0.0}))
+            .await
+            .is_err(),
+        "pending trials from the pre-load engine state must not survive checkpoint load"
+    );
+
+    let trial = restored.ask().await.unwrap();
+    assert_eq!(trial.trial_id, 2);
+    let completed = restored
+        .tell(trial.trial_id, json!({"loss": 0.1}))
+        .await
+        .unwrap();
+    assert_eq!(completed.trial_id, 2);
+
+    let ids: Vec<u64> = restored
+        .trials("index", true)
+        .await
+        .into_iter()
+        .map(|trial| trial.trial_id)
+        .collect();
+    assert_eq!(ids, vec![0, 1, 2]);
+}
+
+#[tokio::test]
 async fn test_dyn_engine_full_checkpoint() {
     let config = StudyConfig {
         space: BTreeMap::from([(
@@ -1041,6 +1203,85 @@ async fn test_dyn_engine_full_checkpoint() {
     let engine2 = HolaEngine::from_config(config).unwrap();
     engine2.load_full_checkpoint(&path).await.unwrap();
     assert_eq!(engine2.trial_count().await, 1);
+}
+
+#[tokio::test]
+async fn test_dyn_engine_full_checkpoint_resume_returns_new_completed_trial() {
+    let config = scalar_checkpoint_config(None);
+    let engine = HolaEngine::from_config(config.clone()).unwrap();
+
+    for loss in [0.5, 0.3] {
+        let trial = engine.ask().await.unwrap();
+        engine
+            .tell(trial.trial_id, json!({"loss": loss}))
+            .await
+            .unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("full.json");
+    engine
+        .save_full_checkpoint(&path, Some("2 trials"))
+        .await
+        .unwrap();
+
+    let restored = HolaEngine::from_config(config).unwrap();
+    restored.load_full_checkpoint(&path).await.unwrap();
+
+    let trial = restored.ask().await.unwrap();
+    assert_eq!(trial.trial_id, 2);
+    let completed = restored
+        .tell(trial.trial_id, json!({"loss": 0.1}))
+        .await
+        .unwrap();
+    assert_eq!(completed.trial_id, 2);
+    assert_eq!(completed.params, trial.params);
+
+    let ids: Vec<u64> = restored
+        .trials("index", true)
+        .await
+        .into_iter()
+        .map(|trial| trial.trial_id)
+        .collect();
+    assert_eq!(ids, vec![0, 1, 2]);
+}
+
+#[tokio::test]
+async fn test_dyn_engine_full_checkpoint_resume_preserves_vector_trial_ids() {
+    let config = vector_checkpoint_config();
+    let engine = HolaEngine::from_config(config.clone()).unwrap();
+
+    for metrics in [json!({"f1": 1.0, "f2": 3.0}), json!({"f1": 2.0, "f2": 1.0})] {
+        let trial = engine.ask().await.unwrap();
+        let completed = engine.tell(trial.trial_id, metrics).await.unwrap();
+        assert_eq!(completed.trial_id, trial.trial_id);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vector-full.json");
+    engine
+        .save_full_checkpoint(&path, Some("vector checkpoint"))
+        .await
+        .unwrap();
+
+    let restored = HolaEngine::from_config(config).unwrap();
+    restored.load_full_checkpoint(&path).await.unwrap();
+
+    let trial = restored.ask().await.unwrap();
+    assert_eq!(trial.trial_id, 2);
+    let completed = restored
+        .tell(trial.trial_id, json!({"f1": 0.5, "f2": 2.5}))
+        .await
+        .unwrap();
+    assert_eq!(completed.trial_id, 2);
+
+    let ids: Vec<u64> = restored
+        .trials("index", true)
+        .await
+        .into_iter()
+        .map(|trial| trial.trial_id)
+        .collect();
+    assert_eq!(ids, vec![0, 1, 2]);
 }
 
 // ==========================================================================

@@ -140,6 +140,18 @@ impl<D, Obs> Leaderboard<D, Obs> {
         trial_id
     }
 
+    /// Append a trial using an externally assigned trial ID.
+    ///
+    /// This is useful when trial IDs are issued before completion. The internal
+    /// auto-assignment counter is advanced so future generated IDs do not reuse
+    /// the provided ID.
+    pub fn push_with_trial_id(&mut self, candidate: D, observation: Obs, trial_id: u64) -> u64 {
+        self.next_id = self.next_id.max(trial_id.saturating_add(1));
+        self.trials
+            .push(Trial::new(candidate, observation, trial_id));
+        trial_id
+    }
+
     /// Append a trial with raw metrics preserved for lazy re-scalarization.
     pub fn push_with_raw(
         &mut self,
@@ -156,6 +168,44 @@ impl<D, Obs> Leaderboard<D, Obs> {
             trial_id,
         ));
         trial_id
+    }
+
+    /// Append a trial with an externally assigned trial ID and raw metrics
+    /// preserved for lazy re-scalarization.
+    pub fn push_with_raw_trial_id(
+        &mut self,
+        candidate: D,
+        observation: Obs,
+        raw_metrics: serde_json::Value,
+        trial_id: u64,
+    ) -> u64 {
+        self.next_id = self.next_id.max(trial_id.saturating_add(1));
+        self.trials.push(Trial::with_raw_metrics(
+            candidate,
+            observation,
+            raw_metrics,
+            trial_id,
+        ));
+        trial_id
+    }
+
+    /// Return the next ID that can be assigned without reusing a stored trial ID.
+    pub fn next_trial_id(&self) -> u64 {
+        let next_from_trials = self
+            .trials
+            .iter()
+            .map(|trial| trial.trial_id.saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        self.next_id.max(next_from_trials)
+    }
+
+    /// Repair the internal next-ID counter after deserializing or manually
+    /// modifying a leaderboard.
+    pub fn normalize_next_trial_id(&mut self) -> u64 {
+        let next_id = self.next_trial_id();
+        self.next_id = next_id;
+        next_id
     }
 
     pub fn len(&self) -> usize {
@@ -1035,6 +1085,27 @@ mod tests {
         assert_eq!(id1, 0);
         assert_eq!(id2, 1);
         assert_eq!(id3, 2);
+    }
+
+    #[test]
+    fn test_externally_assigned_trial_ids_advance_next_id() {
+        let mut lb: Leaderboard<f64, f64> = Leaderboard::new();
+
+        assert_eq!(lb.push_with_trial_id(0.1, 0.1, 7), 7);
+        assert_eq!(lb.push(0.2, 0.2), 8);
+        assert_eq!(lb.next_trial_id(), 9);
+    }
+
+    #[test]
+    fn test_normalize_next_trial_id_repairs_stale_counter() {
+        let mut lb: Leaderboard<f64, f64> = Leaderboard::new();
+        lb.push(0.1, 0.1);
+        lb.push(0.2, 0.2);
+        lb.next_id = 0;
+
+        assert_eq!(lb.next_trial_id(), 2);
+        assert_eq!(lb.normalize_next_trial_id(), 2);
+        assert_eq!(lb.push(0.3, 0.3), 2);
     }
 
     #[test]

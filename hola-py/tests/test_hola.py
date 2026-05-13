@@ -331,7 +331,60 @@ def test_study_categorical_mixed_space():
 
 
 # ==========================================================================
-# 8. Study.run() Convenience Method
+# 8. Checkpoint Persistence
+# ==========================================================================
+
+
+def test_study_save_load_resume_uses_fresh_trial_id(tmp_path):
+    from hola_opt import Minimize, Real, Space, Study
+
+    study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
+    for expected_id, loss in enumerate([0.5, 0.3]):
+        trial = study.ask()
+        assert trial.trial_id == expected_id
+        completed = study.tell(trial.trial_id, {"loss": loss})
+        assert completed.trial_id == expected_id
+
+    path = tmp_path / "study.json"
+    study.save(str(path))
+
+    restored = Study.load(str(path))
+    trial = restored.ask()
+    assert trial.trial_id == 2
+    completed = restored.tell(trial.trial_id, {"loss": 0.1})
+    assert completed.trial_id == 2
+    assert completed.params == trial.params
+    assert [trial.trial_id for trial in restored.trials()] == [0, 1, 2]
+
+
+def test_study_save_load_resume_uses_fresh_vector_trial_id(tmp_path):
+    from hola_opt import Minimize, Real, Space, Study
+
+    study = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("f1", priority=1.0), Minimize("f2", priority=2.0)],
+    )
+    for expected_id, metrics in enumerate(
+        [{"f1": 1.0, "f2": 3.0}, {"f1": 2.0, "f2": 1.0}]
+    ):
+        trial = study.ask()
+        assert trial.trial_id == expected_id
+        completed = study.tell(trial.trial_id, metrics)
+        assert completed.trial_id == expected_id
+
+    path = tmp_path / "vector-study.json"
+    study.save(str(path))
+
+    restored = Study.load(str(path))
+    trial = restored.ask()
+    assert trial.trial_id == 2
+    completed = restored.tell(trial.trial_id, {"f1": 0.5, "f2": 2.5})
+    assert completed.trial_id == 2
+    assert [trial.trial_id for trial in restored.trials()] == [0, 1, 2]
+
+
+# ==========================================================================
+# 9. Study.run() Convenience Method
 # ==========================================================================
 
 

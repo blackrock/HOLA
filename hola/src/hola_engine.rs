@@ -643,6 +643,7 @@ enum DynLeaderboard {
 impl DynLeaderboard {
     fn push_with_raw(
         &mut self,
+        trial_id: u64,
         candidate: serde_json::Value,
         raw_metrics: serde_json::Value,
         objectives: &[ObjectiveConfig],
@@ -650,15 +651,36 @@ impl DynLeaderboard {
         match self {
             DynLeaderboard::Scalar(lb) => {
                 let score = scalarize_raw(&raw_metrics, objectives);
-                let id = lb.push_with_raw(candidate, score, raw_metrics);
+                let id = lb.push_with_raw_trial_id(candidate, score, raw_metrics, trial_id);
                 (id, score)
             }
             DynLeaderboard::Vector(lb) => {
                 let obs = vectorize_raw(&raw_metrics, objectives);
                 let score = scalarize_observation(&obs, objectives);
-                let id = lb.push_with_raw(candidate, obs, raw_metrics);
+                let id = lb.push_with_raw_trial_id(candidate, obs, raw_metrics, trial_id);
                 (id, score)
             }
+        }
+    }
+
+    fn contains_trial_id(&self, trial_id: u64) -> bool {
+        match self {
+            DynLeaderboard::Scalar(lb) => lb.get(trial_id).is_some(),
+            DynLeaderboard::Vector(lb) => lb.get(trial_id).is_some(),
+        }
+    }
+
+    fn next_trial_id(&self) -> u64 {
+        match self {
+            DynLeaderboard::Scalar(lb) => lb.next_trial_id(),
+            DynLeaderboard::Vector(lb) => lb.next_trial_id(),
+        }
+    }
+
+    fn normalize_next_trial_id(&mut self) -> u64 {
+        match self {
+            DynLeaderboard::Scalar(lb) => lb.normalize_next_trial_id(),
+            DynLeaderboard::Vector(lb) => lb.normalize_next_trial_id(),
         }
     }
 
@@ -972,6 +994,14 @@ struct HolaEngineState {
     cancelled: HashSet<u64>,
 }
 
+impl HolaEngineState {
+    fn reset_transient_trial_state_after_load(&mut self) {
+        self.next_pending_id = self.leaderboard.normalize_next_trial_id();
+        self.pending.clear();
+        self.cancelled.clear();
+    }
+}
+
 impl HolaEngine {
     /// Build a HolaEngine from a StudyConfig (parsed from YAML/JSON).
     pub fn from_config(config: StudyConfig) -> Result<Self, String> {
@@ -1119,8 +1149,18 @@ impl HolaEngine {
             }
         }
         let params = state.strategy.suggest(&self.space);
-        let id = state.next_pending_id;
-        state.next_pending_id += 1;
+        let mut id = state.next_pending_id.max(state.leaderboard.next_trial_id());
+        while state.pending.contains_key(&id)
+            || state.cancelled.contains(&id)
+            || state.leaderboard.contains_trial_id(id)
+        {
+            id = id
+                .checked_add(1)
+                .ok_or_else(|| "Exhausted trial ID space".to_string())?;
+        }
+        state.next_pending_id = id
+            .checked_add(1)
+            .ok_or_else(|| "Exhausted trial ID space".to_string())?;
         state.pending.insert(id, params.clone());
         Ok(DynTrial {
             trial_id: id,
@@ -1142,22 +1182,31 @@ impl HolaEngine {
             return Err(format!("Trial {trial_id} has been cancelled"));
         }
 
+        if state.leaderboard.contains_trial_id(trial_id) {
+            return Err(format!("Trial {trial_id} has already been completed"));
+        }
+
         let candidate = state
             .pending
             .remove(&trial_id)
             .ok_or_else(|| format!("Unknown trial_id: {trial_id}"))?;
 
-        let (_trial_id, score) =
+        let (stored_trial_id, score) =
             state
                 .leaderboard
-                .push_with_raw(candidate.clone(), raw_metrics, &objectives);
+                .push_with_raw(trial_id, candidate.clone(), raw_metrics, &objectives);
+        if stored_trial_id != trial_id {
+            return Err(format!(
+                "Internal trial ID mismatch: pending trial {trial_id} was stored as {stored_trial_id}"
+            ));
+        }
         state.strategy.update(&candidate, score);
 
         let n_trials = state.leaderboard.len();
         let completed = state
             .leaderboard
-            .get_completed(trial_id, &objectives)
-            .ok_or_else(|| format!("Failed to build CompletedTrial for {trial_id}"))?;
+            .get_completed(stored_trial_id, &objectives)
+            .ok_or_else(|| format!("Failed to build CompletedTrial for {stored_trial_id}"))?;
         drop(state);
 
         // Auto-refit if configured
@@ -1410,7 +1459,9 @@ impl HolaEngine {
             eprintln!("[hola] Loaded leaderboard checkpoint with {n} trials");
             DynLeaderboard::Scalar(cp.leaderboard)
         };
-        self.state.write().await.leaderboard = leaderboard;
+        let mut state = self.state.write().await;
+        state.leaderboard = leaderboard;
+        state.reset_transient_trial_state_after_load();
         Ok(())
     }
 
@@ -1503,6 +1554,7 @@ impl HolaEngine {
             let mut state = self.state.write().await;
             state.leaderboard = DynLeaderboard::Vector(cp.leaderboard);
             state.strategy = cp.strategy_state;
+            state.reset_transient_trial_state_after_load();
             eprintln!("[hola] Loaded full checkpoint with {n_loaded} trials");
         } else {
             let cp: opt_engine::persistence::Checkpoint<serde_json::Value, f64, DynStrategy> =
@@ -1512,6 +1564,7 @@ impl HolaEngine {
             let mut state = self.state.write().await;
             state.leaderboard = DynLeaderboard::Scalar(cp.leaderboard);
             state.strategy = cp.strategy_state;
+            state.reset_transient_trial_state_after_load();
             eprintln!("[hola] Loaded full checkpoint with {n_loaded} trials");
         }
         Ok(())
