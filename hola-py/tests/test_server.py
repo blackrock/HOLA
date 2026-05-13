@@ -20,7 +20,6 @@ updates, and Study.connect() ask/tell/top_k/connection-error.
 """
 
 import os
-import tempfile
 
 import pytest
 from conftest import http_json
@@ -141,16 +140,23 @@ class TestRestEndpoints:
             body={"trial_id": trial["trial_id"], "metrics": {"loss": 0.5}},
         )
 
-        with tempfile.TemporaryDirectory() as td:
-            ckpt_path = os.path.join(td, "test_checkpoint.json")
-            status, body = http_json(
-                f"{self.url}/api/checkpoint/save",
-                method="POST",
-                body={"path": ckpt_path},
-            )
-            assert status == 200
-            assert body["status"] == "ok"
-            assert os.path.exists(ckpt_path)
+        status, body = http_json(
+            f"{self.url}/api/checkpoint/save",
+            method="POST",
+            body={"path": "test_checkpoint.json"},
+        )
+        assert status == 200
+        assert body["status"] == "ok"
+        assert os.path.exists(body["path"])
+
+    def test_checkpoint_save_rejects_absolute_path(self):
+        status, body = http_json(
+            f"{self.url}/api/checkpoint/save",
+            method="POST",
+            body={"path": "/tmp/hola_escape.json"},
+        )
+        assert status == 400
+        assert "relative" in body["error"]
 
 
 class TestRestMultiParam:

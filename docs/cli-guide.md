@@ -203,11 +203,16 @@ hola serve config.yaml --port 8000
 | Flag | Default | Description |
 |------|---------|-------------|
 | `config` | required | Path to the YAML configuration file |
+| `--host` | `127.0.0.1` | Host/interface to bind. Use `0.0.0.0` explicitly for network access |
 | `--port` | `8000` | Port to listen on |
 | `--dashboard` | none | Path to a dashboard directory to serve at `/` (e.g. `--dashboard ./dashboard`) |
+| `--auth-token` | none | Bearer token required for write-capable API endpoints |
+| `--checkpoint-dir` | checkpoint config directory or config file directory | Directory where dashboard/API checkpoint saves are allowed |
+| `--cors-origin` | none | Allowed browser CORS origin. Repeat for multiple origins |
 
-The server starts listening on `0.0.0.0:<port>` and exposes
-the [REST API](rest-api.md).
+The server starts listening on `127.0.0.1:<port>` by default and exposes
+the [REST API](rest-api.md). Binding a non-local host requires `--auth-token`
+or the `HOLA_API_TOKEN` environment variable.
 
 ## Running Workers
 
@@ -220,6 +225,7 @@ hola worker --server http://localhost:8000 --exec "python train.py"
 | `--server` | required | URL of the HOLA server |
 | `--exec` | required | Shell command to execute for each trial |
 | `--mode` | `callback` | Worker mode: `"callback"` or `"exec"` |
+| `--token` | none | Bearer token for servers started with `--auth-token` |
 
 ### Callback mode (default)
 
@@ -385,13 +391,13 @@ others.
 **Machine A (server):**
 
 ```bash
-hola serve config.yaml --port 8000
+hola serve config.yaml --host 0.0.0.0 --port 8000 --auth-token "$HOLA_API_TOKEN"
 ```
 
 **Machines B, C, D (workers):**
 
 ```bash
-hola worker --server http://machine-a:8000 --exec "python train.py"
+hola worker --server http://machine-a:8000 --token "$HOLA_API_TOKEN" --exec "python train.py"
 ```
 
 Each worker independently polls the server for trials. The

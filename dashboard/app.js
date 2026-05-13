@@ -33,6 +33,22 @@ const S = {
 // ============================================================================
 // Connection
 // ============================================================================
+function apiToken() {
+    const urlToken = new URLSearchParams(window.location.search).get('token');
+    if (urlToken) {
+        localStorage.setItem('hola_api_token', urlToken);
+        return urlToken;
+    }
+    return localStorage.getItem('hola_api_token') || '';
+}
+
+function apiFetch(url, options = {}) {
+    const headers = new Headers(options.headers || {});
+    const token = apiToken();
+    if (token) headers.set('Authorization', `Bearer ${token}`);
+    return fetch(url, { ...options, headers });
+}
+
 async function connectToServer() {
     const url = document.getElementById('server-url').value.trim().replace(/\/+$/, '')
         || 'http://localhost:8000';
@@ -813,7 +829,7 @@ async function applyObjectives() {
     if (S.mode !== 'live') return;
     if (!confirm('This will update the server objectives and rescalarize all trials. The server will use these objectives for future sampling. Continue?')) return;
     try {
-        const resp = await fetch(`${S.serverUrl}/api/objectives`, {
+        const resp = await apiFetch(`${S.serverUrl}/api/objectives`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ objectives: S.objectives }),
@@ -837,7 +853,7 @@ async function applyObjectives() {
 async function saveCheckpoint() {
     if (S.mode !== 'live') return;
     try {
-        const resp = await fetch(`${S.serverUrl}/api/checkpoint/save`, {
+        const resp = await apiFetch(`${S.serverUrl}/api/checkpoint/save`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ description: `Dashboard save at ${new Date().toISOString()}` }),
