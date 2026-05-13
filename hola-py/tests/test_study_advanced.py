@@ -170,6 +170,47 @@ def test_multi_objective_with_priorities():
     assert all(math.isfinite(v) for v in obs.values())
 
 
+def test_update_objectives_migrates_scalar_to_vector_leaderboard():
+    study = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("f1")],
+    )
+    for metrics in [
+        {"f1": 1.0, "f2": 5.0},
+        {"f1": 5.0, "f2": 1.0},
+        {"f1": 3.0, "f2": 3.0},
+        {"f1": 4.0, "f2": 4.0},
+    ]:
+        trial = study.ask()
+        study.tell(trial.trial_id, metrics)
+
+    assert study.pareto_front() == []
+
+    study.update_objectives([Minimize("f1"), Minimize("f2")])
+    front_ids = sorted(trial.trial_id for trial in study.pareto_front())
+    assert front_ids == [0, 1, 2]
+
+
+def test_update_objectives_migrates_vector_to_scalar_leaderboard():
+    study = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("f1"), Minimize("f2")],
+    )
+    for metrics in [
+        {"f1": 10.0, "f2": 0.0},
+        {"f1": 1.0, "f2": 10.0},
+        {"f1": 5.0, "f2": 5.0},
+    ]:
+        trial = study.ask()
+        study.tell(trial.trial_id, metrics)
+
+    assert study.pareto_front() != []
+
+    study.update_objectives([Minimize("f1")])
+    assert study.pareto_front() == []
+    assert study.top_k(1)[0].trial_id == 1
+
+
 # ==========================================================================
 # Sobol Properties
 # ==========================================================================

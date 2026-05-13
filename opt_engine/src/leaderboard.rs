@@ -189,6 +189,17 @@ impl<D, Obs> Leaderboard<D, Obs> {
         trial_id
     }
 
+    /// Append an existing trial record, preserving its ID and timestamp.
+    ///
+    /// This supports rebuilding a leaderboard with a different observation type
+    /// while preserving public trial identity and completion metadata.
+    pub fn push_existing_trial(&mut self, trial: Trial<D, Obs>) -> u64 {
+        let trial_id = trial.trial_id;
+        self.next_id = self.next_id.max(trial_id.saturating_add(1));
+        self.trials.push(trial);
+        trial_id
+    }
+
     /// Return the next ID that can be assigned without reusing a stored trial ID.
     pub fn next_trial_id(&self) -> u64 {
         let next_from_trials = self
@@ -1106,6 +1117,23 @@ mod tests {
         assert_eq!(lb.next_trial_id(), 2);
         assert_eq!(lb.normalize_next_trial_id(), 2);
         assert_eq!(lb.push(0.3, 0.3), 2);
+    }
+
+    #[test]
+    fn test_push_existing_trial_preserves_timestamp_and_advances_next_id() {
+        let mut lb: Leaderboard<f64, f64> = Leaderboard::new();
+        let trial = Trial {
+            candidate: 0.1,
+            observation: 0.2,
+            raw_metrics: Some(serde_json::json!({"loss": 0.2})),
+            trial_id: 4,
+            timestamp: 123,
+        };
+
+        assert_eq!(lb.push_existing_trial(trial), 4);
+        let stored = lb.get(4).unwrap();
+        assert_eq!(stored.timestamp, 123);
+        assert_eq!(lb.push(0.3, 0.3), 5);
     }
 
     #[test]

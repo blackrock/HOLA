@@ -803,6 +803,144 @@ async fn test_dyn_engine_update_objectives_rescalarizes() {
     assert_ne!(best_before.trial_id, best_after.trial_id);
 }
 
+#[tokio::test]
+async fn test_dyn_engine_update_objectives_migrates_scalar_to_vector() {
+    let config = StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![ObjectiveConfig {
+            field: "f1".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }],
+        strategy: None,
+        checkpoint: None,
+        max_trials: None,
+    };
+
+    let engine = HolaEngine::from_config(config).unwrap();
+    for metrics in [
+        json!({"f1": 1.0, "f2": 5.0}),
+        json!({"f1": 5.0, "f2": 1.0}),
+        json!({"f1": 3.0, "f2": 3.0}),
+        json!({"f1": 4.0, "f2": 4.0}),
+    ] {
+        let trial = engine.ask().await.unwrap();
+        engine.tell(trial.trial_id, metrics).await.unwrap();
+    }
+    assert!(engine.pareto_front(0, false).await.is_empty());
+
+    engine
+        .update_objectives(vec![
+            ObjectiveConfig {
+                field: "f1".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            },
+            ObjectiveConfig {
+                field: "f2".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            },
+        ])
+        .await;
+
+    let mut front_ids: Vec<u64> = engine
+        .pareto_front(0, false)
+        .await
+        .into_iter()
+        .map(|trial| trial.trial_id)
+        .collect();
+    front_ids.sort_unstable();
+    assert_eq!(front_ids, vec![0, 1, 2]);
+
+    let migrated = engine
+        .trials("index", true)
+        .await
+        .into_iter()
+        .find(|trial| trial.trial_id == 0)
+        .unwrap();
+    assert!(migrated.score_vector.get("f1").is_some());
+    assert!(migrated.score_vector.get("f2").is_some());
+}
+
+#[tokio::test]
+async fn test_dyn_engine_update_objectives_migrates_vector_to_scalar() {
+    let config = StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![
+            ObjectiveConfig {
+                field: "f1".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            },
+            ObjectiveConfig {
+                field: "f2".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            },
+        ],
+        strategy: None,
+        checkpoint: None,
+        max_trials: None,
+    };
+
+    let engine = HolaEngine::from_config(config).unwrap();
+    for metrics in [
+        json!({"f1": 10.0, "f2": 0.0}),
+        json!({"f1": 1.0, "f2": 10.0}),
+        json!({"f1": 5.0, "f2": 5.0}),
+    ] {
+        let trial = engine.ask().await.unwrap();
+        engine.tell(trial.trial_id, metrics).await.unwrap();
+    }
+    assert!(!engine.pareto_front(0, false).await.is_empty());
+
+    engine
+        .update_objectives(vec![ObjectiveConfig {
+            field: "f1".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }])
+        .await;
+
+    assert!(engine.pareto_front(0, false).await.is_empty());
+    let best = engine.top_k(1, false).await.into_iter().next().unwrap();
+    assert_eq!(best.trial_id, 1);
+    assert_eq!(best.score_vector.as_object().unwrap().len(), 1);
+}
+
 // ==========================================================================
 // Rescalarize
 // ==========================================================================

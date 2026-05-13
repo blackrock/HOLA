@@ -641,6 +641,14 @@ enum DynLeaderboard {
 }
 
 impl DynLeaderboard {
+    fn for_objectives(objectives: &[ObjectiveConfig]) -> Self {
+        if count_priority_groups(objectives) > 1 {
+            DynLeaderboard::Vector(Leaderboard::new())
+        } else {
+            DynLeaderboard::Scalar(Leaderboard::new())
+        }
+    }
+
     fn push_with_raw(
         &mut self,
         trial_id: u64,
@@ -725,6 +733,51 @@ impl DynLeaderboard {
                 lb.rescalarize(|raw| Some(vectorize_raw(raw, objectives)));
             }
         }
+    }
+
+    fn migrate_for_objectives(&mut self, objectives: &[ObjectiveConfig]) {
+        let should_be_vector = count_priority_groups(objectives) > 1;
+        match (&mut *self, should_be_vector) {
+            (DynLeaderboard::Scalar(_), false) | (DynLeaderboard::Vector(_), true) => {
+                self.rescalarize(objectives);
+                return;
+            }
+            _ => {}
+        }
+
+        let migrated = match self {
+            DynLeaderboard::Scalar(lb) => {
+                let mut migrated = Leaderboard::new();
+                for trial in lb.iter() {
+                    let raw_metrics = trial.raw_metrics.clone();
+                    let raw = raw_metrics.as_ref().unwrap_or(&serde_json::Value::Null);
+                    migrated.push_existing_trial(Trial {
+                        candidate: trial.candidate.clone(),
+                        observation: vectorize_raw(raw, objectives),
+                        raw_metrics,
+                        trial_id: trial.trial_id,
+                        timestamp: trial.timestamp,
+                    });
+                }
+                DynLeaderboard::Vector(migrated)
+            }
+            DynLeaderboard::Vector(lb) => {
+                let mut migrated = Leaderboard::new();
+                for trial in lb.iter() {
+                    let raw_metrics = trial.raw_metrics.clone();
+                    let raw = raw_metrics.as_ref().unwrap_or(&serde_json::Value::Null);
+                    migrated.push_existing_trial(Trial {
+                        candidate: trial.candidate.clone(),
+                        observation: scalarize_raw(raw, objectives),
+                        raw_metrics,
+                        trial_id: trial.trial_id,
+                        timestamp: trial.timestamp,
+                    });
+                }
+                DynLeaderboard::Scalar(migrated)
+            }
+        };
+        *self = migrated;
     }
 
     /// Get a single completed trial by ID, computing its rank and Pareto front.
@@ -1111,11 +1164,7 @@ impl HolaEngine {
             ac
         });
 
-        let leaderboard = if count_priority_groups(&config.objectives) > 1 {
-            DynLeaderboard::Vector(Leaderboard::new())
-        } else {
-            DynLeaderboard::Scalar(Leaderboard::new())
-        };
+        let leaderboard = DynLeaderboard::for_objectives(&config.objectives);
 
         Ok(Self {
             space,
@@ -1370,7 +1419,7 @@ impl HolaEngine {
         // Re-scalarize all historical trials with the new objectives
         let n_trials = {
             let mut state = self.state.write().await;
-            state.leaderboard.rescalarize(&objectives);
+            state.leaderboard.migrate_for_objectives(&objectives);
             state.leaderboard.len()
         };
 
