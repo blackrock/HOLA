@@ -453,7 +453,9 @@ checkpoint:
 ```
 
 This saves a checkpoint every 50 completed trials, keeping
-the 5 most recent.
+the 5 most recent. Automatic checkpoints are leaderboard
+checkpoints: they preserve completed trials and can be used to
+warm-start a restarted server.
 
 ### Manual checkpointing
 
@@ -466,6 +468,8 @@ curl -X POST http://localhost:8000/api/checkpoint/save \
 ```
 
 Or from the dashboard's Checkpoints panel.
+Manual REST and dashboard saves write full checkpoints with
+completed trials, strategy state, and study configuration.
 
 ### Resuming from a checkpoint
 
@@ -479,8 +483,8 @@ checkpoint:
   load_from: ./checkpoints/checkpoint_000100.json
 ```
 
-On startup, the server loads the leaderboard (trial history)
-from the specified checkpoint file. We then refit the strategy
-from the loaded data, so optimization resumes with full
-knowledge of previous trials. This is useful for continuing a
-study after a server restart or crash.
+On startup, the server loads the specified checkpoint file. Full
+checkpoints restore both the leaderboard and search strategy state.
+Legacy leaderboard-only checkpoints are still accepted as a
+warm-start path; they restore completed trials but do not restore
+strategy state.

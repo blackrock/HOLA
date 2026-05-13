@@ -14,7 +14,9 @@
 //! Exercises config parsing, ask/tell flows, strategy types, scalarization,
 //! objectives, checkpoints, refit, and all parameter types.
 
-use hola::hola_engine::{HolaEngine, ObjectiveConfig, ParamConfig, StrategyConfig, StudyConfig};
+use hola::hola_engine::{
+    CheckpointLoadKind, HolaEngine, ObjectiveConfig, ParamConfig, StrategyConfig, StudyConfig,
+};
 use opt_engine::traits::SampleSpace;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -1420,6 +1422,48 @@ async fn test_dyn_engine_full_checkpoint_resume_preserves_vector_trial_ids() {
         .map(|trial| trial.trial_id)
         .collect();
     assert_eq!(ids, vec![0, 1, 2]);
+}
+
+#[tokio::test]
+async fn test_dyn_engine_checkpoint_load_with_fallback_supports_full_and_leaderboard() {
+    let config = scalar_checkpoint_config(None);
+    let engine = HolaEngine::from_config(config.clone()).unwrap();
+    let trial = engine.ask().await.unwrap();
+    engine
+        .tell(trial.trial_id, json!({"loss": 0.5}))
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let full_path = dir.path().join("full.json");
+    engine
+        .save_full_checkpoint(&full_path, Some("full"))
+        .await
+        .unwrap();
+
+    let restored_full = HolaEngine::from_config(config.clone()).unwrap();
+    let kind = restored_full
+        .load_checkpoint_with_fallback(&full_path)
+        .await
+        .unwrap();
+    assert_eq!(kind, CheckpointLoadKind::Full);
+    assert_eq!(restored_full.trial_count().await, 1);
+    assert_eq!(restored_full.ask().await.unwrap().trial_id, 1);
+
+    let leaderboard_path = dir.path().join("leaderboard.json");
+    engine
+        .save_leaderboard_checkpoint_to(&leaderboard_path, Some("leaderboard"))
+        .await
+        .unwrap();
+
+    let restored_leaderboard = HolaEngine::from_config(config).unwrap();
+    let kind = restored_leaderboard
+        .load_checkpoint_with_fallback(&leaderboard_path)
+        .await
+        .unwrap();
+    assert_eq!(kind, CheckpointLoadKind::Leaderboard);
+    assert_eq!(restored_leaderboard.trial_count().await, 1);
+    assert_eq!(restored_leaderboard.ask().await.unwrap().trial_id, 1);
 }
 
 // ==========================================================================

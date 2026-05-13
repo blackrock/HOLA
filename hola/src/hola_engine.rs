@@ -629,6 +629,24 @@ pub struct CompletedTrial {
     pub completed_at: u64,
 }
 
+/// Kind of checkpoint loaded by [`HolaEngine::load_checkpoint_with_fallback`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointLoadKind {
+    /// Full checkpoint with leaderboard and strategy state.
+    Full,
+    /// Legacy leaderboard-only checkpoint with trial history but no strategy state.
+    Leaderboard,
+}
+
+impl CheckpointLoadKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckpointLoadKind::Full => "full",
+            CheckpointLoadKind::Leaderboard => "leaderboard",
+        }
+    }
+}
+
 // =============================================================================
 // DynLeaderboard: scalar or vector leaderboard dispatch
 // =============================================================================
@@ -1462,6 +1480,38 @@ impl HolaEngine {
     /// This is the stable persistence API. Use `save` / `load` for checkpointing.
     pub async fn load(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
         self.load_full_checkpoint(path).await
+    }
+
+    /// Load a checkpoint, preferring full checkpoints and falling back to
+    /// legacy leaderboard-only files.
+    ///
+    /// This is used by CLI config `checkpoint.load_from`, which historically
+    /// accepted leaderboard-only checkpoints. Full checkpoints preserve search
+    /// strategy state; leaderboard-only checkpoints preserve completed trials.
+    pub async fn load_checkpoint_with_fallback(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<CheckpointLoadKind> {
+        let path = path.as_ref();
+        let raw: serde_json::Value = {
+            let file = std::fs::File::open(path)?;
+            let reader = std::io::BufReader::new(file);
+            serde_json::from_reader(reader)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+        };
+
+        let has_strategy_state = raw
+            .get("checkpoint")
+            .unwrap_or(&raw)
+            .get("strategy_state")
+            .is_some();
+        if has_strategy_state {
+            self.load_full_checkpoint(path).await?;
+            Ok(CheckpointLoadKind::Full)
+        } else {
+            self.load_leaderboard_checkpoint(path).await?;
+            Ok(CheckpointLoadKind::Leaderboard)
+        }
     }
 
     // =========================================================================

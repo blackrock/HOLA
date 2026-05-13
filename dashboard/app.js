@@ -933,7 +933,10 @@ async function saveCheckpoint() {
             body: JSON.stringify({ description: `Dashboard save at ${new Date().toISOString()}` }),
         });
         const data = await resp.json();
-        if (resp.ok) alert(`Checkpoint saved: ${data.path} (${data.trials_saved} trials)`);
+        if (resp.ok) {
+            const kind = data.checkpoint_type ? `${data.checkpoint_type} checkpoint` : 'checkpoint';
+            alert(`Saved ${kind}: ${data.path} (${data.trials_saved} trials)`);
+        }
         else alert('Save failed: ' + (data.error || 'unknown'));
     } catch (e) {
         alert('Save failed: ' + e.message);

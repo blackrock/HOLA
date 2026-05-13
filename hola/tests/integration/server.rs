@@ -14,7 +14,7 @@
 //! Exercises ask/tell/top_k/trials endpoints, space/objectives info,
 //! checkpoints, error handling, cancel, and objective rescalarization.
 
-use hola::hola_engine::{HolaEngine, ObjectiveConfig, ParamConfig, StudyConfig};
+use hola::hola_engine::{HolaEngine, ObjectiveConfig, ParamConfig, StrategyConfig, StudyConfig};
 use hola::server::{ServerOptions, create_router, create_router_with_options};
 use http_body_util::BodyExt;
 use serde_json::json;
@@ -44,6 +44,37 @@ fn minimal_config() -> StudyConfig {
             group: None,
         }],
         strategy: None,
+        checkpoint: None,
+        max_trials: None,
+    }
+}
+
+fn sobol_config(seed: u64) -> StudyConfig {
+    StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }],
+        strategy: Some(StrategyConfig {
+            strategy_type: "sobol".to_string(),
+            refit_interval: 20,
+            total_budget: None,
+            exploration_budget: None,
+            seed: Some(seed),
+            elite_fraction: None,
+        }),
         checkpoint: None,
         max_trials: None,
     }
@@ -514,8 +545,56 @@ async fn test_server_checkpoint_save_endpoint() {
 
     let (status, body) = json_request(app, "POST", "/api/checkpoint/save", Some(save_req)).await;
     assert_eq!(status, 200);
+    assert_eq!(body["checkpoint_type"], "full");
     assert_eq!(body["path"].as_str().unwrap(), path.to_string_lossy());
     assert!(path.exists());
+
+    let saved: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(&path).unwrap()).unwrap();
+    assert!(saved.get("config").is_some());
+    assert!(saved["checkpoint"].get("strategy_state").is_some());
+}
+
+#[tokio::test]
+async fn test_server_checkpoint_save_preserves_sobol_sequence() {
+    let config = sobol_config(123);
+    let baseline = HolaEngine::from_config(config.clone()).unwrap();
+    let engine = HolaEngine::from_config(config).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = ServerOptions::new(8000);
+    options.checkpoint_dir = dir.path().to_path_buf();
+    let app = create_router_with_options(engine, options);
+
+    for _ in 0..3 {
+        let baseline_trial = baseline.ask().await.unwrap();
+        baseline
+            .tell(
+                baseline_trial.trial_id,
+                json!({"loss": baseline_trial.params["x"]}),
+            )
+            .await
+            .unwrap();
+
+        let (status, trial) = json_request(app.clone(), "POST", "/api/ask", None).await;
+        assert_eq!(status, 200);
+        assert_eq!(trial["params"], baseline_trial.params);
+        let tell =
+            json!({"trial_id": trial["trial_id"], "metrics": {"loss": trial["params"]["x"]}});
+        let (status, _) = json_request(app.clone(), "POST", "/api/tell", Some(tell)).await;
+        assert_eq!(status, 200);
+    }
+    let expected_next = baseline.ask().await.unwrap();
+
+    let path = dir.path().join("full.json");
+    let save_req = json!({"path": "full.json", "description": "server full"});
+    let (status, body) = json_request(app, "POST", "/api/checkpoint/save", Some(save_req)).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["checkpoint_type"], "full");
+
+    let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+    let restored_next = restored.ask().await.unwrap();
+    assert_eq!(restored_next.trial_id, expected_next.trial_id);
+    assert_eq!(restored_next.params, expected_next.params);
 }
 
 #[tokio::test]

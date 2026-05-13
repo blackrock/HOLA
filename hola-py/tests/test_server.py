@@ -19,12 +19,15 @@ fields, checkpoint save, multi-param space/objectives endpoints, objective
 updates, and Study.connect() ask/tell/top_k/connection-error.
 """
 
+import json
 import os
+import socket
+import subprocess
 
 import pytest
-from conftest import http_json
+from conftest import _wait_for_server, http_json
 
-from hola_opt import Study
+from hola_opt import Minimize, Real, Space, Study
 
 # ==========================================================================
 # REST API Endpoint Tests
@@ -147,7 +150,10 @@ class TestRestEndpoints:
         )
         assert status == 200
         assert body["status"] == "ok"
+        assert body["checkpoint_type"] == "full"
         assert os.path.exists(body["path"])
+        restored = Study.load(body["path"])
+        assert restored.trial_count() == 1
 
     def test_checkpoint_save_rejects_absolute_path(self):
         status, body = http_json(
@@ -157,6 +163,116 @@ class TestRestEndpoints:
         )
         assert status == 400
         assert "relative" in body["error"]
+
+
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def _write_sobol_server_config(tmp_path, *, load_from=None):
+    load_from_line = ""
+    if load_from is not None:
+        load_from_line = f"  load_from: {json.dumps(str(load_from))}\n"
+    config_path = tmp_path / ("loaded.yaml" if load_from else "study.yaml")
+    config_path.write_text(
+        "space:\n"
+        "  x:\n"
+        "    type: real\n"
+        "    min: 0.0\n"
+        "    max: 1.0\n"
+        "objectives:\n"
+        "  - field: loss\n"
+        "    type: minimize\n"
+        "    priority: 1.0\n"
+        "strategy:\n"
+        "  type: sobol\n"
+        "  seed: 123\n"
+        "checkpoint:\n"
+        f"  directory: {json.dumps(str(tmp_path))}\n"
+        "  interval: 50\n"
+        "  max_checkpoints: 5\n"
+        f"{load_from_line}",
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def _start_server(cli_binary, config_path, port):
+    url = f"http://localhost:{port}"
+    proc = subprocess.Popen(
+        [cli_binary, "serve", str(config_path), "--port", str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if not _wait_for_server(url):
+        proc.kill()
+        stderr = proc.stderr.read().decode() if proc.stderr else ""
+        pytest.fail(f"Server failed to start within timeout. stderr: {stderr}")
+    return proc, url
+
+
+def _stop_server(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def test_cli_load_from_rest_full_checkpoint_preserves_sobol_sequence(
+    cli_binary, free_port, tmp_path
+):
+    baseline = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("loss")],
+        strategy="sobol",
+        seed=123,
+    )
+    for _ in range(3):
+        baseline.ask()
+    expected = baseline.ask()
+
+    config_path = _write_sobol_server_config(tmp_path)
+    proc, url = _start_server(cli_binary, config_path, free_port)
+    try:
+        for _ in range(3):
+            status, trial = http_json(f"{url}/api/ask", method="POST")
+            assert status == 200
+            status, _ = http_json(
+                f"{url}/api/tell",
+                method="POST",
+                body={
+                    "trial_id": trial["trial_id"],
+                    "metrics": {"loss": trial["params"]["x"]},
+                },
+            )
+            assert status == 200
+
+        status, body = http_json(
+            f"{url}/api/checkpoint/save",
+            method="POST",
+            body={"path": "server-full.json", "description": "server full"},
+        )
+        assert status == 200
+        assert body["checkpoint_type"] == "full"
+        checkpoint_path = body["path"]
+    finally:
+        _stop_server(proc)
+
+    restored = Study.load(checkpoint_path)
+    assert restored.ask().params == expected.params
+
+    loaded_config_path = _write_sobol_server_config(tmp_path, load_from=checkpoint_path)
+    proc, loaded_url = _start_server(cli_binary, loaded_config_path, _free_port())
+    try:
+        status, trial = http_json(f"{loaded_url}/api/ask", method="POST")
+        assert status == 200
+        assert trial["trial_id"] == 3
+        assert trial["params"] == expected.params
+    finally:
+        _stop_server(proc)
 
 
 class TestRestMultiParam:

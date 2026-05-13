@@ -233,13 +233,14 @@ Each trial record contains the following fields.
 
 ## Persistence
 
-We support atomic JSON checkpoints that capture the leaderboard
-state.
+We support atomic JSON checkpoints for both warm starts and exact
+resumes.
 
 - **Leaderboard checkpoint.** All completed trials with params,
   scores, metrics, and timestamps.
-- **Strategy state.** The current state of the search strategy
-  (e.g., Sobol sequence position, GMM parameters).
+- **Full checkpoint.** A leaderboard checkpoint plus the current
+  search strategy state (e.g., Sobol sequence position, GMM
+  parameters) and study configuration.
 
 Checkpoints enable the following.
 

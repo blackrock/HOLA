@@ -27,7 +27,7 @@
 //! - `PATCH /api/objectives` - Update objectives mid-run
 //! - `GET /api/objectives` - Get current objectives
 //! - `GET /api/space` - Get parameter space metadata
-//! - `POST /api/checkpoint/save` - Save a checkpoint (internal)
+//! - `POST /api/checkpoint/save` - Save a full checkpoint
 //! - `GET /api/events` - SSE stream of engine events
 
 use crate::hola_engine::{HolaEngine, ObjectiveConfig};
@@ -370,13 +370,14 @@ async fn handle_checkpoint_save(
 
     match state
         .engine
-        .save_leaderboard_checkpoint_to(&path, req.description.as_deref())
+        .save_full_checkpoint(&path, req.description.as_deref())
         .await
     {
         Ok(()) => {
             let n = state.engine.trial_count().await;
             Ok(Json(serde_json::json!({
                 "status": "ok",
+                "checkpoint_type": "full",
                 "path": path.to_string_lossy(),
                 "trials_saved": n,
             })))

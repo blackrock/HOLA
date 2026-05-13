@@ -136,10 +136,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("Failed to create engine: {e}"))?;
 
             if let Some(path) = load_from {
-                engine
-                    .load_leaderboard_checkpoint(&path)
+                let checkpoint_kind = engine
+                    .load_checkpoint_with_fallback(&path)
                     .await
                     .map_err(|e| format!("Failed to load checkpoint '{path}': {e}"))?;
+                eprintln!("Loaded {} checkpoint from {path}", checkpoint_kind.as_str());
             }
 
             let auth_token = configured_token(auth_token);

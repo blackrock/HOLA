@@ -458,20 +458,20 @@ curl http://localhost:8000/api/space
 
 ### POST /api/checkpoint/save
 
-Save the current state as a JSON checkpoint file.
+Save the current server state as a full JSON checkpoint file.
 
 **Request**
 
 ```json
 {
-  "path": "/tmp/checkpoint.json",
+  "path": "checkpoint.json",
   "description": "After 100 trials"
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `path` | string | no | File path for the checkpoint (default: `"checkpoint.json"`) |
+| `path` | string | no | Relative path under the configured checkpoint directory (default: `"checkpoint.json"`) |
 | `description` | string | no | Optional description stored in the checkpoint metadata |
 
 **Response (200)**
@@ -479,9 +479,19 @@ Save the current state as a JSON checkpoint file.
 ```json
 {
   "status": "ok",
-  "path": "/tmp/checkpoint.json",
+  "checkpoint_type": "full",
+  "path": "./checkpoint.json",
   "trials_saved": 100
 }
+```
+
+The saved file includes completed trials, strategy state, and study
+configuration. The returned `path` is the resolved server-side path.
+
+**Error (400)**
+
+```json
+{"error": "Checkpoint path must be relative to the configured checkpoint directory"}
 ```
 
 **Error (500)**
