@@ -25,8 +25,8 @@
 //! - **Transformers** convert raw worker output into typed observations.
 //! - **[`Engine`]** orchestrates the loop with full compile-time type checking.
 //!
-//! For the type-erased HOLA frontend (`DynEngine`, REST server), see the `hola`
-//! crate which builds on top of `opt_engine`.
+//! For the type-erased HOLA frontend (`HolaEngine`, Python bindings, CLI, and
+//! REST server), see the `hola` crate which builds on top of `opt_engine`.
 //!
 //! # Quick start
 //!

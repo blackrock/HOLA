@@ -482,7 +482,7 @@ impl opt_engine::traits::RefittableStrategy for DynStrategy {
 }
 
 // =============================================================================
-// Configuration types for constructing DynEngine from YAML/JSON
+// Configuration types for constructing HolaEngine from YAML/JSON
 // =============================================================================
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -731,7 +731,7 @@ fn validate_strategy_config(strategy: &StrategyConfig) -> Result<(), String> {
 }
 
 // =============================================================================
-// DynEngine: the top-level Ask/Tell interface
+// HolaEngine: the top-level Ask/Tell interface
 // =============================================================================
 
 /// A trial returned by `ask()`.

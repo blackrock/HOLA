@@ -9,7 +9,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Integration tests for HOLA: DynEngine, REST API, and end-to-end optimization.
+//! Integration tests for HOLA: HolaEngine, REST API, and end-to-end optimization.
 
 mod end_to_end;
 mod hola_engine;
