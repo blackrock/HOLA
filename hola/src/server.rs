@@ -22,6 +22,7 @@
 //! - `POST /api/cancel` - Cancel a pending trial
 //! - `GET /api/top_k` - Get top-k trials by rank
 //! - `GET /api/pareto_front` - Get Pareto front trials
+//! - `GET /api/trial/{trial_id}` - Get one completed trial with scoring/ranking
 //! - `GET /api/trials` - Get all trials with scoring/ranking
 //! - `GET /api/trial_count` - Get number of completed trials
 //! - `PATCH /api/objectives` - Update objectives mid-run
@@ -30,10 +31,10 @@
 //! - `POST /api/checkpoint/save` - Save a full checkpoint
 //! - `GET /api/events` - SSE stream of engine events
 
-use crate::hola_engine::{HolaEngine, ObjectiveConfig};
+use crate::hola_engine::{CompletedTrial, HolaEngine, ObjectiveConfig};
 use axum::{
     Router,
-    extract::{Query, State},
+    extract::{Path as AxumPath, Query, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
         header::{AUTHORIZATION, CONTENT_TYPE},
@@ -62,8 +63,14 @@ use tower_http::services::ServeDir;
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum EngineEvent {
-    TrialCompleted { trial_id: u64, score: f64 },
-    RefitOccurred { n_trials: usize },
+    TrialCompleted {
+        trial_id: u64,
+        score: f64,
+        trial: CompletedTrial,
+    },
+    RefitOccurred {
+        n_trials: usize,
+    },
 }
 
 pub struct ServerState {
@@ -130,6 +137,12 @@ struct ParetoQuery {
 struct TrialsQuery {
     #[serde(default)]
     sorted_by: Option<String>,
+    #[serde(default)]
+    include_infeasible: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct TrialQuery {
     #[serde(default)]
     include_infeasible: Option<bool>,
 }
@@ -252,11 +265,13 @@ async fn handle_tell(
             let _ = state.events_tx.send(EngineEvent::TrialCompleted {
                 trial_id: req.trial_id,
                 score,
+                trial: completed.clone(),
             });
 
             Ok(Json(serde_json::json!({
                 "status": "ok",
                 "trial_count": n,
+                "trial": completed,
             })))
         }
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e }))),
@@ -302,6 +317,27 @@ async fn handle_trials(
     let include_infeasible = q.include_infeasible.unwrap_or(true);
     let trials = state.engine.trials(sorted_by, include_infeasible).await;
     Json(serde_json::to_value(&trials).unwrap_or_default())
+}
+
+async fn handle_trial(
+    State(state): State<Arc<ServerState>>,
+    AxumPath(trial_id): AxumPath<u64>,
+    Query(q): Query<TrialQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let include_infeasible = q.include_infeasible.unwrap_or(true);
+    match state
+        .engine
+        .completed_trial(trial_id, include_infeasible)
+        .await
+    {
+        Some(trial) => Ok(Json(serde_json::to_value(&trial).unwrap_or_default())),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Trial {trial_id} not found"),
+            }),
+        )),
+    }
 }
 
 async fn handle_trial_count(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value> {
@@ -456,6 +492,7 @@ pub fn create_router_with_options(engine: HolaEngine, options: ServerOptions) ->
         .route("/api/cancel", post(handle_cancel))
         .route("/api/top_k", get(handle_top_k))
         .route("/api/pareto_front", get(handle_pareto_front))
+        .route("/api/trial/{trial_id}", get(handle_trial))
         .route("/api/trials", get(handle_trials))
         .route("/api/trial_count", get(handle_trial_count))
         .route(

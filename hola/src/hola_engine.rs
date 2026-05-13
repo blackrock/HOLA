@@ -1005,17 +1005,41 @@ impl DynLeaderboard {
     fn get_completed(
         &self,
         trial_id: u64,
+        include_infeasible: bool,
         objectives: &[ObjectiveConfig],
     ) -> Option<CompletedTrial> {
-        // Build the full ranked list, then find the requested trial.
-        let all = self.completed_trials("rank", false, objectives);
-        all.into_iter()
-            .find(|ct| ct.trial_id == trial_id)
-            .or_else(|| {
-                // Trial might be infeasible — try again with infeasible included
-                let all_with_inf = self.completed_trials("rank", true, objectives);
-                all_with_inf.into_iter().find(|ct| ct.trial_id == trial_id)
-            })
+        match self {
+            DynLeaderboard::Scalar(lb) => {
+                let trial = lb.get(trial_id)?.clone();
+                if !include_infeasible
+                    && !Leaderboard::<serde_json::Value, f64>::trial_is_feasible(&trial)
+                {
+                    return None;
+                }
+
+                let rank = lb
+                    .iter()
+                    .filter(|other| {
+                        include_infeasible
+                            || Leaderboard::<serde_json::Value, f64>::trial_is_feasible(other)
+                    })
+                    .filter(|other| {
+                        other
+                            .observation
+                            .partial_cmp(&trial.observation)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| other.trial_id.cmp(&trial.trial_id))
+                            == std::cmp::Ordering::Less
+                    })
+                    .count();
+
+                Some(build_completed_scalar(trial, rank, objectives))
+            }
+            DynLeaderboard::Vector(_) => {
+                let all = self.completed_trials("rank", include_infeasible, objectives);
+                all.into_iter().find(|ct| ct.trial_id == trial_id)
+            }
+        }
     }
 
     /// Return all trials as CompletedTrial with ranking and scoring.
@@ -1470,11 +1494,12 @@ impl HolaEngine {
         state.strategy.update(&candidate, score);
 
         let n_trials = state.leaderboard.len();
-        let completed = state
-            .leaderboard
-            .get_completed(stored_trial_id, &objectives)
-            .ok_or_else(|| format!("Failed to build CompletedTrial for {stored_trial_id}"))?;
+        let leaderboard_snapshot = state.leaderboard.clone();
         drop(state);
+
+        let completed = leaderboard_snapshot
+            .get_completed(stored_trial_id, true, &objectives)
+            .ok_or_else(|| format!("Failed to build CompletedTrial for {stored_trial_id}"))?;
 
         // Auto-refit if configured
         if let Some(ref config) = self.refit_config
@@ -1562,6 +1587,17 @@ impl HolaEngine {
             include_infeasible,
             &objectives,
         )
+    }
+
+    /// Get a single completed trial by ID with scoring and ranking.
+    pub async fn completed_trial(
+        &self,
+        trial_id: u64,
+        include_infeasible: bool,
+    ) -> Option<CompletedTrial> {
+        let objectives = self.objectives.read().await.clone();
+        let leaderboard_snapshot = self.state.read().await.leaderboard.clone();
+        leaderboard_snapshot.get_completed(trial_id, include_infeasible, &objectives)
     }
 
     /// Get all trials with scoring and ranking.

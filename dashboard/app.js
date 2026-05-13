@@ -94,14 +94,26 @@ function startSSE() {
     S.sse.onmessage = async (e) => {
         const event = JSON.parse(e.data);
         if (event.type === 'TrialCompleted') {
-            // Re-fetch trials
-            const resp = await fetch(`${S.serverUrl}/api/trials?sorted_by=index&include_infeasible=true`);
-            S.trials = await resp.json();
+            const trial = event.trial || await fetchCompletedTrial(event.trial_id);
+            if (!trial) return;
+            upsertTrial(trial);
             discoverMetrics();
             S.lastTrialTime = Date.now();
             if (S.previewActive) previewObjectives(); else renderAll();
         }
     };
+}
+
+async function fetchCompletedTrial(trialId) {
+    const resp = await fetch(`${S.serverUrl}/api/trial/${trialId}?include_infeasible=true`);
+    if (!resp.ok) return null;
+    return resp.json();
+}
+
+function upsertTrial(trial) {
+    const idx = S.trials.findIndex(t => t.trial_id === trial.trial_id);
+    if (idx >= 0) S.trials[idx] = trial;
+    else S.trials.push(trial);
 }
 
 function loadCheckpointFile(event) {

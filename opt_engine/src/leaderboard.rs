@@ -24,6 +24,7 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 // =============================================================================
@@ -304,6 +305,20 @@ impl<D: Clone> Leaderboard<D, f64> {
         is_feasible_scalar(trial.observation)
     }
 
+    fn compare_best(a: &Trial<D, f64>, b: &Trial<D, f64>) -> Ordering {
+        a.observation
+            .partial_cmp(&b.observation)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.trial_id.cmp(&b.trial_id))
+    }
+
+    fn compare_worst(a: &Trial<D, f64>, b: &Trial<D, f64>) -> Ordering {
+        b.observation
+            .partial_cmp(&a.observation)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.trial_id.cmp(&b.trial_id))
+    }
+
     /// Return only feasible trials (those with finite observations).
     pub fn feasible_trials(&self) -> Vec<Trial<D, f64>> {
         self.trials
@@ -337,14 +352,14 @@ impl<D: Clone> Leaderboard<D, f64> {
             .filter(|t| Self::trial_is_feasible(t))
             .collect();
 
-        feasible.sort_by(|a, b| {
-            a.observation
-                .partial_cmp(&b.observation)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.trial_id.cmp(&b.trial_id))
-        });
+        let limit = k.min(feasible.len());
+        if limit < feasible.len() {
+            feasible.select_nth_unstable_by(limit, |a, b| Self::compare_best(a, b));
+            feasible.truncate(limit);
+        }
+        feasible.sort_by(|a, b| Self::compare_best(a, b));
 
-        feasible.into_iter().take(k).cloned().collect()
+        feasible.into_iter().cloned().collect()
     }
 
     /// Return the k trials with the lowest observations, including infeasible.
@@ -353,21 +368,15 @@ impl<D: Clone> Leaderboard<D, f64> {
             return Vec::new();
         }
 
-        let mut indices: Vec<usize> = (0..self.trials.len()).collect();
-        indices.sort_by(|&a, &b| {
-            let obs_a = self.trials[a].observation;
-            let obs_b = self.trials[b].observation;
-            obs_a
-                .partial_cmp(&obs_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| self.trials[a].trial_id.cmp(&self.trials[b].trial_id))
-        });
+        let mut trials: Vec<&Trial<D, f64>> = self.trials.iter().collect();
+        let limit = k.min(trials.len());
+        if limit < trials.len() {
+            trials.select_nth_unstable_by(limit, |a, b| Self::compare_best(a, b));
+            trials.truncate(limit);
+        }
+        trials.sort_by(|a, b| Self::compare_best(a, b));
 
-        indices
-            .into_iter()
-            .take(k)
-            .map(|i| self.trials[i].clone())
-            .collect()
+        trials.into_iter().cloned().collect()
     }
 
     /// Return feasible trials sorted by observation (ascending).
@@ -406,14 +415,14 @@ impl<D: Clone> Leaderboard<D, f64> {
             .filter(|t| Self::trial_is_feasible(t))
             .collect();
 
-        feasible.sort_by(|a, b| {
-            b.observation
-                .partial_cmp(&a.observation)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.trial_id.cmp(&b.trial_id))
-        });
+        let limit = k.min(feasible.len());
+        if limit < feasible.len() {
+            feasible.select_nth_unstable_by(limit, |a, b| Self::compare_worst(a, b));
+            feasible.truncate(limit);
+        }
+        feasible.sort_by(|a, b| Self::compare_worst(a, b));
 
-        feasible.into_iter().take(k).cloned().collect()
+        feasible.into_iter().cloned().collect()
     }
 
     /// Return the k worst trials, including infeasible.
@@ -422,21 +431,15 @@ impl<D: Clone> Leaderboard<D, f64> {
             return Vec::new();
         }
 
-        let mut indices: Vec<usize> = (0..self.trials.len()).collect();
-        indices.sort_by(|&a, &b| {
-            let obs_a = self.trials[a].observation;
-            let obs_b = self.trials[b].observation;
-            obs_b
-                .partial_cmp(&obs_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| self.trials[a].trial_id.cmp(&self.trials[b].trial_id))
-        });
+        let mut trials: Vec<&Trial<D, f64>> = self.trials.iter().collect();
+        let limit = k.min(trials.len());
+        if limit < trials.len() {
+            trials.select_nth_unstable_by(limit, |a, b| Self::compare_worst(a, b));
+            trials.truncate(limit);
+        }
+        trials.sort_by(|a, b| Self::compare_worst(a, b));
 
-        indices
-            .into_iter()
-            .take(k)
-            .map(|i| self.trials[i].clone())
-            .collect()
+        trials.into_iter().cloned().collect()
     }
 
     /// Compute the quantile threshold for feasible observations.
@@ -638,27 +641,38 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
     where
         F: Fn(&BTreeMap<String, f64>) -> f64,
     {
-        let feasible = self.feasible_trials();
-        if feasible.is_empty() || k == 0 {
+        if self.trials.is_empty() || k == 0 {
             return Vec::new();
         }
 
-        let mut indexed: Vec<(usize, f64)> = feasible
+        let mut scored: Vec<(&Trial<D, BTreeMap<String, f64>>, f64)> = self
+            .trials
             .iter()
-            .enumerate()
-            .map(|(i, t)| (i, scalarizer(&t.observation)))
+            .filter(|t| Self::trial_is_feasible(t))
+            .map(|t| (t, scalarizer(&t.observation)))
             .collect();
 
-        indexed.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| feasible[a.0].trial_id.cmp(&feasible[b.0].trial_id))
-        });
+        if scored.is_empty() {
+            return Vec::new();
+        }
 
-        indexed
+        let compare = |a: &(&Trial<D, BTreeMap<String, f64>>, f64),
+                       b: &(&Trial<D, BTreeMap<String, f64>>, f64)| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.trial_id.cmp(&b.0.trial_id))
+        };
+
+        let limit = k.min(scored.len());
+        if limit < scored.len() {
+            scored.select_nth_unstable_by(limit, compare);
+            scored.truncate(limit);
+        }
+        scored.sort_by(compare);
+
+        scored
             .into_iter()
-            .take(k)
-            .map(|(i, _)| feasible[i].clone())
+            .map(|(trial, _)| (*trial).clone())
             .collect()
     }
 

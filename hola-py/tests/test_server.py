@@ -63,6 +63,8 @@ class TestRestEndpoints:
         assert status == 200
         assert resp["status"] == "ok"
         assert resp["trial_count"] == 1
+        assert resp["trial"]["trial_id"] == trial_id
+        assert isinstance(resp["trial"]["score_vector"], dict)
 
         # Top K (replacement for /api/best)
         status, best = http_json(f"{self.url}/api/top_k?k=1")
@@ -71,6 +73,11 @@ class TestRestEndpoints:
         assert len(best) == 1
         assert best[0]["trial_id"] == trial_id
         assert isinstance(best[0]["score_vector"], dict)
+
+        status, completed = http_json(f"{self.url}/api/trial/{trial_id}?include_infeasible=true")
+        assert status == 200
+        assert completed["trial_id"] == trial_id
+        assert completed["metrics"]["loss"] == 0.42
 
     def test_trials_empty(self):
         status, body = http_json(f"{self.url}/api/trials?sorted_by=index&include_infeasible=true")
@@ -362,7 +369,9 @@ class TestStudyConnect:
         assert t.trial_id == 0
         assert "x" in t.params
 
-        remote.tell(t.trial_id, {"loss": 0.42})
+        completed = remote.tell(t.trial_id, {"loss": 0.42})
+        assert completed.trial_id == t.trial_id
+        assert isinstance(completed.score_vector, dict)
 
         top = remote.top_k(1)
         assert len(top) == 1

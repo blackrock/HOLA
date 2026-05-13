@@ -204,6 +204,8 @@ async fn test_server_ask_tell_top_k_flow() {
     assert_eq!(status, 200);
     assert_eq!(result["status"], "ok");
     assert_eq!(result["trial_count"], 1);
+    assert_eq!(result["trial"]["trial_id"], trial_id);
+    assert!(result["trial"]["score_vector"].is_object());
 
     // Top-k
     let (status, top) = json_request(
@@ -221,6 +223,18 @@ async fn test_server_ask_tell_top_k_flow() {
     assert!(top_arr[0]["metrics"].is_object());
     assert!(top_arr[0]["scores"].is_object());
     assert!(top_arr[0]["rank"].is_u64());
+
+    // Single-trial lookup
+    let (status, single) = json_request(
+        app.clone(),
+        "GET",
+        &format!("/api/trial/{trial_id}?include_infeasible=true"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(single["trial_id"], trial_id);
+    assert_eq!(single["metrics"]["loss"], 0.42);
 
     // Trials
     let (status, trials) = json_request(

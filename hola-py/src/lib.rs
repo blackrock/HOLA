@@ -692,9 +692,7 @@ impl Study {
                 client,
                 runtime,
             } => {
-                // Remote tell returns lightweight response, so we tell then
-                // fetch the trial's details via top_k.
-                runtime
+                let trial_json: serde_json::Value = runtime
                     .block_on(async {
                         let resp = with_remote_auth(client.post(format!("{url}/api/tell")), token)
                             .json(&serde_json::json!({
@@ -712,14 +710,27 @@ impl Study {
                                 .unwrap_or_else(|_| "unknown error".to_string());
                             return Err(format!("Server error: {body}"));
                         }
-                        Ok(())
-                    })
-                    .map_err(PyValueError::new_err)?;
+                        let tell_body: serde_json::Value =
+                            resp.json().await.map_err(|e| format!("JSON error: {e}"))?;
+                        if let Some(trial) = tell_body.get("trial") {
+                            return Ok(trial.clone());
+                        }
 
-                // Fetch the trial details from the server
-                let trials_resp: Vec<serde_json::Value> = runtime
-                    .block_on(async {
-                        client
+                        let trial_resp = client
+                            .get(format!(
+                                "{url}/api/trial/{trial_id}?include_infeasible=true"
+                            ))
+                            .send()
+                            .await
+                            .map_err(|e| format!("HTTP error: {e}"))?;
+                        if trial_resp.status().is_success() {
+                            return trial_resp
+                                .json()
+                                .await
+                                .map_err(|e| format!("JSON error: {e}"));
+                        }
+
+                        let trials_resp: Vec<serde_json::Value> = client
                             .get(format!(
                                 "{url}/api/trials?sorted_by=index&include_infeasible=true"
                             ))
@@ -728,22 +739,16 @@ impl Study {
                             .map_err(|e| format!("HTTP error: {e}"))?
                             .json()
                             .await
-                            .map_err(|e| format!("JSON error: {e}"))
+                            .map_err(|e| format!("JSON error: {e}"))?;
+                        trials_resp
+                            .into_iter()
+                            .find(|t| t.get("trial_id").and_then(|v| v.as_u64()) == Some(trial_id))
+                            .ok_or_else(|| format!("Trial {trial_id} not found in server response"))
                     })
                     .map_err(PyValueError::new_err)?;
 
-                // Find the trial we just told
-                let trial_json = trials_resp
-                    .iter()
-                    .find(|t| t.get("trial_id").and_then(|v| v.as_u64()) == Some(trial_id))
-                    .ok_or_else(|| {
-                        PyValueError::new_err(format!(
-                            "Trial {trial_id} not found in server response"
-                        ))
-                    })?;
-
                 let ct: hola_engine::hola_engine::CompletedTrial =
-                    serde_json::from_value(trial_json.clone()).map_err(|e| {
+                    serde_json::from_value(trial_json).map_err(|e| {
                         PyValueError::new_err(format!("Deserialization error: {e}"))
                     })?;
                 rust_to_py_completed(py, &ct)
