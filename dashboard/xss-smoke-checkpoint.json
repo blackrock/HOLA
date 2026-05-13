@@ -1,0 +1,22 @@
+{
+  "leaderboard": {
+    "trials": [
+      {
+        "trial_id": 0,
+        "candidate": {
+          "<img src=x onerror=alert(1)>": "<svg onload=alert(2)>"
+        },
+        "raw_metrics": {
+          "<img src=x onerror=alert(3)>": "<script>alert(4)</script>",
+          "loss": 0.5
+        },
+        "score_vector": {
+          "loss": 0.5
+        },
+        "rank": 0,
+        "pareto_front": 0,
+        "timestamp": 0
+      }
+    ]
+  }
+}
