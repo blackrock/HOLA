@@ -90,6 +90,155 @@ async fn test_dyn_engine_config_with_checkpoint() {
     let _t = engine.ask().await.unwrap();
 }
 
+fn valid_config_for_validation() -> StudyConfig {
+    StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }],
+        strategy: Some(StrategyConfig {
+            strategy_type: "gmm".to_string(),
+            refit_interval: 20,
+            total_budget: None,
+            exploration_budget: None,
+            seed: None,
+            elite_fraction: None,
+        }),
+        checkpoint: None,
+        max_trials: None,
+    }
+}
+
+fn assert_config_error(config: StudyConfig, expected: &[&str]) {
+    let err = match HolaEngine::from_config(config) {
+        Ok(_) => panic!("expected config validation to fail"),
+        Err(err) => err,
+    };
+    for needle in expected {
+        assert!(
+            err.contains(needle),
+            "expected error {err:?} to contain {needle:?}"
+        );
+    }
+}
+
+#[test]
+fn test_dyn_engine_config_validation_rejects_invalid_scale() {
+    let mut config = valid_config_for_validation();
+    config.space.insert(
+        "lr".to_string(),
+        ParamConfig::Real {
+            min: 1.0e-4,
+            max: 1.0e-1,
+            scale: "log2".to_string(),
+        },
+    );
+    assert_config_error(config, &["Parameter 'lr'", "unknown real scale", "log2"]);
+}
+
+#[test]
+fn test_dyn_engine_config_validation_rejects_invalid_strategy() {
+    let mut config = valid_config_for_validation();
+    config.strategy.as_mut().unwrap().strategy_type = "soboll".to_string();
+    assert_config_error(config, &["Unknown strategy type", "soboll"]);
+}
+
+#[test]
+fn test_dyn_engine_config_validation_rejects_invalid_objective_type() {
+    let mut config = valid_config_for_validation();
+    config.objectives[0].obj_type = "minimise".to_string();
+    assert_config_error(
+        config,
+        &["Objective 'loss'", "unknown objective type", "minimise"],
+    );
+}
+
+#[test]
+fn test_dyn_engine_config_validation_rejects_invalid_space_shapes() {
+    let mut real = valid_config_for_validation();
+    real.space.insert(
+        "x".to_string(),
+        ParamConfig::Real {
+            min: 1.0,
+            max: 1.0,
+            scale: "linear".to_string(),
+        },
+    );
+    assert_config_error(real, &["Parameter 'x'", "min must be less than max"]);
+
+    let mut integer = valid_config_for_validation();
+    integer.space.insert(
+        "layers".to_string(),
+        ParamConfig::Integer { min: 10, max: 1 },
+    );
+    assert_config_error(
+        integer,
+        &["Parameter 'layers'", "integer min must be <= max"],
+    );
+
+    let mut categorical = valid_config_for_validation();
+    categorical.space.insert(
+        "optimizer".to_string(),
+        ParamConfig::Categorical { choices: vec![] },
+    );
+    assert_config_error(
+        categorical,
+        &["Parameter 'optimizer'", "choices must not be empty"],
+    );
+}
+
+#[test]
+fn test_dyn_engine_config_validation_rejects_non_finite_real_bounds() {
+    let mut nan = valid_config_for_validation();
+    nan.space.insert(
+        "x".to_string(),
+        ParamConfig::Real {
+            min: f64::NAN,
+            max: 1.0,
+            scale: "linear".to_string(),
+        },
+    );
+    assert_config_error(nan, &["Parameter 'x'", "bounds must be finite"]);
+
+    let mut inf = valid_config_for_validation();
+    inf.space.insert(
+        "x".to_string(),
+        ParamConfig::Real {
+            min: 0.0,
+            max: f64::INFINITY,
+            scale: "linear".to_string(),
+        },
+    );
+    assert_config_error(inf, &["Parameter 'x'", "bounds must be finite"]);
+}
+
+#[test]
+fn test_dyn_engine_config_validation_rejects_invalid_refit_and_priority() {
+    let mut refit = valid_config_for_validation();
+    refit.strategy.as_mut().unwrap().refit_interval = 0;
+    assert_config_error(refit, &["strategy.refit_interval", "at least 1"]);
+
+    let mut priority = valid_config_for_validation();
+    priority.objectives[0].priority = -1.0;
+    assert_config_error(priority, &["Objective 'loss'", "priority"]);
+
+    let mut elite_fraction = valid_config_for_validation();
+    elite_fraction.strategy.as_mut().unwrap().elite_fraction = Some(f64::NAN);
+    assert_config_error(elite_fraction, &["strategy.elite_fraction", "finite"]);
+}
+
 // ==========================================================================
 // Ask/Tell flow
 // ==========================================================================
@@ -703,9 +852,31 @@ async fn test_dyn_engine_update_objectives() {
             priority: 1.0,
             group: None,
         }])
-        .await;
+        .await
+        .unwrap();
 
     assert!(!engine.top_k(1, false).await.is_empty());
+}
+
+#[tokio::test]
+async fn test_dyn_engine_update_objectives_rejects_invalid_config() {
+    let engine = HolaEngine::from_config(valid_config_for_validation()).unwrap();
+    let before = engine.objectives().await;
+
+    let err = engine
+        .update_objectives(vec![ObjectiveConfig {
+            field: "accuracy".to_string(),
+            obj_type: "larger_is_better".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }])
+        .await
+        .unwrap_err();
+
+    assert!(err.contains("Objective 'accuracy'"));
+    assert_eq!(engine.objectives().await[0].field, before[0].field);
 }
 
 #[tokio::test]
@@ -799,7 +970,8 @@ async fn test_dyn_engine_update_objectives_rescalarizes() {
             priority: 1.0,
             group: None,
         }])
-        .await;
+        .await
+        .unwrap();
 
     let best_after = engine.top_k(1, false).await.into_iter().next().unwrap();
     assert_ne!(best_before.trial_id, best_after.trial_id);
@@ -860,7 +1032,8 @@ async fn test_dyn_engine_update_objectives_migrates_scalar_to_vector() {
                 group: None,
             },
         ])
-        .await;
+        .await
+        .unwrap();
 
     let mut front_ids: Vec<u64> = engine
         .pareto_front(0, false)
@@ -935,7 +1108,8 @@ async fn test_dyn_engine_update_objectives_migrates_vector_to_scalar() {
             priority: 1.0,
             group: None,
         }])
-        .await;
+        .await
+        .unwrap();
 
     assert!(engine.pareto_front(0, false).await.is_empty());
     let best = engine.top_k(1, false).await.into_iter().next().unwrap();
@@ -1133,7 +1307,8 @@ async fn test_update_objectives_triggers_refit() {
             priority: 1.0,
             group: None,
         }])
-        .await;
+        .await
+        .unwrap();
 
     let best_after = engine.top_k(1, false).await.into_iter().next().unwrap();
     assert!(best_after.rank < best_before.rank || best_after.trial_id != best_before.trial_id);

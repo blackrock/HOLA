@@ -332,6 +332,19 @@ class TestRestMultiParam:
         assert status == 200
         assert body["status"] == "ok"
 
+    @pytest.mark.server_config(
+        objectives=[{"field": "loss", "type": "minimize", "priority": 1.0}],
+    )
+    def test_update_objectives_rejects_invalid_type(self, running_server):
+        url = running_server
+        status, body = http_json(
+            f"{url}/api/objectives",
+            method="PATCH",
+            body={"objectives": [{"field": "accuracy", "type": "larger", "priority": 1.0}]},
+        )
+        assert status == 400
+        assert "Objective 'accuracy'" in body["error"]
+
 
 # ==========================================================================
 # Study.connect() Live Integration Tests

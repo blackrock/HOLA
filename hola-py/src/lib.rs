@@ -232,10 +232,10 @@ impl Gmm {
         exploration_budget: Option<usize>,
     ) -> PyResult<Self> {
         if let Some(ef) = elite_fraction
-            && (ef <= 0.0 || ef > 1.0)
+            && (!ef.is_finite() || ef <= 0.0 || ef > 1.0)
         {
             return Err(PyValueError::new_err(
-                "elite_fraction must be between 0.0 (exclusive) and 1.0 (inclusive)",
+                "elite_fraction must be finite and between 0.0 (exclusive) and 1.0 (inclusive)",
             ));
         }
         if let Some(ri) = refit_interval
@@ -928,10 +928,9 @@ impl Study {
     fn update_objectives(&self, objectives: &Bound<'_, PyList>) -> PyResult<()> {
         let obj_configs = extract_objectives(objectives)?;
         match &self.inner {
-            StudyInner::Local { engine, runtime } => {
-                runtime.block_on(engine.update_objectives(obj_configs));
-                Ok(())
-            }
+            StudyInner::Local { engine, runtime } => runtime
+                .block_on(engine.update_objectives(obj_configs))
+                .map_err(PyValueError::new_err),
             StudyInner::Remote {
                 url,
                 token,

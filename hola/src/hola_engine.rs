@@ -588,6 +588,148 @@ fn default_checkpoint_interval() -> usize {
     50
 }
 
+fn validate_study_config(config: &StudyConfig) -> Result<(), String> {
+    validate_space_config(&config.space)?;
+    validate_objectives(&config.objectives)?;
+    if let Some(strategy) = &config.strategy {
+        validate_strategy_config(strategy)?;
+    }
+    if let Some(checkpoint) = &config.checkpoint
+        && checkpoint.interval == 0
+    {
+        return Err("checkpoint.interval must be at least 1".to_string());
+    }
+    Ok(())
+}
+
+fn validate_space_config(space: &BTreeMap<String, ParamConfig>) -> Result<(), String> {
+    if space.is_empty() {
+        return Err("At least one parameter is required".to_string());
+    }
+
+    for (name, param) in space {
+        if name.trim().is_empty() {
+            return Err("Parameter names must not be empty".to_string());
+        }
+        match param {
+            ParamConfig::Real { min, max, scale } => {
+                if !min.is_finite() || !max.is_finite() {
+                    return Err(format!(
+                        "Parameter '{name}': real bounds must be finite, got min={min}, max={max}",
+                    ));
+                }
+                if min >= max {
+                    return Err(format!(
+                        "Parameter '{name}': min must be less than max, got min={min}, max={max}",
+                    ));
+                }
+                match scale.as_str() {
+                    "linear" => {}
+                    "log" | "ln" | "log10" => {
+                        if *min <= 0.0 || *max <= 0.0 {
+                            return Err(format!(
+                                "Parameter '{name}': {scale} scale requires min > 0 and max > 0, got min={min}, max={max}",
+                            ));
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "Parameter '{name}': unknown real scale '{other}'. Expected one of: linear, log, ln, log10",
+                        ));
+                    }
+                }
+            }
+            ParamConfig::Integer { min, max } => {
+                if min > max {
+                    return Err(format!(
+                        "Parameter '{name}': integer min must be <= max, got min={min}, max={max}",
+                    ));
+                }
+            }
+            ParamConfig::Categorical { choices } => {
+                if choices.is_empty() {
+                    return Err(format!(
+                        "Parameter '{name}': categorical choices must not be empty",
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_objectives(objectives: &[ObjectiveConfig]) -> Result<(), String> {
+    if objectives.is_empty() {
+        return Err("At least one objective is required. \
+             Example: objectives: [{ field: \"loss\", type: \"minimize\" }]"
+            .to_string());
+    }
+
+    for obj in objectives {
+        if obj.field.trim().is_empty() {
+            return Err("Objective field names must not be empty".to_string());
+        }
+        match obj.obj_type.as_str() {
+            "minimize" | "maximize" => {}
+            other => {
+                return Err(format!(
+                    "Objective '{}': unknown objective type '{}'. Expected 'minimize' or 'maximize'",
+                    obj.field, other
+                ));
+            }
+        }
+        if !obj.priority.is_finite() || obj.priority < 0.0 {
+            return Err(format!(
+                "Objective '{}': priority must be finite and non-negative, got {}",
+                obj.field, obj.priority
+            ));
+        }
+        if let Some(target) = obj.target
+            && !target.is_finite()
+        {
+            return Err(format!(
+                "Objective '{}': target must be finite, got {}",
+                obj.field, target
+            ));
+        }
+        if let Some(limit) = obj.limit
+            && !limit.is_finite()
+        {
+            return Err(format!(
+                "Objective '{}': limit must be finite, got {}",
+                obj.field, limit
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_strategy_config(strategy: &StrategyConfig) -> Result<(), String> {
+    match strategy.strategy_type.as_str() {
+        "random" | "sobol" | "gmm" | "auto" => {}
+        other => {
+            return Err(format!(
+                "Unknown strategy type '{other}'. Expected one of: random, sobol, gmm, auto",
+            ));
+        }
+    }
+
+    if strategy.refit_interval == 0 {
+        return Err("strategy.refit_interval must be at least 1".to_string());
+    }
+    if let Some(elite_fraction) = strategy.elite_fraction
+        && (!elite_fraction.is_finite() || elite_fraction <= 0.0 || elite_fraction > 1.0)
+    {
+        return Err(format!(
+            "strategy.elite_fraction must be finite and in (0, 1], got {elite_fraction}",
+        ));
+    }
+
+    Ok(())
+}
+
 // =============================================================================
 // DynEngine: the top-level Ask/Tell interface
 // =============================================================================
@@ -1076,11 +1218,7 @@ impl HolaEngineState {
 impl HolaEngine {
     /// Build a HolaEngine from a StudyConfig (parsed from YAML/JSON).
     pub fn from_config(config: StudyConfig) -> Result<Self, String> {
-        if config.objectives.is_empty() {
-            return Err("At least one objective is required. \
-                 Example: objectives: [{ field: \"loss\", obj_type: \"minimize\" }]"
-                .to_string());
-        }
+        validate_study_config(&config)?;
 
         let mut space = DynSpace::new();
         for (name, param) in &config.space {
@@ -1152,7 +1290,7 @@ impl HolaEngine {
                 None,
             ),
             // "gmm" (default): Sobol exploration followed by GMM exploitation
-            _ => {
+            "gmm" | "auto" => {
                 let exploration_budget = strategy_cfg
                     .and_then(|s| s.exploration_budget)
                     .unwrap_or_else(|| {
@@ -1174,6 +1312,7 @@ impl HolaEngine {
                     )),
                 )
             }
+            _ => unreachable!("strategy type was validated before construction"),
         };
 
         let auto_checkpoint = config.checkpoint.as_ref().map(|c| {
@@ -1431,7 +1570,9 @@ impl HolaEngine {
     /// updated scalarization. If a refittable strategy (e.g., GMM) is configured,
     /// a refit is triggered immediately so the sampling distribution reflects
     /// the new objective weights.
-    pub async fn update_objectives(&self, objectives: Vec<ObjectiveConfig>) {
+    pub async fn update_objectives(&self, objectives: Vec<ObjectiveConfig>) -> Result<(), String> {
+        validate_objectives(&objectives)?;
+
         // Persist the new objectives
         *self.objectives.write().await = objectives.clone();
         // Re-scalarize all historical trials with the new objectives
@@ -1462,6 +1603,7 @@ impl HolaEngine {
                 self.state.write().await.strategy = fitted;
             }
         }
+        Ok(())
     }
 
     // =========================================================================
@@ -1797,7 +1939,7 @@ fn objective_score(val: f64, obj_type: &str, target: Option<f64>, limit: Option<
             (Some(t), Some(l)) => opt_engine::objectives::tlp_score(val, t, l),
             _ => opt_engine::objectives::directed_value(val, true),
         },
-        _ => val,
+        _ => f64::INFINITY,
     }
 }
 

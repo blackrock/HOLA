@@ -98,6 +98,36 @@ def test_serve_invalid_yaml_exits(cli_binary, tmp_path):
     assert result.returncode != 0
 
 
+def test_serve_invalid_strategy_config_exits_with_helpful_error(cli_binary, tmp_path):
+    config_path = write_yaml_config(tmp_path, strategy={"type": "soboll"})
+
+    result = subprocess.run(
+        [cli_binary, "serve", str(config_path)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert "Unknown strategy type 'soboll'" in result.stderr
+
+
+def test_serve_invalid_scale_config_exits_with_parameter_name(cli_binary, tmp_path):
+    config_path = write_yaml_config(
+        tmp_path,
+        space={"lr": {"type": "real", "min": 0.001, "max": 0.1, "scale": "log2"}},
+    )
+
+    result = subprocess.run(
+        [cli_binary, "serve", str(config_path)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert "Parameter 'lr'" in result.stderr
+    assert "unknown real scale" in result.stderr
+
+
 def test_serve_custom_port(cli_binary, tmp_path):
     port = _find_free_port()
     config_path = write_yaml_config(tmp_path)

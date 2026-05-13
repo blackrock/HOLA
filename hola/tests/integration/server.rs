@@ -476,6 +476,22 @@ async fn test_server_update_objectives() {
 }
 
 #[tokio::test]
+async fn test_server_update_objectives_rejects_invalid_type() {
+    let engine = HolaEngine::from_config(minimal_config()).unwrap();
+    let app = create_router(engine);
+
+    let patch = json!({"objectives": [{"field": "accuracy", "type": "larger", "priority": 1.0}]});
+    let (status, result) = json_request(app, "PATCH", "/api/objectives", Some(patch)).await;
+    assert_eq!(status, 400);
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("Objective 'accuracy'")
+    );
+}
+
+#[tokio::test]
 async fn test_server_update_objectives_rescalarizes() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
     let app = create_router(engine);

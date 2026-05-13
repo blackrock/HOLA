@@ -315,12 +315,16 @@ async fn handle_update_objectives(
     Json(req): Json<UpdateObjectivesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     authorize_mutation(&state, &headers)?;
-    state.engine.update_objectives(req.objectives).await;
-    let n = state.engine.trial_count().await;
-    Ok(Json(serde_json::json!({
-        "status": "ok",
-        "rescalarized_trials": n,
-    })))
+    match state.engine.update_objectives(req.objectives).await {
+        Ok(()) => {
+            let n = state.engine.trial_count().await;
+            Ok(Json(serde_json::json!({
+                "status": "ok",
+                "rescalarized_trials": n,
+            })))
+        }
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e }))),
+    }
 }
 
 async fn handle_get_objectives(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value> {

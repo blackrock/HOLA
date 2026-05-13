@@ -13,7 +13,7 @@
 Advanced Study tests covering error paths, scalarization, convergence,
 concurrency, and best-tracking.
 
-Tests double-tell errors, bad strategy fallback, maximize/minimize
+Tests double-tell errors, config validation, maximize/minimize
 scalarization, TLP feasibility, multi-objective priorities, Sobol
 properties, GMM refit, end-to-end convergence, concurrent ask/tell,
 and monotonic best-tracking.
@@ -39,12 +39,35 @@ def test_double_tell_raises(simple_space):
         study.tell(t.trial_id, {"loss": 0.3})
 
 
-def test_bad_strategy_string_defaults_gracefully(simple_space):
-    # Unknown strategy names do not raise; the engine falls back to a default.
-    study = Study(space=simple_space, objectives=[Minimize("loss")], strategy="nonexistent")
-    t = study.ask()
-    study.tell(t.trial_id, {"loss": 0.5})
-    assert study.trial_count() == 1
+def test_bad_strategy_string_raises(simple_space):
+    with pytest.raises(ValueError, match="Unknown strategy type.*nonexistent"):
+        Study(space=simple_space, objectives=[Minimize("loss")], strategy="nonexistent")
+
+
+def test_invalid_space_config_raises_with_parameter_name():
+    with pytest.raises(ValueError, match="scale must be"):
+        Real(0.0, 1.0, scale="log2")
+
+    with pytest.raises(ValueError, match="Parameter 'x'.*min must be less than max"):
+        Study(space=Space(x=Real(1.0, 0.0)), objectives=[Minimize("loss")])
+
+    with pytest.raises(ValueError, match="Parameter 'layers'.*integer min"):
+        Study(space=Space(layers=Integer(5, 1)), objectives=[Minimize("loss")])
+
+    with pytest.raises(ValueError, match="Parameter 'opt'.*choices must not be empty"):
+        Study(space=Space(opt=Categorical([])), objectives=[Minimize("loss")])
+
+    with pytest.raises(ValueError, match="Parameter 'x'.*bounds must be finite"):
+        Study(space=Space(x=Real(float("nan"), 1.0)), objectives=[Minimize("loss")])
+
+
+def test_invalid_objective_config_raises_with_field_name(simple_space):
+    with pytest.raises(ValueError, match="Objective 'loss'.*priority"):
+        Study(space=simple_space, objectives=[Minimize("loss", priority=-1.0)])
+
+    study = Study(space=simple_space, objectives=[Minimize("loss")])
+    with pytest.raises(ValueError, match="Objective 'loss'.*priority"):
+        study.update_objectives([Minimize("loss", priority=float("inf"))])
 
 
 def test_run_zero_trials(simple_space):
