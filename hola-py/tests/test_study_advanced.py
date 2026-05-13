@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from hola_opt import Categorical, Integer, Maximize, Minimize, Real, Space, Study
+from hola_opt import Categorical, Gmm, Integer, Maximize, Minimize, Real, Space, Study
 
 # ==========================================================================
 # Error Paths
@@ -278,6 +278,65 @@ def test_gmm_survives_50_trials():
     assert study.trial_count() == 50
     best = study.top_k(1)[0]
     assert best is not None
+
+
+def _assert_same_params(actual, expected):
+    assert actual.keys() == expected.keys()
+    for key in actual:
+        assert actual[key] == pytest.approx(expected[key])
+
+
+def test_gmm_counts_pending_asks_against_exploration_budget():
+    space = Space(x=Real(0.0, 1.0))
+    study = Study(
+        space=space,
+        objectives=[Minimize("loss")],
+        strategy=Gmm(exploration_budget=2),
+        seed=17,
+    )
+    sobol = Study(space=space, objectives=[Minimize("loss")], strategy="sobol", seed=17)
+    gmm = Study(
+        space=space,
+        objectives=[Minimize("loss")],
+        strategy=Gmm(exploration_budget=0),
+        seed=17,
+    )
+
+    trials = [study.ask() for _ in range(4)]
+
+    _assert_same_params(trials[0].params, sobol.ask().params)
+    _assert_same_params(trials[1].params, sobol.ask().params)
+    _assert_same_params(trials[2].params, gmm.ask().params)
+    _assert_same_params(trials[3].params, gmm.ask().params)
+    assert study.trial_count() == 0
+
+
+def test_gmm_save_load_preserves_pending_ask_accounting(tmp_path):
+    space = Space(x=Real(0.0, 1.0))
+    study = Study(
+        space=space,
+        objectives=[Minimize("loss")],
+        strategy=Gmm(exploration_budget=2),
+        seed=17,
+    )
+    for _ in range(3):
+        study.ask()
+
+    path = tmp_path / "auto-pending.json"
+    study.save(str(path))
+    restored = Study.load(str(path))
+
+    gmm = Study(
+        space=space,
+        objectives=[Minimize("loss")],
+        strategy=Gmm(exploration_budget=0),
+        seed=17,
+    )
+    gmm.ask()
+    expected = gmm.ask()
+    resumed = restored.ask()
+
+    _assert_same_params(resumed.params, expected.params)
 
 
 @pytest.mark.slow

@@ -1645,6 +1645,50 @@ async fn test_dyn_engine_checkpoint_load_with_fallback_supports_full_and_leaderb
 // Auto strategy (Sobol -> GMM switching)
 // ==========================================================================
 
+fn auto_strategy_test_config(exploration_budget: usize, seed: u64) -> StudyConfig {
+    StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }],
+        strategy: Some(StrategyConfig {
+            strategy_type: "auto".to_string(),
+            refit_interval: 5,
+            total_budget: None,
+            exploration_budget: Some(exploration_budget),
+            seed: Some(seed),
+            elite_fraction: None,
+        }),
+        checkpoint: None,
+        max_trials: None,
+    }
+}
+
+fn sobol_strategy_test_config(seed: u64) -> StudyConfig {
+    let mut config = auto_strategy_test_config(0, seed);
+    config.strategy = Some(StrategyConfig {
+        strategy_type: "sobol".to_string(),
+        refit_interval: 20,
+        total_budget: None,
+        exploration_budget: None,
+        seed: Some(seed),
+        elite_fraction: None,
+    });
+    config
+}
+
 #[tokio::test]
 async fn test_auto_strategy_default() {
     // With no strategy config, should use "auto" and work correctly
@@ -1753,6 +1797,50 @@ fn test_auto_strategy_default_exploration_budget() {
     // Edge cases
     assert_eq!(AutoStrategy::default_exploration_budget(10, 1), 2); // min(2, 52) = 2
     assert_eq!(AutoStrategy::default_exploration_budget(5, 1), 1); // min(1, 52) = 1
+}
+
+#[tokio::test]
+async fn test_auto_strategy_counts_pending_asks_against_exploration_budget() {
+    let auto = HolaEngine::from_config(auto_strategy_test_config(2, 17)).unwrap();
+    let sobol = HolaEngine::from_config(sobol_strategy_test_config(17)).unwrap();
+    let gmm = HolaEngine::from_config(auto_strategy_test_config(0, 17)).unwrap();
+
+    let auto_trials = vec![
+        auto.ask().await.unwrap(),
+        auto.ask().await.unwrap(),
+        auto.ask().await.unwrap(),
+        auto.ask().await.unwrap(),
+    ];
+
+    assert_eq!(auto_trials[0].params, sobol.ask().await.unwrap().params);
+    assert_eq!(auto_trials[1].params, sobol.ask().await.unwrap().params);
+    assert_eq!(auto_trials[2].params, gmm.ask().await.unwrap().params);
+    assert_eq!(auto_trials[3].params, gmm.ask().await.unwrap().params);
+    assert_eq!(auto.trial_count().await, 0);
+}
+
+#[tokio::test]
+async fn test_auto_strategy_full_checkpoint_preserves_pending_ask_accounting() {
+    let engine = HolaEngine::from_config(auto_strategy_test_config(2, 17)).unwrap();
+    for _ in 0..3 {
+        engine.ask().await.unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auto-full.json");
+    engine
+        .save_full_checkpoint(&path, Some("auto pending asks"))
+        .await
+        .unwrap();
+
+    let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+
+    let gmm = HolaEngine::from_config(auto_strategy_test_config(0, 17)).unwrap();
+    gmm.ask().await.unwrap();
+    let expected = gmm.ask().await.unwrap();
+    let resumed = restored.ask().await.unwrap();
+
+    assert_eq!(resumed.params, expected.params);
 }
 
 // ==========================================================================

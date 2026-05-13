@@ -31,6 +31,7 @@ use opt_engine::traits::{RefitConfig, SampleSpace, StandardizedSpace, Strategy};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 
 // =============================================================================
@@ -391,12 +392,13 @@ enum DynStrategyInner {
 /// The default exploration budget follows the formula from the paper:
 /// `min(floor(S / 5), 50 + 2n)`, where `S` is the intended number of
 /// simulations and `n` is the dimensionality.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct AutoStrategy {
     sobol: SobolStrategy<DynSpace>,
     gmm: GmmStrategy<DynSpace>,
     exploration_budget: usize,
     trial_count: usize,
+    issued_count: AtomicUsize,
 }
 
 impl AutoStrategy {
@@ -429,7 +431,64 @@ impl AutoStrategy {
             gmm: GmmStrategy::uniform_prior(gmm_seed, dim, 0.1),
             exploration_budget,
             trial_count: 0,
+            issued_count: AtomicUsize::new(0),
         }
+    }
+}
+
+impl Clone for AutoStrategy {
+    fn clone(&self) -> Self {
+        Self {
+            sobol: self.sobol.clone(),
+            gmm: self.gmm.clone(),
+            exploration_budget: self.exploration_budget,
+            trial_count: self.trial_count,
+            issued_count: AtomicUsize::new(self.issued_count.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl Serialize for AutoStrategy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("AutoStrategy", 5)?;
+        state.serialize_field("sobol", &self.sobol)?;
+        state.serialize_field("gmm", &self.gmm)?;
+        state.serialize_field("exploration_budget", &self.exploration_budget)?;
+        state.serialize_field("trial_count", &self.trial_count)?;
+        state.serialize_field("issued_count", &self.issued_count.load(Ordering::Relaxed))?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for AutoStrategy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct AutoStrategySerde {
+            sobol: SobolStrategy<DynSpace>,
+            gmm: GmmStrategy<DynSpace>,
+            exploration_budget: usize,
+            trial_count: usize,
+            #[serde(default)]
+            issued_count: Option<usize>,
+        }
+
+        let state = AutoStrategySerde::deserialize(deserializer)?;
+        let issued_count = state.issued_count.unwrap_or(state.trial_count);
+        Ok(Self {
+            sobol: state.sobol,
+            gmm: state.gmm,
+            exploration_budget: state.exploration_budget,
+            trial_count: state.trial_count,
+            issued_count: AtomicUsize::new(issued_count.max(state.trial_count)),
+        })
     }
 }
 
@@ -448,7 +507,8 @@ impl Strategy for DynStrategy {
             DynStrategyInner::Sobol(s) => s.suggest(space),
             DynStrategyInner::Gmm(s) => s.suggest(space),
             DynStrategyInner::Auto(s) => {
-                if s.trial_count < s.exploration_budget {
+                let issued = s.issued_count.fetch_add(1, Ordering::Relaxed);
+                if issued < s.exploration_budget {
                     s.sobol.suggest(space)
                 } else {
                     s.gmm.suggest(space)
@@ -464,6 +524,7 @@ impl Strategy for DynStrategy {
             DynStrategyInner::Gmm(s) => s.update(candidate, observation),
             DynStrategyInner::Auto(s) => {
                 s.trial_count += 1;
+                s.issued_count.fetch_max(s.trial_count, Ordering::Relaxed);
                 s.sobol.update(candidate, observation);
                 s.gmm.update(candidate, observation);
             }
