@@ -115,6 +115,10 @@ The lifecycle follows three phases.
 3. **Exploit.** New samples are drawn from the updated GMM,
    focusing on promising regions.
 
+The exploration budget counts issued suggestions from `ask`,
+including suggestions that are still pending. GMM refits are based
+on completed trials in the leaderboard.
+
 This strategy works well for larger budgets (50+ trials) where you
 want to transition from exploration to exploitation. The more
 trials you run, the more the GMM focuses on the best regions.
@@ -247,6 +251,12 @@ Checkpoints enable the following.
 - Resuming an optimization after a crash or restart
 - Offline analysis in the dashboard
 - Carrying over a leaderboard to a new engine (warm-start)
+
+Loading a checkpoint replaces the in-memory pending and cancelled
+sets. Pending or cancelled in-flight trials from the pre-load engine
+state do not survive the load; the restored engine resumes from
+completed trials and issues fresh trial IDs after the restored
+leaderboard.
 
 We write checkpoint files atomically (first to a temp file, then
 rename) to prevent corruption.
