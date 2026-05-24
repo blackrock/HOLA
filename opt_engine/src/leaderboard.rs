@@ -24,6 +24,7 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 // =============================================================================
@@ -140,6 +141,18 @@ impl<D, Obs> Leaderboard<D, Obs> {
         trial_id
     }
 
+    /// Append a trial using an externally assigned trial ID.
+    ///
+    /// This is useful when trial IDs are issued before completion. The internal
+    /// auto-assignment counter is advanced so future generated IDs do not reuse
+    /// the provided ID.
+    pub fn push_with_trial_id(&mut self, candidate: D, observation: Obs, trial_id: u64) -> u64 {
+        self.next_id = self.next_id.max(trial_id.saturating_add(1));
+        self.trials
+            .push(Trial::new(candidate, observation, trial_id));
+        trial_id
+    }
+
     /// Append a trial with raw metrics preserved for lazy re-scalarization.
     pub fn push_with_raw(
         &mut self,
@@ -156,6 +169,55 @@ impl<D, Obs> Leaderboard<D, Obs> {
             trial_id,
         ));
         trial_id
+    }
+
+    /// Append a trial with an externally assigned trial ID and raw metrics
+    /// preserved for lazy re-scalarization.
+    pub fn push_with_raw_trial_id(
+        &mut self,
+        candidate: D,
+        observation: Obs,
+        raw_metrics: serde_json::Value,
+        trial_id: u64,
+    ) -> u64 {
+        self.next_id = self.next_id.max(trial_id.saturating_add(1));
+        self.trials.push(Trial::with_raw_metrics(
+            candidate,
+            observation,
+            raw_metrics,
+            trial_id,
+        ));
+        trial_id
+    }
+
+    /// Append an existing trial record, preserving its ID and timestamp.
+    ///
+    /// This supports rebuilding a leaderboard with a different observation type
+    /// while preserving public trial identity and completion metadata.
+    pub fn push_existing_trial(&mut self, trial: Trial<D, Obs>) -> u64 {
+        let trial_id = trial.trial_id;
+        self.next_id = self.next_id.max(trial_id.saturating_add(1));
+        self.trials.push(trial);
+        trial_id
+    }
+
+    /// Return the next ID that can be assigned without reusing a stored trial ID.
+    pub fn next_trial_id(&self) -> u64 {
+        let next_from_trials = self
+            .trials
+            .iter()
+            .map(|trial| trial.trial_id.saturating_add(1))
+            .max()
+            .unwrap_or(0);
+        self.next_id.max(next_from_trials)
+    }
+
+    /// Repair the internal next-ID counter after deserializing or manually
+    /// modifying a leaderboard.
+    pub fn normalize_next_trial_id(&mut self) -> u64 {
+        let next_id = self.next_trial_id();
+        self.next_id = next_id;
+        next_id
     }
 
     pub fn len(&self) -> usize {
@@ -243,6 +305,20 @@ impl<D: Clone> Leaderboard<D, f64> {
         is_feasible_scalar(trial.observation)
     }
 
+    fn compare_best(a: &Trial<D, f64>, b: &Trial<D, f64>) -> Ordering {
+        a.observation
+            .partial_cmp(&b.observation)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.trial_id.cmp(&b.trial_id))
+    }
+
+    fn compare_worst(a: &Trial<D, f64>, b: &Trial<D, f64>) -> Ordering {
+        b.observation
+            .partial_cmp(&a.observation)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.trial_id.cmp(&b.trial_id))
+    }
+
     /// Return only feasible trials (those with finite observations).
     pub fn feasible_trials(&self) -> Vec<Trial<D, f64>> {
         self.trials
@@ -276,14 +352,14 @@ impl<D: Clone> Leaderboard<D, f64> {
             .filter(|t| Self::trial_is_feasible(t))
             .collect();
 
-        feasible.sort_by(|a, b| {
-            a.observation
-                .partial_cmp(&b.observation)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.trial_id.cmp(&b.trial_id))
-        });
+        let limit = k.min(feasible.len());
+        if limit < feasible.len() {
+            feasible.select_nth_unstable_by(limit, |a, b| Self::compare_best(a, b));
+            feasible.truncate(limit);
+        }
+        feasible.sort_by(|a, b| Self::compare_best(a, b));
 
-        feasible.into_iter().take(k).cloned().collect()
+        feasible.into_iter().cloned().collect()
     }
 
     /// Return the k trials with the lowest observations, including infeasible.
@@ -292,21 +368,15 @@ impl<D: Clone> Leaderboard<D, f64> {
             return Vec::new();
         }
 
-        let mut indices: Vec<usize> = (0..self.trials.len()).collect();
-        indices.sort_by(|&a, &b| {
-            let obs_a = self.trials[a].observation;
-            let obs_b = self.trials[b].observation;
-            obs_a
-                .partial_cmp(&obs_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| self.trials[a].trial_id.cmp(&self.trials[b].trial_id))
-        });
+        let mut trials: Vec<&Trial<D, f64>> = self.trials.iter().collect();
+        let limit = k.min(trials.len());
+        if limit < trials.len() {
+            trials.select_nth_unstable_by(limit, |a, b| Self::compare_best(a, b));
+            trials.truncate(limit);
+        }
+        trials.sort_by(|a, b| Self::compare_best(a, b));
 
-        indices
-            .into_iter()
-            .take(k)
-            .map(|i| self.trials[i].clone())
-            .collect()
+        trials.into_iter().cloned().collect()
     }
 
     /// Return feasible trials sorted by observation (ascending).
@@ -345,14 +415,14 @@ impl<D: Clone> Leaderboard<D, f64> {
             .filter(|t| Self::trial_is_feasible(t))
             .collect();
 
-        feasible.sort_by(|a, b| {
-            b.observation
-                .partial_cmp(&a.observation)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.trial_id.cmp(&b.trial_id))
-        });
+        let limit = k.min(feasible.len());
+        if limit < feasible.len() {
+            feasible.select_nth_unstable_by(limit, |a, b| Self::compare_worst(a, b));
+            feasible.truncate(limit);
+        }
+        feasible.sort_by(|a, b| Self::compare_worst(a, b));
 
-        feasible.into_iter().take(k).cloned().collect()
+        feasible.into_iter().cloned().collect()
     }
 
     /// Return the k worst trials, including infeasible.
@@ -361,21 +431,15 @@ impl<D: Clone> Leaderboard<D, f64> {
             return Vec::new();
         }
 
-        let mut indices: Vec<usize> = (0..self.trials.len()).collect();
-        indices.sort_by(|&a, &b| {
-            let obs_a = self.trials[a].observation;
-            let obs_b = self.trials[b].observation;
-            obs_b
-                .partial_cmp(&obs_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| self.trials[a].trial_id.cmp(&self.trials[b].trial_id))
-        });
+        let mut trials: Vec<&Trial<D, f64>> = self.trials.iter().collect();
+        let limit = k.min(trials.len());
+        if limit < trials.len() {
+            trials.select_nth_unstable_by(limit, |a, b| Self::compare_worst(a, b));
+            trials.truncate(limit);
+        }
+        trials.sort_by(|a, b| Self::compare_worst(a, b));
 
-        indices
-            .into_iter()
-            .take(k)
-            .map(|i| self.trials[i].clone())
-            .collect()
+        trials.into_iter().cloned().collect()
     }
 
     /// Compute the quantile threshold for feasible observations.
@@ -418,6 +482,8 @@ impl<D: Clone> Leaderboard<D, f64> {
 // =============================================================================
 // Multi-Objective Ranking (BTreeMap<String, f64> observations)
 // =============================================================================
+
+type ScoredMultiTrial<'a, D> = (&'a Trial<D, BTreeMap<String, f64>>, f64);
 
 impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
     /// Check if a trial is feasible (all objective values are finite).
@@ -577,27 +643,37 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
     where
         F: Fn(&BTreeMap<String, f64>) -> f64,
     {
-        let feasible = self.feasible_trials();
-        if feasible.is_empty() || k == 0 {
+        if self.trials.is_empty() || k == 0 {
             return Vec::new();
         }
 
-        let mut indexed: Vec<(usize, f64)> = feasible
+        let mut scored: Vec<ScoredMultiTrial<'_, D>> = self
+            .trials
             .iter()
-            .enumerate()
-            .map(|(i, t)| (i, scalarizer(&t.observation)))
+            .filter(|t| Self::trial_is_feasible(t))
+            .map(|t| (t, scalarizer(&t.observation)))
             .collect();
 
-        indexed.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| feasible[a.0].trial_id.cmp(&feasible[b.0].trial_id))
-        });
+        if scored.is_empty() {
+            return Vec::new();
+        }
 
-        indexed
+        let compare = |a: &ScoredMultiTrial<'_, D>, b: &ScoredMultiTrial<'_, D>| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.trial_id.cmp(&b.0.trial_id))
+        };
+
+        let limit = k.min(scored.len());
+        if limit < scored.len() {
+            scored.select_nth_unstable_by(limit, compare);
+            scored.truncate(limit);
+        }
+        scored.sort_by(compare);
+
+        scored
             .into_iter()
-            .take(k)
-            .map(|(i, _)| feasible[i].clone())
+            .map(|(trial, _)| (*trial).clone())
             .collect()
     }
 
@@ -1035,6 +1111,44 @@ mod tests {
         assert_eq!(id1, 0);
         assert_eq!(id2, 1);
         assert_eq!(id3, 2);
+    }
+
+    #[test]
+    fn test_externally_assigned_trial_ids_advance_next_id() {
+        let mut lb: Leaderboard<f64, f64> = Leaderboard::new();
+
+        assert_eq!(lb.push_with_trial_id(0.1, 0.1, 7), 7);
+        assert_eq!(lb.push(0.2, 0.2), 8);
+        assert_eq!(lb.next_trial_id(), 9);
+    }
+
+    #[test]
+    fn test_normalize_next_trial_id_repairs_stale_counter() {
+        let mut lb: Leaderboard<f64, f64> = Leaderboard::new();
+        lb.push(0.1, 0.1);
+        lb.push(0.2, 0.2);
+        lb.next_id = 0;
+
+        assert_eq!(lb.next_trial_id(), 2);
+        assert_eq!(lb.normalize_next_trial_id(), 2);
+        assert_eq!(lb.push(0.3, 0.3), 2);
+    }
+
+    #[test]
+    fn test_push_existing_trial_preserves_timestamp_and_advances_next_id() {
+        let mut lb: Leaderboard<f64, f64> = Leaderboard::new();
+        let trial = Trial {
+            candidate: 0.1,
+            observation: 0.2,
+            raw_metrics: Some(serde_json::json!({"loss": 0.2})),
+            trial_id: 4,
+            timestamp: 123,
+        };
+
+        assert_eq!(lb.push_existing_trial(trial), 4);
+        let stored = lb.get(4).unwrap();
+        assert_eq!(stored.timestamp, 123);
+        assert_eq!(lb.push(0.3, 0.3), 5);
     }
 
     #[test]

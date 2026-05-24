@@ -22,19 +22,23 @@
 //! - `POST /api/cancel` - Cancel a pending trial
 //! - `GET /api/top_k` - Get top-k trials by rank
 //! - `GET /api/pareto_front` - Get Pareto front trials
+//! - `GET /api/trial/{trial_id}` - Get one completed trial with scoring/ranking
 //! - `GET /api/trials` - Get all trials with scoring/ranking
 //! - `GET /api/trial_count` - Get number of completed trials
 //! - `PATCH /api/objectives` - Update objectives mid-run
 //! - `GET /api/objectives` - Get current objectives
 //! - `GET /api/space` - Get parameter space metadata
-//! - `POST /api/checkpoint/save` - Save a checkpoint (internal)
+//! - `POST /api/checkpoint/save` - Save a full checkpoint
 //! - `GET /api/events` - SSE stream of engine events
 
-use crate::hola_engine::{HolaEngine, ObjectiveConfig};
+use crate::hola_engine::{CompletedTrial, HolaEngine, ObjectiveConfig};
 use axum::{
     Router,
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{Path as AxumPath, Query, State},
+    http::{
+        HeaderMap, HeaderValue, Method, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
     response::{
         Json,
         sse::{Event, Sse},
@@ -43,12 +47,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::ServeDir;
 
 // =============================================================================
@@ -59,13 +63,44 @@ use tower_http::services::ServeDir;
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum EngineEvent {
-    TrialCompleted { trial_id: u64, score: f64 },
-    RefitOccurred { n_trials: usize },
+    TrialCompleted {
+        trial_id: u64,
+        score: f64,
+        trial: CompletedTrial,
+    },
+    RefitOccurred {
+        n_trials: usize,
+    },
 }
 
 pub struct ServerState {
     pub engine: HolaEngine,
     pub events_tx: broadcast::Sender<EngineEvent>,
+    auth_token: Option<String>,
+    checkpoint_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServerOptions {
+    pub host: String,
+    pub port: u16,
+    pub dashboard_dir: Option<PathBuf>,
+    pub auth_token: Option<String>,
+    pub checkpoint_dir: PathBuf,
+    pub cors_allowed_origins: Vec<String>,
+}
+
+impl ServerOptions {
+    pub fn new(port: u16) -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port,
+            dashboard_dir: None,
+            auth_token: None,
+            checkpoint_dir: PathBuf::from("."),
+            cors_allowed_origins: Vec::new(),
+        }
+    }
 }
 
 // =============================================================================
@@ -107,6 +142,12 @@ struct TrialsQuery {
 }
 
 #[derive(Deserialize)]
+struct TrialQuery {
+    #[serde(default)]
+    include_infeasible: Option<bool>,
+}
+
+#[derive(Deserialize)]
 struct SaveCheckpointRequest {
     #[serde(default = "default_checkpoint_path")]
     path: String,
@@ -132,9 +173,71 @@ struct UpdateObjectivesRequest {
 // Handlers
 // =============================================================================
 
+fn unauthorized() -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorResponse {
+            error: "Missing or invalid bearer token".to_string(),
+        }),
+    )
+}
+
+fn authorize_mutation(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(token) = &state.auth_token else {
+        return Ok(());
+    };
+
+    let expected = format!("Bearer {token}");
+    match headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(actual) if actual == expected => Ok(()),
+        _ => Err(unauthorized()),
+    }
+}
+
+fn invalid_checkpoint_path(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: message.into(),
+        }),
+    )
+}
+
+fn resolve_checkpoint_path(
+    state: &ServerState,
+    requested: &str,
+) -> Result<PathBuf, (StatusCode, Json<ErrorResponse>)> {
+    let path = Path::new(requested);
+    if path.as_os_str().is_empty() {
+        return Err(invalid_checkpoint_path("Checkpoint path must not be empty"));
+    }
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(invalid_checkpoint_path(
+            "Checkpoint path must be relative to the configured checkpoint directory",
+        ));
+    }
+
+    Ok(state.checkpoint_dir.join(path))
+}
+
 async fn handle_ask(
     State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_mutation(&state, &headers)?;
     match state.engine.ask().await {
         Ok(trial) => Ok(Json(serde_json::to_value(&trial).unwrap())),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e }))),
@@ -143,8 +246,10 @@ async fn handle_ask(
 
 async fn handle_tell(
     State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
     Json(req): Json<TellRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_mutation(&state, &headers)?;
     match state.engine.tell(req.trial_id, req.metrics).await {
         Ok(completed) => {
             let n = state.engine.trial_count().await;
@@ -160,11 +265,13 @@ async fn handle_tell(
             let _ = state.events_tx.send(EngineEvent::TrialCompleted {
                 trial_id: req.trial_id,
                 score,
+                trial: completed.clone(),
             });
 
             Ok(Json(serde_json::json!({
                 "status": "ok",
                 "trial_count": n,
+                "trial": completed,
             })))
         }
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e }))),
@@ -173,8 +280,10 @@ async fn handle_tell(
 
 async fn handle_cancel(
     State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
     Json(req): Json<CancelRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_mutation(&state, &headers)?;
     match state.engine.cancel(req.trial_id).await {
         Ok(()) => Ok(Json(serde_json::json!({ "status": "ok" }))),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e }))),
@@ -210,6 +319,27 @@ async fn handle_trials(
     Json(serde_json::to_value(&trials).unwrap_or_default())
 }
 
+async fn handle_trial(
+    State(state): State<Arc<ServerState>>,
+    AxumPath(trial_id): AxumPath<u64>,
+    Query(q): Query<TrialQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let include_infeasible = q.include_infeasible.unwrap_or(true);
+    match state
+        .engine
+        .completed_trial(trial_id, include_infeasible)
+        .await
+    {
+        Some(trial) => Ok(Json(serde_json::to_value(&trial).unwrap_or_default())),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Trial {trial_id} not found"),
+            }),
+        )),
+    }
+}
+
 async fn handle_trial_count(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value> {
     let count = state.engine.trial_count().await;
     Json(serde_json::json!({ "trial_count": count }))
@@ -217,14 +347,20 @@ async fn handle_trial_count(State(state): State<Arc<ServerState>>) -> Json<serde
 
 async fn handle_update_objectives(
     State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
     Json(req): Json<UpdateObjectivesRequest>,
-) -> Json<serde_json::Value> {
-    state.engine.update_objectives(req.objectives).await;
-    let n = state.engine.trial_count().await;
-    Json(serde_json::json!({
-        "status": "ok",
-        "rescalarized_trials": n,
-    }))
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_mutation(&state, &headers)?;
+    match state.engine.update_objectives(req.objectives).await {
+        Ok(()) => {
+            let n = state.engine.trial_count().await;
+            Ok(Json(serde_json::json!({
+                "status": "ok",
+                "rescalarized_trials": n,
+            })))
+        }
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e }))),
+    }
 }
 
 async fn handle_get_objectives(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value> {
@@ -256,18 +392,33 @@ async fn handle_space(State(state): State<Arc<ServerState>>) -> Json<serde_json:
 
 async fn handle_checkpoint_save(
     State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
     Json(req): Json<SaveCheckpointRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_mutation(&state, &headers)?;
+    let path = resolve_checkpoint_path(&state, &req.path)?;
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        ));
+    }
+
     match state
         .engine
-        .save_leaderboard_checkpoint_to(&req.path, req.description.as_deref())
+        .save_full_checkpoint(&path, req.description.as_deref())
         .await
     {
         Ok(()) => {
             let n = state.engine.trial_count().await;
             Ok(Json(serde_json::json!({
                 "status": "ok",
-                "path": req.path,
+                "checkpoint_type": "full",
+                "path": path.to_string_lossy(),
                 "trials_saved": n,
             })))
         }
@@ -298,12 +449,42 @@ async fn handle_events(
 // Router & Server
 // =============================================================================
 
+fn build_cors(origins: &[String]) -> CorsLayer {
+    let mut cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::PATCH])
+        .allow_headers([CONTENT_TYPE, AUTHORIZATION]);
+
+    if !origins.is_empty() {
+        let parsed: Vec<HeaderValue> = origins
+            .iter()
+            .map(|origin| {
+                origin
+                    .parse()
+                    .expect("CORS origins must be valid HTTP header values")
+            })
+            .collect();
+        cors = cors.allow_origin(AllowOrigin::list(parsed));
+    }
+
+    cors
+}
+
 /// Create the Axum router for the engine server.
 pub fn create_router(engine: HolaEngine) -> Router {
-    let (events_tx, _) = broadcast::channel(256);
-    let state = Arc::new(ServerState { engine, events_tx });
+    create_router_with_options(engine, ServerOptions::new(8000))
+}
 
-    let cors = CorsLayer::permissive();
+/// Create the Axum router for the engine server with explicit server options.
+pub fn create_router_with_options(engine: HolaEngine, options: ServerOptions) -> Router {
+    let (events_tx, _) = broadcast::channel(256);
+    let state = Arc::new(ServerState {
+        engine,
+        events_tx,
+        auth_token: options.auth_token,
+        checkpoint_dir: options.checkpoint_dir,
+    });
+
+    let cors = build_cors(&options.cors_allowed_origins);
 
     Router::new()
         .route("/api/ask", post(handle_ask))
@@ -311,6 +492,7 @@ pub fn create_router(engine: HolaEngine) -> Router {
         .route("/api/cancel", post(handle_cancel))
         .route("/api/top_k", get(handle_top_k))
         .route("/api/pareto_front", get(handle_pareto_front))
+        .route("/api/trial/{trial_id}", get(handle_trial))
         .route("/api/trials", get(handle_trials))
         .route("/api/trial_count", get(handle_trial_count))
         .route(
@@ -329,7 +511,22 @@ pub fn create_router(engine: HolaEngine) -> Router {
 /// API routes under `/api/*` take priority; all other paths fall through to
 /// serve static files from `dashboard_dir`.
 pub fn create_router_with_dashboard(engine: HolaEngine, dashboard_dir: &Path) -> Router {
-    create_router(engine).fallback_service(ServeDir::new(dashboard_dir))
+    let mut options = ServerOptions::new(8000);
+    options.dashboard_dir = Some(dashboard_dir.to_path_buf());
+    create_router_with_dashboard_and_options(engine, options)
+}
+
+/// Create the Axum router with the dashboard and explicit server options.
+pub fn create_router_with_dashboard_and_options(
+    engine: HolaEngine,
+    options: ServerOptions,
+) -> Router {
+    let dashboard_dir = options.dashboard_dir.clone();
+    let router = create_router_with_options(engine, options);
+    match dashboard_dir {
+        Some(dir) => router.fallback_service(ServeDir::new(dir)),
+        None => router,
+    }
 }
 
 /// Start the server on the given port. Blocks until the server is shut down.
@@ -340,18 +537,31 @@ pub async fn serve(
     port: u16,
     dashboard_dir: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let router = match dashboard_dir {
-        Some(dir) => create_router_with_dashboard(engine, dir),
-        None => create_router(engine),
+    let mut options = ServerOptions::new(port);
+    options.dashboard_dir = dashboard_dir.map(Path::to_path_buf);
+    serve_with_options(engine, options).await
+}
+
+/// Start the server with explicit host, auth, CORS, and checkpoint options.
+pub async fn serve_with_options(
+    engine: HolaEngine,
+    options: ServerOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let router = match options.dashboard_dir.as_deref() {
+        Some(_) => create_router_with_dashboard_and_options(engine, options.clone()),
+        None => create_router_with_options(engine, options.clone()),
     };
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-    if let Some(dir) = dashboard_dir {
+    let listener =
+        tokio::net::TcpListener::bind(format!("{}:{}", options.host, options.port)).await?;
+    if let Some(dir) = &options.dashboard_dir {
         eprintln!(
-            "HOLA server listening on port {port} (dashboard: {})",
+            "HOLA server listening on {}:{} (dashboard: {})",
+            options.host,
+            options.port,
             dir.display()
         );
     } else {
-        eprintln!("HOLA server listening on port {port}");
+        eprintln!("HOLA server listening on {}:{}", options.host, options.port);
     }
     axum::serve(listener, router).await?;
     Ok(())

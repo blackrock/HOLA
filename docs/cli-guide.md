@@ -172,7 +172,7 @@ strategy:
   type: gmm               # "gmm" (default), "sobol", or "random"
   refit_interval: 20       # how often GMM refits (used by "gmm")
   seed: 42                 # optional seed for reproducible runs
-  exploration_budget: 50   # number of Sobol trials before switching to GMM
+  exploration_budget: 50   # number of Sobol asks before switching to GMM
   elite_fraction: 0.25     # fraction of top trials used for GMM fitting (default: 0.25)
 ```
 
@@ -181,7 +181,7 @@ strategy:
 | `type` | `"gmm"` | Strategy type: `"gmm"`, `"sobol"`, or `"random"` |
 | `refit_interval` | `20` | How often the GMM refits (only used by `"gmm"`) |
 | `seed` | none | Seed for reproducible runs. When omitted, Sobol uses 42, others use random seeds. |
-| `exploration_budget` | none | Number of Sobol exploration trials before switching to GMM exploitation. When omitted, we use a formula based on `total_budget`. |
+| `exploration_budget` | none | Number of issued Sobol exploration suggestions before switching to GMM exploitation. Pending asks count against this budget. When omitted, we use a formula based on `total_budget`. |
 | `elite_fraction` | `0.25` | Fraction of top trials used for GMM refitting. Must be in (0.0, 1.0]. |
 
 ### Checkpoint Configuration
@@ -203,11 +203,16 @@ hola serve config.yaml --port 8000
 | Flag | Default | Description |
 |------|---------|-------------|
 | `config` | required | Path to the YAML configuration file |
+| `--host` | `127.0.0.1` | Host/interface to bind. Use `0.0.0.0` explicitly for network access |
 | `--port` | `8000` | Port to listen on |
 | `--dashboard` | none | Path to a dashboard directory to serve at `/` (e.g. `--dashboard ./dashboard`) |
+| `--auth-token` | none | Bearer token required for write-capable API endpoints |
+| `--checkpoint-dir` | checkpoint config directory or config file directory | Directory where dashboard/API checkpoint saves are allowed |
+| `--cors-origin` | none | Allowed browser CORS origin. Repeat for multiple origins |
 
-The server starts listening on `0.0.0.0:<port>` and exposes
-the [REST API](rest-api.md).
+The server starts listening on `127.0.0.1:<port>` by default and exposes
+the [REST API](rest-api.md). Binding a non-local host requires `--auth-token`
+or the `HOLA_API_TOKEN` environment variable.
 
 ## Running Workers
 
@@ -220,6 +225,7 @@ hola worker --server http://localhost:8000 --exec "python train.py"
 | `--server` | required | URL of the HOLA server |
 | `--exec` | required | Shell command to execute for each trial |
 | `--mode` | `callback` | Worker mode: `"callback"` or `"exec"` |
+| `--token` | none | Bearer token for servers started with `--auth-token` |
 
 ### Callback mode (default)
 
@@ -385,13 +391,13 @@ others.
 **Machine A (server):**
 
 ```bash
-hola serve config.yaml --port 8000
+hola serve config.yaml --host 0.0.0.0 --port 8000 --auth-token "$HOLA_API_TOKEN"
 ```
 
 **Machines B, C, D (workers):**
 
 ```bash
-hola worker --server http://machine-a:8000 --exec "python train.py"
+hola worker --server http://machine-a:8000 --token "$HOLA_API_TOKEN" --exec "python train.py"
 ```
 
 Each worker independently polls the server for trials. The
@@ -447,7 +453,9 @@ checkpoint:
 ```
 
 This saves a checkpoint every 50 completed trials, keeping
-the 5 most recent.
+the 5 most recent. Automatic checkpoints are leaderboard
+checkpoints: they preserve completed trials and can be used to
+warm-start a restarted server.
 
 ### Manual checkpointing
 
@@ -460,6 +468,8 @@ curl -X POST http://localhost:8000/api/checkpoint/save \
 ```
 
 Or from the dashboard's Checkpoints panel.
+Manual REST and dashboard saves write full checkpoints with
+completed trials, strategy state, and study configuration.
 
 ### Resuming from a checkpoint
 
@@ -473,8 +483,13 @@ checkpoint:
   load_from: ./checkpoints/checkpoint_000100.json
 ```
 
-On startup, the server loads the leaderboard (trial history)
-from the specified checkpoint file. We then refit the strategy
-from the loaded data, so optimization resumes with full
-knowledge of previous trials. This is useful for continuing a
-study after a server restart or crash.
+On startup, the server loads the specified checkpoint file. Full
+checkpoints restore both the leaderboard and search strategy state.
+Legacy leaderboard-only checkpoints are still accepted as a
+warm-start path; they restore completed trials but do not restore
+strategy state.
+
+Checkpoint loads intentionally clear any pending or cancelled
+in-flight trials from the engine state. Restored studies resume from
+the completed trial history, and the next `ask` receives a fresh ID
+after the restored completed trials.

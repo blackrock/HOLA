@@ -14,7 +14,9 @@
 //! Exercises config parsing, ask/tell flows, strategy types, scalarization,
 //! objectives, checkpoints, refit, and all parameter types.
 
-use hola::hola_engine::{HolaEngine, ObjectiveConfig, ParamConfig, StrategyConfig, StudyConfig};
+use hola::hola_engine::{
+    CheckpointLoadKind, HolaEngine, ObjectiveConfig, ParamConfig, StrategyConfig, StudyConfig,
+};
 use opt_engine::traits::SampleSpace;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -86,6 +88,155 @@ async fn test_dyn_engine_config_with_checkpoint() {
 
     let engine = HolaEngine::from_config(config).unwrap();
     let _t = engine.ask().await.unwrap();
+}
+
+fn valid_config_for_validation() -> StudyConfig {
+    StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }],
+        strategy: Some(StrategyConfig {
+            strategy_type: "gmm".to_string(),
+            refit_interval: 20,
+            total_budget: None,
+            exploration_budget: None,
+            seed: None,
+            elite_fraction: None,
+        }),
+        checkpoint: None,
+        max_trials: None,
+    }
+}
+
+fn assert_config_error(config: StudyConfig, expected: &[&str]) {
+    let err = match HolaEngine::from_config(config) {
+        Ok(_) => panic!("expected config validation to fail"),
+        Err(err) => err,
+    };
+    for needle in expected {
+        assert!(
+            err.contains(needle),
+            "expected error {err:?} to contain {needle:?}"
+        );
+    }
+}
+
+#[test]
+fn test_dyn_engine_config_validation_rejects_invalid_scale() {
+    let mut config = valid_config_for_validation();
+    config.space.insert(
+        "lr".to_string(),
+        ParamConfig::Real {
+            min: 1.0e-4,
+            max: 1.0e-1,
+            scale: "log2".to_string(),
+        },
+    );
+    assert_config_error(config, &["Parameter 'lr'", "unknown real scale", "log2"]);
+}
+
+#[test]
+fn test_dyn_engine_config_validation_rejects_invalid_strategy() {
+    let mut config = valid_config_for_validation();
+    config.strategy.as_mut().unwrap().strategy_type = "soboll".to_string();
+    assert_config_error(config, &["Unknown strategy type", "soboll"]);
+}
+
+#[test]
+fn test_dyn_engine_config_validation_rejects_invalid_objective_type() {
+    let mut config = valid_config_for_validation();
+    config.objectives[0].obj_type = "minimise".to_string();
+    assert_config_error(
+        config,
+        &["Objective 'loss'", "unknown objective type", "minimise"],
+    );
+}
+
+#[test]
+fn test_dyn_engine_config_validation_rejects_invalid_space_shapes() {
+    let mut real = valid_config_for_validation();
+    real.space.insert(
+        "x".to_string(),
+        ParamConfig::Real {
+            min: 1.0,
+            max: 1.0,
+            scale: "linear".to_string(),
+        },
+    );
+    assert_config_error(real, &["Parameter 'x'", "min must be less than max"]);
+
+    let mut integer = valid_config_for_validation();
+    integer.space.insert(
+        "layers".to_string(),
+        ParamConfig::Integer { min: 10, max: 1 },
+    );
+    assert_config_error(
+        integer,
+        &["Parameter 'layers'", "integer min must be <= max"],
+    );
+
+    let mut categorical = valid_config_for_validation();
+    categorical.space.insert(
+        "optimizer".to_string(),
+        ParamConfig::Categorical { choices: vec![] },
+    );
+    assert_config_error(
+        categorical,
+        &["Parameter 'optimizer'", "choices must not be empty"],
+    );
+}
+
+#[test]
+fn test_dyn_engine_config_validation_rejects_non_finite_real_bounds() {
+    let mut nan = valid_config_for_validation();
+    nan.space.insert(
+        "x".to_string(),
+        ParamConfig::Real {
+            min: f64::NAN,
+            max: 1.0,
+            scale: "linear".to_string(),
+        },
+    );
+    assert_config_error(nan, &["Parameter 'x'", "bounds must be finite"]);
+
+    let mut inf = valid_config_for_validation();
+    inf.space.insert(
+        "x".to_string(),
+        ParamConfig::Real {
+            min: 0.0,
+            max: f64::INFINITY,
+            scale: "linear".to_string(),
+        },
+    );
+    assert_config_error(inf, &["Parameter 'x'", "bounds must be finite"]);
+}
+
+#[test]
+fn test_dyn_engine_config_validation_rejects_invalid_refit_and_priority() {
+    let mut refit = valid_config_for_validation();
+    refit.strategy.as_mut().unwrap().refit_interval = 0;
+    assert_config_error(refit, &["strategy.refit_interval", "at least 1"]);
+
+    let mut priority = valid_config_for_validation();
+    priority.objectives[0].priority = -1.0;
+    assert_config_error(priority, &["Objective 'loss'", "priority"]);
+
+    let mut elite_fraction = valid_config_for_validation();
+    elite_fraction.strategy.as_mut().unwrap().elite_fraction = Some(f64::NAN);
+    assert_config_error(elite_fraction, &["strategy.elite_fraction", "finite"]);
 }
 
 // ==========================================================================
@@ -200,6 +351,57 @@ async fn test_dyn_engine_double_tell_error() {
     let t = engine.ask().await.unwrap();
     engine.tell(t.trial_id, json!({"loss": 0.5})).await.unwrap();
     assert!(engine.tell(t.trial_id, json!({"loss": 0.3})).await.is_err());
+}
+
+#[tokio::test]
+async fn test_dyn_engine_out_of_order_tell_preserves_public_trial_ids() {
+    let config = StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }],
+        strategy: None,
+        checkpoint: None,
+        max_trials: None,
+    };
+
+    let engine = HolaEngine::from_config(config).unwrap();
+    let t0 = engine.ask().await.unwrap();
+    let t1 = engine.ask().await.unwrap();
+
+    let completed_1 = engine
+        .tell(t1.trial_id, json!({"loss": 0.2}))
+        .await
+        .unwrap();
+    assert_eq!(completed_1.trial_id, t1.trial_id);
+    assert_eq!(completed_1.params, t1.params);
+
+    let completed_0 = engine
+        .tell(t0.trial_id, json!({"loss": 0.8}))
+        .await
+        .unwrap();
+    assert_eq!(completed_0.trial_id, t0.trial_id);
+    assert_eq!(completed_0.params, t0.params);
+
+    let ids: Vec<u64> = engine
+        .trials("index", true)
+        .await
+        .into_iter()
+        .map(|trial| trial.trial_id)
+        .collect();
+    assert_eq!(ids, vec![0, 1]);
 }
 
 // ==========================================================================
@@ -650,9 +852,31 @@ async fn test_dyn_engine_update_objectives() {
             priority: 1.0,
             group: None,
         }])
-        .await;
+        .await
+        .unwrap();
 
     assert!(!engine.top_k(1, false).await.is_empty());
+}
+
+#[tokio::test]
+async fn test_dyn_engine_update_objectives_rejects_invalid_config() {
+    let engine = HolaEngine::from_config(valid_config_for_validation()).unwrap();
+    let before = engine.objectives().await;
+
+    let err = engine
+        .update_objectives(vec![ObjectiveConfig {
+            field: "accuracy".to_string(),
+            obj_type: "larger_is_better".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }])
+        .await
+        .unwrap_err();
+
+    assert!(err.contains("Objective 'accuracy'"));
+    assert_eq!(engine.objectives().await[0].field, before[0].field);
 }
 
 #[tokio::test]
@@ -746,10 +970,151 @@ async fn test_dyn_engine_update_objectives_rescalarizes() {
             priority: 1.0,
             group: None,
         }])
-        .await;
+        .await
+        .unwrap();
 
     let best_after = engine.top_k(1, false).await.into_iter().next().unwrap();
     assert_ne!(best_before.trial_id, best_after.trial_id);
+}
+
+#[tokio::test]
+async fn test_dyn_engine_update_objectives_migrates_scalar_to_vector() {
+    let config = StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![ObjectiveConfig {
+            field: "f1".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }],
+        strategy: None,
+        checkpoint: None,
+        max_trials: None,
+    };
+
+    let engine = HolaEngine::from_config(config).unwrap();
+    for metrics in [
+        json!({"f1": 1.0, "f2": 5.0}),
+        json!({"f1": 5.0, "f2": 1.0}),
+        json!({"f1": 3.0, "f2": 3.0}),
+        json!({"f1": 4.0, "f2": 4.0}),
+    ] {
+        let trial = engine.ask().await.unwrap();
+        engine.tell(trial.trial_id, metrics).await.unwrap();
+    }
+    assert!(engine.pareto_front(0, false).await.is_empty());
+
+    engine
+        .update_objectives(vec![
+            ObjectiveConfig {
+                field: "f1".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            },
+            ObjectiveConfig {
+                field: "f2".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+    let mut front_ids: Vec<u64> = engine
+        .pareto_front(0, false)
+        .await
+        .into_iter()
+        .map(|trial| trial.trial_id)
+        .collect();
+    front_ids.sort_unstable();
+    assert_eq!(front_ids, vec![0, 1, 2]);
+
+    let migrated = engine
+        .trials("index", true)
+        .await
+        .into_iter()
+        .find(|trial| trial.trial_id == 0)
+        .unwrap();
+    assert!(migrated.score_vector.get("f1").is_some());
+    assert!(migrated.score_vector.get("f2").is_some());
+}
+
+#[tokio::test]
+async fn test_dyn_engine_update_objectives_migrates_vector_to_scalar() {
+    let config = StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![
+            ObjectiveConfig {
+                field: "f1".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            },
+            ObjectiveConfig {
+                field: "f2".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            },
+        ],
+        strategy: None,
+        checkpoint: None,
+        max_trials: None,
+    };
+
+    let engine = HolaEngine::from_config(config).unwrap();
+    for metrics in [
+        json!({"f1": 10.0, "f2": 0.0}),
+        json!({"f1": 1.0, "f2": 10.0}),
+        json!({"f1": 5.0, "f2": 5.0}),
+    ] {
+        let trial = engine.ask().await.unwrap();
+        engine.tell(trial.trial_id, metrics).await.unwrap();
+    }
+    assert!(!engine.pareto_front(0, false).await.is_empty());
+
+    engine
+        .update_objectives(vec![ObjectiveConfig {
+            field: "f1".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }])
+        .await
+        .unwrap();
+
+    assert!(engine.pareto_front(0, false).await.is_empty());
+    let best = engine.top_k(1, false).await.into_iter().next().unwrap();
+    assert_eq!(best.trial_id, 1);
+    assert_eq!(best.score_vector.as_object().unwrap().len(), 1);
 }
 
 // ==========================================================================
@@ -942,7 +1307,8 @@ async fn test_update_objectives_triggers_refit() {
             priority: 1.0,
             group: None,
         }])
-        .await;
+        .await
+        .unwrap();
 
     let best_after = engine.top_k(1, false).await.into_iter().next().unwrap();
     assert!(best_after.rank < best_before.rank || best_after.trial_id != best_before.trial_id);
@@ -954,6 +1320,64 @@ async fn test_update_objectives_triggers_refit() {
 // ==========================================================================
 // Checkpoints
 // ==========================================================================
+
+fn scalar_checkpoint_config(max_trials: Option<usize>) -> StudyConfig {
+    StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }],
+        strategy: None,
+        checkpoint: None,
+        max_trials,
+    }
+}
+
+fn vector_checkpoint_config() -> StudyConfig {
+    StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![
+            ObjectiveConfig {
+                field: "f1".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            },
+            ObjectiveConfig {
+                field: "f2".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 2.0,
+                group: None,
+            },
+        ],
+        strategy: None,
+        checkpoint: None,
+        max_trials: None,
+    }
+}
 
 #[tokio::test]
 async fn test_dyn_engine_leaderboard_checkpoint() {
@@ -1004,6 +1428,59 @@ async fn test_dyn_engine_leaderboard_checkpoint() {
 }
 
 #[tokio::test]
+async fn test_dyn_engine_leaderboard_checkpoint_resume_uses_fresh_trial_id() {
+    let config = scalar_checkpoint_config(Some(3));
+    let engine = HolaEngine::from_config(config.clone()).unwrap();
+
+    for (expected_id, loss) in [0.5, 0.3].into_iter().enumerate() {
+        let trial = engine.ask().await.unwrap();
+        assert_eq!(trial.trial_id, expected_id as u64);
+        let completed = engine
+            .tell(trial.trial_id, json!({"loss": loss}))
+            .await
+            .unwrap();
+        assert_eq!(completed.trial_id, expected_id as u64);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lb.json");
+    engine
+        .save_leaderboard_checkpoint_to(&path, Some("2 trials"))
+        .await
+        .unwrap();
+
+    let restored = HolaEngine::from_config(config).unwrap();
+    let stale_pending = restored.ask().await.unwrap();
+    let stale_cancelled = restored.ask().await.unwrap();
+    restored.cancel(stale_cancelled.trial_id).await.unwrap();
+
+    restored.load_leaderboard_checkpoint(&path).await.unwrap();
+    assert!(
+        restored
+            .tell(stale_pending.trial_id, json!({"loss": 0.0}))
+            .await
+            .is_err(),
+        "pending trials from the pre-load engine state must not survive checkpoint load"
+    );
+
+    let trial = restored.ask().await.unwrap();
+    assert_eq!(trial.trial_id, 2);
+    let completed = restored
+        .tell(trial.trial_id, json!({"loss": 0.1}))
+        .await
+        .unwrap();
+    assert_eq!(completed.trial_id, 2);
+
+    let ids: Vec<u64> = restored
+        .trials("index", true)
+        .await
+        .into_iter()
+        .map(|trial| trial.trial_id)
+        .collect();
+    assert_eq!(ids, vec![0, 1, 2]);
+}
+
+#[tokio::test]
 async fn test_dyn_engine_full_checkpoint() {
     let config = StudyConfig {
         space: BTreeMap::from([(
@@ -1043,9 +1520,174 @@ async fn test_dyn_engine_full_checkpoint() {
     assert_eq!(engine2.trial_count().await, 1);
 }
 
+#[tokio::test]
+async fn test_dyn_engine_full_checkpoint_resume_returns_new_completed_trial() {
+    let config = scalar_checkpoint_config(None);
+    let engine = HolaEngine::from_config(config.clone()).unwrap();
+
+    for loss in [0.5, 0.3] {
+        let trial = engine.ask().await.unwrap();
+        engine
+            .tell(trial.trial_id, json!({"loss": loss}))
+            .await
+            .unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("full.json");
+    engine
+        .save_full_checkpoint(&path, Some("2 trials"))
+        .await
+        .unwrap();
+
+    let restored = HolaEngine::from_config(config).unwrap();
+    restored.load_full_checkpoint(&path).await.unwrap();
+
+    let trial = restored.ask().await.unwrap();
+    assert_eq!(trial.trial_id, 2);
+    let completed = restored
+        .tell(trial.trial_id, json!({"loss": 0.1}))
+        .await
+        .unwrap();
+    assert_eq!(completed.trial_id, 2);
+    assert_eq!(completed.params, trial.params);
+
+    let ids: Vec<u64> = restored
+        .trials("index", true)
+        .await
+        .into_iter()
+        .map(|trial| trial.trial_id)
+        .collect();
+    assert_eq!(ids, vec![0, 1, 2]);
+}
+
+#[tokio::test]
+async fn test_dyn_engine_full_checkpoint_resume_preserves_vector_trial_ids() {
+    let config = vector_checkpoint_config();
+    let engine = HolaEngine::from_config(config.clone()).unwrap();
+
+    for metrics in [json!({"f1": 1.0, "f2": 3.0}), json!({"f1": 2.0, "f2": 1.0})] {
+        let trial = engine.ask().await.unwrap();
+        let completed = engine.tell(trial.trial_id, metrics).await.unwrap();
+        assert_eq!(completed.trial_id, trial.trial_id);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vector-full.json");
+    engine
+        .save_full_checkpoint(&path, Some("vector checkpoint"))
+        .await
+        .unwrap();
+
+    let restored = HolaEngine::from_config(config).unwrap();
+    restored.load_full_checkpoint(&path).await.unwrap();
+
+    let trial = restored.ask().await.unwrap();
+    assert_eq!(trial.trial_id, 2);
+    let completed = restored
+        .tell(trial.trial_id, json!({"f1": 0.5, "f2": 2.5}))
+        .await
+        .unwrap();
+    assert_eq!(completed.trial_id, 2);
+
+    let ids: Vec<u64> = restored
+        .trials("index", true)
+        .await
+        .into_iter()
+        .map(|trial| trial.trial_id)
+        .collect();
+    assert_eq!(ids, vec![0, 1, 2]);
+}
+
+#[tokio::test]
+async fn test_dyn_engine_checkpoint_load_with_fallback_supports_full_and_leaderboard() {
+    let config = scalar_checkpoint_config(None);
+    let engine = HolaEngine::from_config(config.clone()).unwrap();
+    let trial = engine.ask().await.unwrap();
+    engine
+        .tell(trial.trial_id, json!({"loss": 0.5}))
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let full_path = dir.path().join("full.json");
+    engine
+        .save_full_checkpoint(&full_path, Some("full"))
+        .await
+        .unwrap();
+
+    let restored_full = HolaEngine::from_config(config.clone()).unwrap();
+    let kind = restored_full
+        .load_checkpoint_with_fallback(&full_path)
+        .await
+        .unwrap();
+    assert_eq!(kind, CheckpointLoadKind::Full);
+    assert_eq!(restored_full.trial_count().await, 1);
+    assert_eq!(restored_full.ask().await.unwrap().trial_id, 1);
+
+    let leaderboard_path = dir.path().join("leaderboard.json");
+    engine
+        .save_leaderboard_checkpoint_to(&leaderboard_path, Some("leaderboard"))
+        .await
+        .unwrap();
+
+    let restored_leaderboard = HolaEngine::from_config(config).unwrap();
+    let kind = restored_leaderboard
+        .load_checkpoint_with_fallback(&leaderboard_path)
+        .await
+        .unwrap();
+    assert_eq!(kind, CheckpointLoadKind::Leaderboard);
+    assert_eq!(restored_leaderboard.trial_count().await, 1);
+    assert_eq!(restored_leaderboard.ask().await.unwrap().trial_id, 1);
+}
+
 // ==========================================================================
 // Auto strategy (Sobol -> GMM switching)
 // ==========================================================================
+
+fn auto_strategy_test_config(exploration_budget: usize, seed: u64) -> StudyConfig {
+    StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }],
+        strategy: Some(StrategyConfig {
+            strategy_type: "auto".to_string(),
+            refit_interval: 5,
+            total_budget: None,
+            exploration_budget: Some(exploration_budget),
+            seed: Some(seed),
+            elite_fraction: None,
+        }),
+        checkpoint: None,
+        max_trials: None,
+    }
+}
+
+fn sobol_strategy_test_config(seed: u64) -> StudyConfig {
+    let mut config = auto_strategy_test_config(0, seed);
+    config.strategy = Some(StrategyConfig {
+        strategy_type: "sobol".to_string(),
+        refit_interval: 20,
+        total_budget: None,
+        exploration_budget: None,
+        seed: Some(seed),
+        elite_fraction: None,
+    });
+    config
+}
 
 #[tokio::test]
 async fn test_auto_strategy_default() {
@@ -1155,6 +1797,50 @@ fn test_auto_strategy_default_exploration_budget() {
     // Edge cases
     assert_eq!(AutoStrategy::default_exploration_budget(10, 1), 2); // min(2, 52) = 2
     assert_eq!(AutoStrategy::default_exploration_budget(5, 1), 1); // min(1, 52) = 1
+}
+
+#[tokio::test]
+async fn test_auto_strategy_counts_pending_asks_against_exploration_budget() {
+    let auto = HolaEngine::from_config(auto_strategy_test_config(2, 17)).unwrap();
+    let sobol = HolaEngine::from_config(sobol_strategy_test_config(17)).unwrap();
+    let gmm = HolaEngine::from_config(auto_strategy_test_config(0, 17)).unwrap();
+
+    let auto_trials = [
+        auto.ask().await.unwrap(),
+        auto.ask().await.unwrap(),
+        auto.ask().await.unwrap(),
+        auto.ask().await.unwrap(),
+    ];
+
+    assert_eq!(auto_trials[0].params, sobol.ask().await.unwrap().params);
+    assert_eq!(auto_trials[1].params, sobol.ask().await.unwrap().params);
+    assert_eq!(auto_trials[2].params, gmm.ask().await.unwrap().params);
+    assert_eq!(auto_trials[3].params, gmm.ask().await.unwrap().params);
+    assert_eq!(auto.trial_count().await, 0);
+}
+
+#[tokio::test]
+async fn test_auto_strategy_full_checkpoint_preserves_pending_ask_accounting() {
+    let engine = HolaEngine::from_config(auto_strategy_test_config(2, 17)).unwrap();
+    for _ in 0..3 {
+        engine.ask().await.unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auto-full.json");
+    engine
+        .save_full_checkpoint(&path, Some("auto pending asks"))
+        .await
+        .unwrap();
+
+    let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+
+    let gmm = HolaEngine::from_config(auto_strategy_test_config(0, 17)).unwrap();
+    gmm.ask().await.unwrap();
+    let expected = gmm.ask().await.unwrap();
+    let resumed = restored.ask().await.unwrap();
+
+    assert_eq!(resumed.params, expected.params);
 }
 
 // ==========================================================================

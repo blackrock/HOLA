@@ -191,7 +191,7 @@ class Study:
         max_trials: int | None = None,
     ) -> None: ...
     @staticmethod
-    def connect(url: str) -> Study:
+    def connect(url: str, token: str | None = None) -> Study:
         """Connect to an existing HOLA server."""
         ...
     @staticmethod

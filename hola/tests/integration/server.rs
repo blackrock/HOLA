@@ -14,8 +14,8 @@
 //! Exercises ask/tell/top_k/trials endpoints, space/objectives info,
 //! checkpoints, error handling, cancel, and objective rescalarization.
 
-use hola::hola_engine::{HolaEngine, ObjectiveConfig, ParamConfig, StudyConfig};
-use hola::server::create_router;
+use hola::hola_engine::{HolaEngine, ObjectiveConfig, ParamConfig, StrategyConfig, StudyConfig};
+use hola::server::{ServerOptions, create_router, create_router_with_options};
 use http_body_util::BodyExt;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -44,6 +44,37 @@ fn minimal_config() -> StudyConfig {
             group: None,
         }],
         strategy: None,
+        checkpoint: None,
+        max_trials: None,
+    }
+}
+
+fn sobol_config(seed: u64) -> StudyConfig {
+    StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }],
+        strategy: Some(StrategyConfig {
+            strategy_type: "sobol".to_string(),
+            refit_interval: 20,
+            total_budget: None,
+            exploration_budget: None,
+            seed: Some(seed),
+            elite_fraction: None,
+        }),
         checkpoint: None,
         max_trials: None,
     }
@@ -91,7 +122,20 @@ async fn json_request(
     uri: &str,
     body: Option<serde_json::Value>,
 ) -> (u16, serde_json::Value) {
+    json_request_with_headers(app, method, uri, body, &[]).await
+}
+
+async fn json_request_with_headers(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+    headers: &[(&str, &str)],
+) -> (u16, serde_json::Value) {
     let mut builder = hyper::Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
     let body = if let Some(b) = body {
         builder = builder.header("content-type", "application/json");
         axum::body::Body::from(serde_json::to_vec(&b).unwrap())
@@ -104,6 +148,22 @@ async fn json_request(
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     (status, json)
+}
+
+async fn options_request(
+    app: axum::Router,
+    uri: &str,
+    origin: &str,
+    requested_method: &str,
+) -> hyper::Response<axum::body::Body> {
+    let req = hyper::Request::builder()
+        .method("OPTIONS")
+        .uri(uri)
+        .header("origin", origin)
+        .header("access-control-request-method", requested_method)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    app.oneshot(req).await.unwrap()
 }
 
 // ==========================================================================
@@ -144,6 +204,8 @@ async fn test_server_ask_tell_top_k_flow() {
     assert_eq!(status, 200);
     assert_eq!(result["status"], "ok");
     assert_eq!(result["trial_count"], 1);
+    assert_eq!(result["trial"]["trial_id"], trial_id);
+    assert!(result["trial"]["score_vector"].is_object());
 
     // Top-k
     let (status, top) = json_request(
@@ -161,6 +223,18 @@ async fn test_server_ask_tell_top_k_flow() {
     assert!(top_arr[0]["metrics"].is_object());
     assert!(top_arr[0]["scores"].is_object());
     assert!(top_arr[0]["rank"].is_u64());
+
+    // Single-trial lookup
+    let (status, single) = json_request(
+        app.clone(),
+        "GET",
+        &format!("/api/trial/{trial_id}?include_infeasible=true"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(single["trial_id"], trial_id);
+    assert_eq!(single["metrics"]["loss"], 0.42);
 
     // Trials
     let (status, trials) = json_request(
@@ -194,6 +268,111 @@ async fn test_server_trial_count() {
     let (status, body) = json_request(app, "GET", "/api/trial_count", None).await;
     assert_eq!(status, 200);
     assert_eq!(body["trial_count"], 0);
+}
+
+// ==========================================================================
+// Security options: auth and CORS
+// ==========================================================================
+
+#[tokio::test]
+async fn test_server_auth_rejects_missing_and_invalid_bearer() {
+    let engine = HolaEngine::from_config(minimal_config()).unwrap();
+    let mut options = ServerOptions::new(8000);
+    options.auth_token = Some("secret".to_string());
+    let app = create_router_with_options(engine, options);
+
+    let (status, body) = json_request(app.clone(), "POST", "/api/ask", None).await;
+    assert_eq!(status, 401);
+    assert!(body["error"].as_str().unwrap().contains("bearer token"));
+
+    for (method, uri, body) in [
+        (
+            "POST",
+            "/api/tell",
+            Some(json!({"trial_id": 0, "metrics": {"loss": 0.5}})),
+        ),
+        ("POST", "/api/cancel", Some(json!({"trial_id": 0}))),
+        (
+            "PATCH",
+            "/api/objectives",
+            Some(json!({"objectives": [{"field": "loss", "type": "minimize"}]})),
+        ),
+        (
+            "POST",
+            "/api/checkpoint/save",
+            Some(json!({"path": "checkpoint.json"})),
+        ),
+    ] {
+        let (status, body) = json_request(app.clone(), method, uri, body).await;
+        assert_eq!(status, 401, "{method} {uri}");
+        assert!(body["error"].as_str().unwrap().contains("bearer token"));
+    }
+
+    let (status, body) = json_request_with_headers(
+        app,
+        "POST",
+        "/api/ask",
+        None,
+        &[("authorization", "Bearer wrong")],
+    )
+    .await;
+    assert_eq!(status, 401);
+    assert!(body["error"].as_str().unwrap().contains("bearer token"));
+}
+
+#[tokio::test]
+async fn test_server_auth_accepts_valid_bearer_for_mutations() {
+    let engine = HolaEngine::from_config(minimal_config()).unwrap();
+    let mut options = ServerOptions::new(8000);
+    options.auth_token = Some("secret".to_string());
+    let app = create_router_with_options(engine, options);
+
+    let (status, trial) = json_request_with_headers(
+        app.clone(),
+        "POST",
+        "/api/ask",
+        None,
+        &[("authorization", "Bearer secret")],
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let tell = json!({"trial_id": trial["trial_id"], "metrics": {"loss": 0.5}});
+    let (status, body) = json_request_with_headers(
+        app,
+        "POST",
+        "/api/tell",
+        Some(tell),
+        &[("authorization", "Bearer secret")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test]
+async fn test_server_cors_allows_configured_origin_only() {
+    let engine = HolaEngine::from_config(minimal_config()).unwrap();
+    let mut options = ServerOptions::new(8000);
+    options.cors_allowed_origins = vec!["http://allowed.example".to_string()];
+    let app = create_router_with_options(engine, options);
+
+    let allowed = options_request(app.clone(), "/api/ask", "http://allowed.example", "POST").await;
+    assert_eq!(
+        allowed
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "http://allowed.example"
+    );
+
+    let disallowed = options_request(app, "/api/ask", "http://disallowed.example", "POST").await;
+    assert!(
+        disallowed
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none()
+    );
 }
 
 // ==========================================================================
@@ -311,6 +490,22 @@ async fn test_server_update_objectives() {
 }
 
 #[tokio::test]
+async fn test_server_update_objectives_rejects_invalid_type() {
+    let engine = HolaEngine::from_config(minimal_config()).unwrap();
+    let app = create_router(engine);
+
+    let patch = json!({"objectives": [{"field": "accuracy", "type": "larger", "priority": 1.0}]});
+    let (status, result) = json_request(app, "PATCH", "/api/objectives", Some(patch)).await;
+    assert_eq!(status, 400);
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("Objective 'accuracy'")
+    );
+}
+
+#[tokio::test]
 async fn test_server_update_objectives_rescalarizes() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
     let app = create_router(engine);
@@ -366,19 +561,96 @@ async fn test_server_ask_sequential_ids() {
 #[tokio::test]
 async fn test_server_checkpoint_save_endpoint() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = ServerOptions::new(8000);
+    options.checkpoint_dir = dir.path().to_path_buf();
+    let app = create_router_with_options(engine, options);
 
     let (_, trial) = json_request(app.clone(), "POST", "/api/ask", None).await;
     let tell = json!({"trial_id": trial["trial_id"], "metrics": {"loss": 0.5}});
     json_request(app.clone(), "POST", "/api/tell", Some(tell)).await;
 
-    let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ckpt.json");
-    let save_req = json!({"path": path.to_string_lossy(), "description": "server test"});
+    let save_req = json!({"path": "ckpt.json", "description": "server test"});
 
-    let (status, _) = json_request(app, "POST", "/api/checkpoint/save", Some(save_req)).await;
+    let (status, body) = json_request(app, "POST", "/api/checkpoint/save", Some(save_req)).await;
     assert_eq!(status, 200);
+    assert_eq!(body["checkpoint_type"], "full");
+    assert_eq!(body["path"].as_str().unwrap(), path.to_string_lossy());
     assert!(path.exists());
+
+    let saved: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(&path).unwrap()).unwrap();
+    assert!(saved.get("config").is_some());
+    assert!(saved["checkpoint"].get("strategy_state").is_some());
+}
+
+#[tokio::test]
+async fn test_server_checkpoint_save_preserves_sobol_sequence() {
+    let config = sobol_config(123);
+    let baseline = HolaEngine::from_config(config.clone()).unwrap();
+    let engine = HolaEngine::from_config(config).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = ServerOptions::new(8000);
+    options.checkpoint_dir = dir.path().to_path_buf();
+    let app = create_router_with_options(engine, options);
+
+    for _ in 0..3 {
+        let baseline_trial = baseline.ask().await.unwrap();
+        baseline
+            .tell(
+                baseline_trial.trial_id,
+                json!({"loss": baseline_trial.params["x"]}),
+            )
+            .await
+            .unwrap();
+
+        let (status, trial) = json_request(app.clone(), "POST", "/api/ask", None).await;
+        assert_eq!(status, 200);
+        assert_eq!(trial["params"], baseline_trial.params);
+        let tell =
+            json!({"trial_id": trial["trial_id"], "metrics": {"loss": trial["params"]["x"]}});
+        let (status, _) = json_request(app.clone(), "POST", "/api/tell", Some(tell)).await;
+        assert_eq!(status, 200);
+    }
+    let expected_next = baseline.ask().await.unwrap();
+
+    let path = dir.path().join("full.json");
+    let save_req = json!({"path": "full.json", "description": "server full"});
+    let (status, body) = json_request(app, "POST", "/api/checkpoint/save", Some(save_req)).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["checkpoint_type"], "full");
+
+    let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+    let restored_next = restored.ask().await.unwrap();
+    assert_eq!(restored_next.trial_id, expected_next.trial_id);
+    assert_eq!(restored_next.params, expected_next.params);
+}
+
+#[tokio::test]
+async fn test_server_checkpoint_save_rejects_unconfined_paths() {
+    let engine = HolaEngine::from_config(minimal_config()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = ServerOptions::new(8000);
+    options.checkpoint_dir = dir.path().to_path_buf();
+    let app = create_router_with_options(engine, options);
+
+    let absolute_req = json!({"path": dir.path().join("escape.json").to_string_lossy()});
+    let (status, body) = json_request(
+        app.clone(),
+        "POST",
+        "/api/checkpoint/save",
+        Some(absolute_req),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(body["error"].as_str().unwrap().contains("relative"));
+
+    let traversal_req = json!({"path": "../escape.json"});
+    let (status, body) =
+        json_request(app, "POST", "/api/checkpoint/save", Some(traversal_req)).await;
+    assert_eq!(status, 400);
+    assert!(body["error"].as_str().unwrap().contains("relative"));
 }
 
 // ==========================================================================

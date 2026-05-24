@@ -31,6 +31,7 @@ use opt_engine::traits::{RefitConfig, SampleSpace, StandardizedSpace, Strategy};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 
 // =============================================================================
@@ -391,12 +392,13 @@ enum DynStrategyInner {
 /// The default exploration budget follows the formula from the paper:
 /// `min(floor(S / 5), 50 + 2n)`, where `S` is the intended number of
 /// simulations and `n` is the dimensionality.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct AutoStrategy {
     sobol: SobolStrategy<DynSpace>,
     gmm: GmmStrategy<DynSpace>,
     exploration_budget: usize,
     trial_count: usize,
+    issued_count: AtomicUsize,
 }
 
 impl AutoStrategy {
@@ -429,7 +431,64 @@ impl AutoStrategy {
             gmm: GmmStrategy::uniform_prior(gmm_seed, dim, 0.1),
             exploration_budget,
             trial_count: 0,
+            issued_count: AtomicUsize::new(0),
         }
+    }
+}
+
+impl Clone for AutoStrategy {
+    fn clone(&self) -> Self {
+        Self {
+            sobol: self.sobol.clone(),
+            gmm: self.gmm.clone(),
+            exploration_budget: self.exploration_budget,
+            trial_count: self.trial_count,
+            issued_count: AtomicUsize::new(self.issued_count.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl Serialize for AutoStrategy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("AutoStrategy", 5)?;
+        state.serialize_field("sobol", &self.sobol)?;
+        state.serialize_field("gmm", &self.gmm)?;
+        state.serialize_field("exploration_budget", &self.exploration_budget)?;
+        state.serialize_field("trial_count", &self.trial_count)?;
+        state.serialize_field("issued_count", &self.issued_count.load(Ordering::Relaxed))?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for AutoStrategy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct AutoStrategySerde {
+            sobol: SobolStrategy<DynSpace>,
+            gmm: GmmStrategy<DynSpace>,
+            exploration_budget: usize,
+            trial_count: usize,
+            #[serde(default)]
+            issued_count: Option<usize>,
+        }
+
+        let state = AutoStrategySerde::deserialize(deserializer)?;
+        let issued_count = state.issued_count.unwrap_or(state.trial_count);
+        Ok(Self {
+            sobol: state.sobol,
+            gmm: state.gmm,
+            exploration_budget: state.exploration_budget,
+            trial_count: state.trial_count,
+            issued_count: AtomicUsize::new(issued_count.max(state.trial_count)),
+        })
     }
 }
 
@@ -448,7 +507,8 @@ impl Strategy for DynStrategy {
             DynStrategyInner::Sobol(s) => s.suggest(space),
             DynStrategyInner::Gmm(s) => s.suggest(space),
             DynStrategyInner::Auto(s) => {
-                if s.trial_count < s.exploration_budget {
+                let issued = s.issued_count.fetch_add(1, Ordering::Relaxed);
+                if issued < s.exploration_budget {
                     s.sobol.suggest(space)
                 } else {
                     s.gmm.suggest(space)
@@ -464,6 +524,7 @@ impl Strategy for DynStrategy {
             DynStrategyInner::Gmm(s) => s.update(candidate, observation),
             DynStrategyInner::Auto(s) => {
                 s.trial_count += 1;
+                s.issued_count.fetch_max(s.trial_count, Ordering::Relaxed);
                 s.sobol.update(candidate, observation);
                 s.gmm.update(candidate, observation);
             }
@@ -482,7 +543,7 @@ impl opt_engine::traits::RefittableStrategy for DynStrategy {
 }
 
 // =============================================================================
-// Configuration types for constructing DynEngine from YAML/JSON
+// Configuration types for constructing HolaEngine from YAML/JSON
 // =============================================================================
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -588,8 +649,150 @@ fn default_checkpoint_interval() -> usize {
     50
 }
 
+fn validate_study_config(config: &StudyConfig) -> Result<(), String> {
+    validate_space_config(&config.space)?;
+    validate_objectives(&config.objectives)?;
+    if let Some(strategy) = &config.strategy {
+        validate_strategy_config(strategy)?;
+    }
+    if let Some(checkpoint) = &config.checkpoint
+        && checkpoint.interval == 0
+    {
+        return Err("checkpoint.interval must be at least 1".to_string());
+    }
+    Ok(())
+}
+
+fn validate_space_config(space: &BTreeMap<String, ParamConfig>) -> Result<(), String> {
+    if space.is_empty() {
+        return Err("At least one parameter is required".to_string());
+    }
+
+    for (name, param) in space {
+        if name.trim().is_empty() {
+            return Err("Parameter names must not be empty".to_string());
+        }
+        match param {
+            ParamConfig::Real { min, max, scale } => {
+                if !min.is_finite() || !max.is_finite() {
+                    return Err(format!(
+                        "Parameter '{name}': real bounds must be finite, got min={min}, max={max}",
+                    ));
+                }
+                if min >= max {
+                    return Err(format!(
+                        "Parameter '{name}': min must be less than max, got min={min}, max={max}",
+                    ));
+                }
+                match scale.as_str() {
+                    "linear" => {}
+                    "log" | "ln" | "log10" => {
+                        if *min <= 0.0 || *max <= 0.0 {
+                            return Err(format!(
+                                "Parameter '{name}': {scale} scale requires min > 0 and max > 0, got min={min}, max={max}",
+                            ));
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "Parameter '{name}': unknown real scale '{other}'. Expected one of: linear, log, ln, log10",
+                        ));
+                    }
+                }
+            }
+            ParamConfig::Integer { min, max } => {
+                if min > max {
+                    return Err(format!(
+                        "Parameter '{name}': integer min must be <= max, got min={min}, max={max}",
+                    ));
+                }
+            }
+            ParamConfig::Categorical { choices } => {
+                if choices.is_empty() {
+                    return Err(format!(
+                        "Parameter '{name}': categorical choices must not be empty",
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_objectives(objectives: &[ObjectiveConfig]) -> Result<(), String> {
+    if objectives.is_empty() {
+        return Err("At least one objective is required. \
+             Example: objectives: [{ field: \"loss\", type: \"minimize\" }]"
+            .to_string());
+    }
+
+    for obj in objectives {
+        if obj.field.trim().is_empty() {
+            return Err("Objective field names must not be empty".to_string());
+        }
+        match obj.obj_type.as_str() {
+            "minimize" | "maximize" => {}
+            other => {
+                return Err(format!(
+                    "Objective '{}': unknown objective type '{}'. Expected 'minimize' or 'maximize'",
+                    obj.field, other
+                ));
+            }
+        }
+        if !obj.priority.is_finite() || obj.priority < 0.0 {
+            return Err(format!(
+                "Objective '{}': priority must be finite and non-negative, got {}",
+                obj.field, obj.priority
+            ));
+        }
+        if let Some(target) = obj.target
+            && !target.is_finite()
+        {
+            return Err(format!(
+                "Objective '{}': target must be finite, got {}",
+                obj.field, target
+            ));
+        }
+        if let Some(limit) = obj.limit
+            && !limit.is_finite()
+        {
+            return Err(format!(
+                "Objective '{}': limit must be finite, got {}",
+                obj.field, limit
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_strategy_config(strategy: &StrategyConfig) -> Result<(), String> {
+    match strategy.strategy_type.as_str() {
+        "random" | "sobol" | "gmm" | "auto" => {}
+        other => {
+            return Err(format!(
+                "Unknown strategy type '{other}'. Expected one of: random, sobol, gmm, auto",
+            ));
+        }
+    }
+
+    if strategy.refit_interval == 0 {
+        return Err("strategy.refit_interval must be at least 1".to_string());
+    }
+    if let Some(elite_fraction) = strategy.elite_fraction
+        && (!elite_fraction.is_finite() || elite_fraction <= 0.0 || elite_fraction > 1.0)
+    {
+        return Err(format!(
+            "strategy.elite_fraction must be finite and in (0, 1], got {elite_fraction}",
+        ));
+    }
+
+    Ok(())
+}
+
 // =============================================================================
-// DynEngine: the top-level Ask/Tell interface
+// HolaEngine: the top-level Ask/Tell interface
 // =============================================================================
 
 /// A trial returned by `ask()`.
@@ -629,6 +832,24 @@ pub struct CompletedTrial {
     pub completed_at: u64,
 }
 
+/// Kind of checkpoint loaded by [`HolaEngine::load_checkpoint_with_fallback`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointLoadKind {
+    /// Full checkpoint with leaderboard and strategy state.
+    Full,
+    /// Legacy leaderboard-only checkpoint with trial history but no strategy state.
+    Leaderboard,
+}
+
+impl CheckpointLoadKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckpointLoadKind::Full => "full",
+            CheckpointLoadKind::Leaderboard => "leaderboard",
+        }
+    }
+}
+
 // =============================================================================
 // DynLeaderboard: scalar or vector leaderboard dispatch
 // =============================================================================
@@ -641,8 +862,17 @@ enum DynLeaderboard {
 }
 
 impl DynLeaderboard {
+    fn for_objectives(objectives: &[ObjectiveConfig]) -> Self {
+        if count_priority_groups(objectives) > 1 {
+            DynLeaderboard::Vector(Leaderboard::new())
+        } else {
+            DynLeaderboard::Scalar(Leaderboard::new())
+        }
+    }
+
     fn push_with_raw(
         &mut self,
+        trial_id: u64,
         candidate: serde_json::Value,
         raw_metrics: serde_json::Value,
         objectives: &[ObjectiveConfig],
@@ -650,15 +880,36 @@ impl DynLeaderboard {
         match self {
             DynLeaderboard::Scalar(lb) => {
                 let score = scalarize_raw(&raw_metrics, objectives);
-                let id = lb.push_with_raw(candidate, score, raw_metrics);
+                let id = lb.push_with_raw_trial_id(candidate, score, raw_metrics, trial_id);
                 (id, score)
             }
             DynLeaderboard::Vector(lb) => {
                 let obs = vectorize_raw(&raw_metrics, objectives);
                 let score = scalarize_observation(&obs, objectives);
-                let id = lb.push_with_raw(candidate, obs, raw_metrics);
+                let id = lb.push_with_raw_trial_id(candidate, obs, raw_metrics, trial_id);
                 (id, score)
             }
+        }
+    }
+
+    fn contains_trial_id(&self, trial_id: u64) -> bool {
+        match self {
+            DynLeaderboard::Scalar(lb) => lb.get(trial_id).is_some(),
+            DynLeaderboard::Vector(lb) => lb.get(trial_id).is_some(),
+        }
+    }
+
+    fn next_trial_id(&self) -> u64 {
+        match self {
+            DynLeaderboard::Scalar(lb) => lb.next_trial_id(),
+            DynLeaderboard::Vector(lb) => lb.next_trial_id(),
+        }
+    }
+
+    fn normalize_next_trial_id(&mut self) -> u64 {
+        match self {
+            DynLeaderboard::Scalar(lb) => lb.normalize_next_trial_id(),
+            DynLeaderboard::Vector(lb) => lb.normalize_next_trial_id(),
         }
     }
 
@@ -705,21 +956,90 @@ impl DynLeaderboard {
         }
     }
 
+    fn migrate_for_objectives(&mut self, objectives: &[ObjectiveConfig]) {
+        let should_be_vector = count_priority_groups(objectives) > 1;
+        match (&mut *self, should_be_vector) {
+            (DynLeaderboard::Scalar(_), false) | (DynLeaderboard::Vector(_), true) => {
+                self.rescalarize(objectives);
+                return;
+            }
+            _ => {}
+        }
+
+        let migrated = match self {
+            DynLeaderboard::Scalar(lb) => {
+                let mut migrated = Leaderboard::new();
+                for trial in lb.iter() {
+                    let raw_metrics = trial.raw_metrics.clone();
+                    let raw = raw_metrics.as_ref().unwrap_or(&serde_json::Value::Null);
+                    migrated.push_existing_trial(Trial {
+                        candidate: trial.candidate.clone(),
+                        observation: vectorize_raw(raw, objectives),
+                        raw_metrics,
+                        trial_id: trial.trial_id,
+                        timestamp: trial.timestamp,
+                    });
+                }
+                DynLeaderboard::Vector(migrated)
+            }
+            DynLeaderboard::Vector(lb) => {
+                let mut migrated = Leaderboard::new();
+                for trial in lb.iter() {
+                    let raw_metrics = trial.raw_metrics.clone();
+                    let raw = raw_metrics.as_ref().unwrap_or(&serde_json::Value::Null);
+                    migrated.push_existing_trial(Trial {
+                        candidate: trial.candidate.clone(),
+                        observation: scalarize_raw(raw, objectives),
+                        raw_metrics,
+                        trial_id: trial.trial_id,
+                        timestamp: trial.timestamp,
+                    });
+                }
+                DynLeaderboard::Scalar(migrated)
+            }
+        };
+        *self = migrated;
+    }
+
     /// Get a single completed trial by ID, computing its rank and Pareto front.
     fn get_completed(
         &self,
         trial_id: u64,
+        include_infeasible: bool,
         objectives: &[ObjectiveConfig],
     ) -> Option<CompletedTrial> {
-        // Build the full ranked list, then find the requested trial.
-        let all = self.completed_trials("rank", false, objectives);
-        all.into_iter()
-            .find(|ct| ct.trial_id == trial_id)
-            .or_else(|| {
-                // Trial might be infeasible — try again with infeasible included
-                let all_with_inf = self.completed_trials("rank", true, objectives);
-                all_with_inf.into_iter().find(|ct| ct.trial_id == trial_id)
-            })
+        match self {
+            DynLeaderboard::Scalar(lb) => {
+                let trial = lb.get(trial_id)?.clone();
+                if !include_infeasible
+                    && !Leaderboard::<serde_json::Value, f64>::trial_is_feasible(&trial)
+                {
+                    return None;
+                }
+
+                let rank = lb
+                    .iter()
+                    .filter(|other| {
+                        include_infeasible
+                            || Leaderboard::<serde_json::Value, f64>::trial_is_feasible(other)
+                    })
+                    .filter(|other| {
+                        other
+                            .observation
+                            .partial_cmp(&trial.observation)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| other.trial_id.cmp(&trial.trial_id))
+                            == std::cmp::Ordering::Less
+                    })
+                    .count();
+
+                Some(build_completed_scalar(trial, rank, objectives))
+            }
+            DynLeaderboard::Vector(_) => {
+                let all = self.completed_trials("rank", include_infeasible, objectives);
+                all.into_iter().find(|ct| ct.trial_id == trial_id)
+            }
+        }
     }
 
     /// Return all trials as CompletedTrial with ranking and scoring.
@@ -972,14 +1292,18 @@ struct HolaEngineState {
     cancelled: HashSet<u64>,
 }
 
+impl HolaEngineState {
+    fn reset_transient_trial_state_after_load(&mut self) {
+        self.next_pending_id = self.leaderboard.normalize_next_trial_id();
+        self.pending.clear();
+        self.cancelled.clear();
+    }
+}
+
 impl HolaEngine {
     /// Build a HolaEngine from a StudyConfig (parsed from YAML/JSON).
     pub fn from_config(config: StudyConfig) -> Result<Self, String> {
-        if config.objectives.is_empty() {
-            return Err("At least one objective is required. \
-                 Example: objectives: [{ field: \"loss\", obj_type: \"minimize\" }]"
-                .to_string());
-        }
+        validate_study_config(&config)?;
 
         let mut space = DynSpace::new();
         for (name, param) in &config.space {
@@ -1051,7 +1375,7 @@ impl HolaEngine {
                 None,
             ),
             // "gmm" (default): Sobol exploration followed by GMM exploitation
-            _ => {
+            "gmm" | "auto" => {
                 let exploration_budget = strategy_cfg
                     .and_then(|s| s.exploration_budget)
                     .unwrap_or_else(|| {
@@ -1073,6 +1397,7 @@ impl HolaEngine {
                     )),
                 )
             }
+            _ => unreachable!("strategy type was validated before construction"),
         };
 
         let auto_checkpoint = config.checkpoint.as_ref().map(|c| {
@@ -1081,11 +1406,7 @@ impl HolaEngine {
             ac
         });
 
-        let leaderboard = if count_priority_groups(&config.objectives) > 1 {
-            DynLeaderboard::Vector(Leaderboard::new())
-        } else {
-            DynLeaderboard::Scalar(Leaderboard::new())
-        };
+        let leaderboard = DynLeaderboard::for_objectives(&config.objectives);
 
         Ok(Self {
             space,
@@ -1119,8 +1440,18 @@ impl HolaEngine {
             }
         }
         let params = state.strategy.suggest(&self.space);
-        let id = state.next_pending_id;
-        state.next_pending_id += 1;
+        let mut id = state.next_pending_id.max(state.leaderboard.next_trial_id());
+        while state.pending.contains_key(&id)
+            || state.cancelled.contains(&id)
+            || state.leaderboard.contains_trial_id(id)
+        {
+            id = id
+                .checked_add(1)
+                .ok_or_else(|| "Exhausted trial ID space".to_string())?;
+        }
+        state.next_pending_id = id
+            .checked_add(1)
+            .ok_or_else(|| "Exhausted trial ID space".to_string())?;
         state.pending.insert(id, params.clone());
         Ok(DynTrial {
             trial_id: id,
@@ -1142,23 +1473,33 @@ impl HolaEngine {
             return Err(format!("Trial {trial_id} has been cancelled"));
         }
 
+        if state.leaderboard.contains_trial_id(trial_id) {
+            return Err(format!("Trial {trial_id} has already been completed"));
+        }
+
         let candidate = state
             .pending
             .remove(&trial_id)
             .ok_or_else(|| format!("Unknown trial_id: {trial_id}"))?;
 
-        let (_trial_id, score) =
+        let (stored_trial_id, score) =
             state
                 .leaderboard
-                .push_with_raw(candidate.clone(), raw_metrics, &objectives);
+                .push_with_raw(trial_id, candidate.clone(), raw_metrics, &objectives);
+        if stored_trial_id != trial_id {
+            return Err(format!(
+                "Internal trial ID mismatch: pending trial {trial_id} was stored as {stored_trial_id}"
+            ));
+        }
         state.strategy.update(&candidate, score);
 
         let n_trials = state.leaderboard.len();
-        let completed = state
-            .leaderboard
-            .get_completed(trial_id, &objectives)
-            .ok_or_else(|| format!("Failed to build CompletedTrial for {trial_id}"))?;
+        let leaderboard_snapshot = state.leaderboard.clone();
         drop(state);
+
+        let completed = leaderboard_snapshot
+            .get_completed(stored_trial_id, true, &objectives)
+            .ok_or_else(|| format!("Failed to build CompletedTrial for {stored_trial_id}"))?;
 
         // Auto-refit if configured
         if let Some(ref config) = self.refit_config
@@ -1248,6 +1589,17 @@ impl HolaEngine {
         )
     }
 
+    /// Get a single completed trial by ID with scoring and ranking.
+    pub async fn completed_trial(
+        &self,
+        trial_id: u64,
+        include_infeasible: bool,
+    ) -> Option<CompletedTrial> {
+        let objectives = self.objectives.read().await.clone();
+        let leaderboard_snapshot = self.state.read().await.leaderboard.clone();
+        leaderboard_snapshot.get_completed(trial_id, include_infeasible, &objectives)
+    }
+
     /// Get all trials with scoring and ranking.
     pub async fn trials(&self, sorted_by: &str, include_infeasible: bool) -> Vec<CompletedTrial> {
         let objectives = self.objectives.read().await.clone();
@@ -1315,13 +1667,15 @@ impl HolaEngine {
     /// updated scalarization. If a refittable strategy (e.g., GMM) is configured,
     /// a refit is triggered immediately so the sampling distribution reflects
     /// the new objective weights.
-    pub async fn update_objectives(&self, objectives: Vec<ObjectiveConfig>) {
+    pub async fn update_objectives(&self, objectives: Vec<ObjectiveConfig>) -> Result<(), String> {
+        validate_objectives(&objectives)?;
+
         // Persist the new objectives
         *self.objectives.write().await = objectives.clone();
         // Re-scalarize all historical trials with the new objectives
         let n_trials = {
             let mut state = self.state.write().await;
-            state.leaderboard.rescalarize(&objectives);
+            state.leaderboard.migrate_for_objectives(&objectives);
             state.leaderboard.len()
         };
 
@@ -1346,6 +1700,7 @@ impl HolaEngine {
                 self.state.write().await.strategy = fitted;
             }
         }
+        Ok(())
     }
 
     // =========================================================================
@@ -1364,6 +1719,38 @@ impl HolaEngine {
     /// This is the stable persistence API. Use `save` / `load` for checkpointing.
     pub async fn load(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
         self.load_full_checkpoint(path).await
+    }
+
+    /// Load a checkpoint, preferring full checkpoints and falling back to
+    /// legacy leaderboard-only files.
+    ///
+    /// This is used by CLI config `checkpoint.load_from`, which historically
+    /// accepted leaderboard-only checkpoints. Full checkpoints preserve search
+    /// strategy state; leaderboard-only checkpoints preserve completed trials.
+    pub async fn load_checkpoint_with_fallback(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<CheckpointLoadKind> {
+        let path = path.as_ref();
+        let raw: serde_json::Value = {
+            let file = std::fs::File::open(path)?;
+            let reader = std::io::BufReader::new(file);
+            serde_json::from_reader(reader)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+        };
+
+        let has_strategy_state = raw
+            .get("checkpoint")
+            .unwrap_or(&raw)
+            .get("strategy_state")
+            .is_some();
+        if has_strategy_state {
+            self.load_full_checkpoint(path).await?;
+            Ok(CheckpointLoadKind::Full)
+        } else {
+            self.load_leaderboard_checkpoint(path).await?;
+            Ok(CheckpointLoadKind::Leaderboard)
+        }
     }
 
     // =========================================================================
@@ -1410,7 +1797,9 @@ impl HolaEngine {
             eprintln!("[hola] Loaded leaderboard checkpoint with {n} trials");
             DynLeaderboard::Scalar(cp.leaderboard)
         };
-        self.state.write().await.leaderboard = leaderboard;
+        let mut state = self.state.write().await;
+        state.leaderboard = leaderboard;
+        state.reset_transient_trial_state_after_load();
         Ok(())
     }
 
@@ -1503,6 +1892,7 @@ impl HolaEngine {
             let mut state = self.state.write().await;
             state.leaderboard = DynLeaderboard::Vector(cp.leaderboard);
             state.strategy = cp.strategy_state;
+            state.reset_transient_trial_state_after_load();
             eprintln!("[hola] Loaded full checkpoint with {n_loaded} trials");
         } else {
             let cp: opt_engine::persistence::Checkpoint<serde_json::Value, f64, DynStrategy> =
@@ -1512,6 +1902,7 @@ impl HolaEngine {
             let mut state = self.state.write().await;
             state.leaderboard = DynLeaderboard::Scalar(cp.leaderboard);
             state.strategy = cp.strategy_state;
+            state.reset_transient_trial_state_after_load();
             eprintln!("[hola] Loaded full checkpoint with {n_loaded} trials");
         }
         Ok(())
@@ -1645,7 +2036,7 @@ fn objective_score(val: f64, obj_type: &str, target: Option<f64>, limit: Option<
             (Some(t), Some(l)) => opt_engine::objectives::tlp_score(val, t, l),
             _ => opt_engine::objectives::directed_value(val, true),
         },
-        _ => val,
+        _ => f64::INFINITY,
     }
 }
 

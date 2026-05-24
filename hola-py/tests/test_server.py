@@ -19,13 +19,15 @@ fields, checkpoint save, multi-param space/objectives endpoints, objective
 updates, and Study.connect() ask/tell/top_k/connection-error.
 """
 
+import json
 import os
-import tempfile
+import socket
+import subprocess
 
 import pytest
-from conftest import http_json
+from conftest import _wait_for_server, http_json
 
-from hola_opt import Study
+from hola_opt import Minimize, Real, Space, Study
 
 # ==========================================================================
 # REST API Endpoint Tests
@@ -61,6 +63,8 @@ class TestRestEndpoints:
         assert status == 200
         assert resp["status"] == "ok"
         assert resp["trial_count"] == 1
+        assert resp["trial"]["trial_id"] == trial_id
+        assert isinstance(resp["trial"]["score_vector"], dict)
 
         # Top K (replacement for /api/best)
         status, best = http_json(f"{self.url}/api/top_k?k=1")
@@ -69,6 +73,11 @@ class TestRestEndpoints:
         assert len(best) == 1
         assert best[0]["trial_id"] == trial_id
         assert isinstance(best[0]["score_vector"], dict)
+
+        status, completed = http_json(f"{self.url}/api/trial/{trial_id}?include_infeasible=true")
+        assert status == 200
+        assert completed["trial_id"] == trial_id
+        assert completed["metrics"]["loss"] == 0.42
 
     def test_trials_empty(self):
         status, body = http_json(f"{self.url}/api/trials?sorted_by=index&include_infeasible=true")
@@ -141,16 +150,136 @@ class TestRestEndpoints:
             body={"trial_id": trial["trial_id"], "metrics": {"loss": 0.5}},
         )
 
-        with tempfile.TemporaryDirectory() as td:
-            ckpt_path = os.path.join(td, "test_checkpoint.json")
-            status, body = http_json(
-                f"{self.url}/api/checkpoint/save",
+        status, body = http_json(
+            f"{self.url}/api/checkpoint/save",
+            method="POST",
+            body={"path": "test_checkpoint.json"},
+        )
+        assert status == 200
+        assert body["status"] == "ok"
+        assert body["checkpoint_type"] == "full"
+        assert os.path.exists(body["path"])
+        restored = Study.load(body["path"])
+        assert restored.trial_count() == 1
+
+    def test_checkpoint_save_rejects_absolute_path(self):
+        status, body = http_json(
+            f"{self.url}/api/checkpoint/save",
+            method="POST",
+            body={"path": "/tmp/hola_escape.json"},
+        )
+        assert status == 400
+        assert "relative" in body["error"]
+
+
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def _write_sobol_server_config(tmp_path, *, load_from=None):
+    load_from_line = ""
+    if load_from is not None:
+        load_from_line = f"  load_from: {json.dumps(str(load_from))}\n"
+    config_path = tmp_path / ("loaded.yaml" if load_from else "study.yaml")
+    config_path.write_text(
+        "space:\n"
+        "  x:\n"
+        "    type: real\n"
+        "    min: 0.0\n"
+        "    max: 1.0\n"
+        "objectives:\n"
+        "  - field: loss\n"
+        "    type: minimize\n"
+        "    priority: 1.0\n"
+        "strategy:\n"
+        "  type: sobol\n"
+        "  seed: 123\n"
+        "checkpoint:\n"
+        f"  directory: {json.dumps(str(tmp_path))}\n"
+        "  interval: 50\n"
+        "  max_checkpoints: 5\n"
+        f"{load_from_line}",
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def _start_server(cli_binary, config_path, port):
+    url = f"http://localhost:{port}"
+    proc = subprocess.Popen(
+        [cli_binary, "serve", str(config_path), "--port", str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if not _wait_for_server(url):
+        proc.kill()
+        stderr = proc.stderr.read().decode() if proc.stderr else ""
+        pytest.fail(f"Server failed to start within timeout. stderr: {stderr}")
+    return proc, url
+
+
+def _stop_server(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def test_cli_load_from_rest_full_checkpoint_preserves_sobol_sequence(
+    cli_binary, free_port, tmp_path
+):
+    baseline = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("loss")],
+        strategy="sobol",
+        seed=123,
+    )
+    for _ in range(3):
+        baseline.ask()
+    expected = baseline.ask()
+
+    config_path = _write_sobol_server_config(tmp_path)
+    proc, url = _start_server(cli_binary, config_path, free_port)
+    try:
+        for _ in range(3):
+            status, trial = http_json(f"{url}/api/ask", method="POST")
+            assert status == 200
+            status, _ = http_json(
+                f"{url}/api/tell",
                 method="POST",
-                body={"path": ckpt_path},
+                body={
+                    "trial_id": trial["trial_id"],
+                    "metrics": {"loss": trial["params"]["x"]},
+                },
             )
             assert status == 200
-            assert body["status"] == "ok"
-            assert os.path.exists(ckpt_path)
+
+        status, body = http_json(
+            f"{url}/api/checkpoint/save",
+            method="POST",
+            body={"path": "server-full.json", "description": "server full"},
+        )
+        assert status == 200
+        assert body["checkpoint_type"] == "full"
+        checkpoint_path = body["path"]
+    finally:
+        _stop_server(proc)
+
+    restored = Study.load(checkpoint_path)
+    assert restored.ask().params == expected.params
+
+    loaded_config_path = _write_sobol_server_config(tmp_path, load_from=checkpoint_path)
+    proc, loaded_url = _start_server(cli_binary, loaded_config_path, _free_port())
+    try:
+        status, trial = http_json(f"{loaded_url}/api/ask", method="POST")
+        assert status == 200
+        assert trial["trial_id"] == 3
+        assert trial["params"] == expected.params
+    finally:
+        _stop_server(proc)
 
 
 class TestRestMultiParam:
@@ -210,6 +339,19 @@ class TestRestMultiParam:
         assert status == 200
         assert body["status"] == "ok"
 
+    @pytest.mark.server_config(
+        objectives=[{"field": "loss", "type": "minimize", "priority": 1.0}],
+    )
+    def test_update_objectives_rejects_invalid_type(self, running_server):
+        url = running_server
+        status, body = http_json(
+            f"{url}/api/objectives",
+            method="PATCH",
+            body={"objectives": [{"field": "accuracy", "type": "larger", "priority": 1.0}]},
+        )
+        assert status == 400
+        assert "Objective 'accuracy'" in body["error"]
+
 
 # ==========================================================================
 # Study.connect() Live Integration Tests
@@ -227,7 +369,9 @@ class TestStudyConnect:
         assert t.trial_id == 0
         assert "x" in t.params
 
-        remote.tell(t.trial_id, {"loss": 0.42})
+        completed = remote.tell(t.trial_id, {"loss": 0.42})
+        assert completed.trial_id == t.trial_id
+        assert isinstance(completed.score_vector, dict)
 
         top = remote.top_k(1)
         assert len(top) == 1

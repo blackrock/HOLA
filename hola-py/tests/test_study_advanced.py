@@ -13,7 +13,7 @@
 Advanced Study tests covering error paths, scalarization, convergence,
 concurrency, and best-tracking.
 
-Tests double-tell errors, bad strategy fallback, maximize/minimize
+Tests double-tell errors, config validation, maximize/minimize
 scalarization, TLP feasibility, multi-objective priorities, Sobol
 properties, GMM refit, end-to-end convergence, concurrent ask/tell,
 and monotonic best-tracking.
@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from hola_opt import Categorical, Integer, Maximize, Minimize, Real, Space, Study
+from hola_opt import Categorical, Gmm, Integer, Maximize, Minimize, Real, Space, Study
 
 # ==========================================================================
 # Error Paths
@@ -39,12 +39,35 @@ def test_double_tell_raises(simple_space):
         study.tell(t.trial_id, {"loss": 0.3})
 
 
-def test_bad_strategy_string_defaults_gracefully(simple_space):
-    # Unknown strategy names do not raise; the engine falls back to a default.
-    study = Study(space=simple_space, objectives=[Minimize("loss")], strategy="nonexistent")
-    t = study.ask()
-    study.tell(t.trial_id, {"loss": 0.5})
-    assert study.trial_count() == 1
+def test_bad_strategy_string_raises(simple_space):
+    with pytest.raises(ValueError, match="Unknown strategy type.*nonexistent"):
+        Study(space=simple_space, objectives=[Minimize("loss")], strategy="nonexistent")
+
+
+def test_invalid_space_config_raises_with_parameter_name():
+    with pytest.raises(ValueError, match="scale must be"):
+        Real(0.0, 1.0, scale="log2")
+
+    with pytest.raises(ValueError, match="Parameter 'x'.*min must be less than max"):
+        Study(space=Space(x=Real(1.0, 0.0)), objectives=[Minimize("loss")])
+
+    with pytest.raises(ValueError, match="Parameter 'layers'.*integer min"):
+        Study(space=Space(layers=Integer(5, 1)), objectives=[Minimize("loss")])
+
+    with pytest.raises(ValueError, match="Parameter 'opt'.*choices must not be empty"):
+        Study(space=Space(opt=Categorical([])), objectives=[Minimize("loss")])
+
+    with pytest.raises(ValueError, match="Parameter 'x'.*bounds must be finite"):
+        Study(space=Space(x=Real(float("nan"), 1.0)), objectives=[Minimize("loss")])
+
+
+def test_invalid_objective_config_raises_with_field_name(simple_space):
+    with pytest.raises(ValueError, match="Objective 'loss'.*priority"):
+        Study(space=simple_space, objectives=[Minimize("loss", priority=-1.0)])
+
+    study = Study(space=simple_space, objectives=[Minimize("loss")])
+    with pytest.raises(ValueError, match="Objective 'loss'.*priority"):
+        study.update_objectives([Minimize("loss", priority=float("inf"))])
 
 
 def test_run_zero_trials(simple_space):
@@ -170,6 +193,47 @@ def test_multi_objective_with_priorities():
     assert all(math.isfinite(v) for v in obs.values())
 
 
+def test_update_objectives_migrates_scalar_to_vector_leaderboard():
+    study = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("f1")],
+    )
+    for metrics in [
+        {"f1": 1.0, "f2": 5.0},
+        {"f1": 5.0, "f2": 1.0},
+        {"f1": 3.0, "f2": 3.0},
+        {"f1": 4.0, "f2": 4.0},
+    ]:
+        trial = study.ask()
+        study.tell(trial.trial_id, metrics)
+
+    assert study.pareto_front() == []
+
+    study.update_objectives([Minimize("f1"), Minimize("f2")])
+    front_ids = sorted(trial.trial_id for trial in study.pareto_front())
+    assert front_ids == [0, 1, 2]
+
+
+def test_update_objectives_migrates_vector_to_scalar_leaderboard():
+    study = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("f1"), Minimize("f2")],
+    )
+    for metrics in [
+        {"f1": 10.0, "f2": 0.0},
+        {"f1": 1.0, "f2": 10.0},
+        {"f1": 5.0, "f2": 5.0},
+    ]:
+        trial = study.ask()
+        study.tell(trial.trial_id, metrics)
+
+    assert study.pareto_front() != []
+
+    study.update_objectives([Minimize("f1")])
+    assert study.pareto_front() == []
+    assert study.top_k(1)[0].trial_id == 1
+
+
 # ==========================================================================
 # Sobol Properties
 # ==========================================================================
@@ -214,6 +278,65 @@ def test_gmm_survives_50_trials():
     assert study.trial_count() == 50
     best = study.top_k(1)[0]
     assert best is not None
+
+
+def _assert_same_params(actual, expected):
+    assert actual.keys() == expected.keys()
+    for key in actual:
+        assert actual[key] == pytest.approx(expected[key])
+
+
+def test_gmm_counts_pending_asks_against_exploration_budget():
+    space = Space(x=Real(0.0, 1.0))
+    study = Study(
+        space=space,
+        objectives=[Minimize("loss")],
+        strategy=Gmm(exploration_budget=2),
+        seed=17,
+    )
+    sobol = Study(space=space, objectives=[Minimize("loss")], strategy="sobol", seed=17)
+    gmm = Study(
+        space=space,
+        objectives=[Minimize("loss")],
+        strategy=Gmm(exploration_budget=0),
+        seed=17,
+    )
+
+    trials = [study.ask() for _ in range(4)]
+
+    _assert_same_params(trials[0].params, sobol.ask().params)
+    _assert_same_params(trials[1].params, sobol.ask().params)
+    _assert_same_params(trials[2].params, gmm.ask().params)
+    _assert_same_params(trials[3].params, gmm.ask().params)
+    assert study.trial_count() == 0
+
+
+def test_gmm_save_load_preserves_pending_ask_accounting(tmp_path):
+    space = Space(x=Real(0.0, 1.0))
+    study = Study(
+        space=space,
+        objectives=[Minimize("loss")],
+        strategy=Gmm(exploration_budget=2),
+        seed=17,
+    )
+    for _ in range(3):
+        study.ask()
+
+    path = tmp_path / "auto-pending.json"
+    study.save(str(path))
+    restored = Study.load(str(path))
+
+    gmm = Study(
+        space=space,
+        objectives=[Minimize("loss")],
+        strategy=Gmm(exploration_budget=0),
+        seed=17,
+    )
+    gmm.ask()
+    expected = gmm.ask()
+    resumed = restored.ask()
+
+    _assert_same_params(resumed.params, expected.params)
 
 
 @pytest.mark.slow

@@ -14,5 +14,6 @@ clap = { version = "4", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
+# CLI needs the Tokio main macro, multi-threaded runtime for reqwest, and retry sleeps.
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

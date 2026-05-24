@@ -309,6 +309,26 @@ tr.best-row {
   background: var(--bg-3);
   border-radius: 4px;
 }
+.objective-label {
+  font-size: 0.75rem;
+  color: var(--text-2);
+}
+.obj-priority-value {
+  font-family: var(--mono);
+  color: var(--text-1);
+  min-width: 30px;
+  display: inline-block;
+}
+.obj-group-input {
+  width: 80px;
+  padding: 4px 8px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-0);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+}
 input[type="range"] {
   -webkit-appearance: none;
   width: 120px;

@@ -423,7 +423,8 @@ Study(strategy=Gmm(refit_interval=10, elite_fraction=0.1), ...)
 Gaussian Mixture Model strategy. Uses Sobol exploration followed
 by GMM exploitation. Refits a GMM to the top `elite_fraction`
 (default 25%) of trials every `refit_interval` (default 20)
-completed trials. Uses the
+completed trials. The exploration budget counts issued `ask`
+suggestions, including pending trials. Uses the
 [HOLA algorithm](concepts.md#gmm-strategy).
 
 - Best for larger budgets (50+ trials) where exploration can
@@ -444,7 +445,7 @@ Study(strategy=Gmm(refit_interval=10, elite_fraction=0.1), ...)
 |-----------|------|---------|-------------|
 | `refit_interval` | `int` or `None` | 20 | How often the GMM is refit, in completed trials |
 | `elite_fraction` | `float` or `None` | 0.25 | Fraction of top trials used for refitting. Must be in (0, 1]. |
-| `exploration_budget` | `int` or `None` | auto | Number of Sobol exploration trials before GMM exploitation begins. When omitted, computed automatically from the number of dimensions. |
+| `exploration_budget` | `int` or `None` | auto | Number of issued Sobol exploration suggestions before GMM exploitation begins. Pending asks count against this budget. When omitted, computed automatically from the number of dimensions. |
 
 ### Sobol
 

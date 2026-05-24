@@ -17,6 +17,22 @@ http://localhost:8000
 
 The port is configurable via `hola serve --port <PORT>`.
 
+## Authentication
+
+By default, a local HOLA server does not require authentication.
+When the server is started with `--auth-token <TOKEN>`, all
+write-capable endpoints require this header:
+
+```http
+Authorization: Bearer <TOKEN>
+```
+
+This applies to `POST /api/ask`, `POST /api/tell`,
+`POST /api/cancel`, `PATCH /api/objectives`, and
+`POST /api/checkpoint/save`. Read-only endpoints remain
+available without a token. The CLI requires an auth token when
+binding the server to a non-local host.
+
 ## Error Format
 
 All error responses return a JSON object with an `error`
@@ -89,7 +105,25 @@ Report the result of a trial.
 ```json
 {
   "status": "ok",
-  "trial_count": 1
+  "trial_count": 1,
+  "trial": {
+    "trial_id": 0,
+    "params": {
+      "learning_rate": 0.00316,
+      "num_layers": 5,
+      "optimizer": "adam",
+      "momentum": 0.85
+    },
+    "score_vector": {"loss": 0.42},
+    "scores": {"loss": 0.42},
+    "metrics": {
+      "loss": 0.42,
+      "latency": 120.5
+    },
+    "rank": 0,
+    "pareto_front": 0,
+    "completed_at": 1736935800
+  }
 }
 ```
 
@@ -97,9 +131,13 @@ Report the result of a trial.
 |-------|------|-------------|
 | `status` | string | `"ok"` on success |
 | `trial_count` | integer | Total number of completed trials after this tell |
+| `trial` | object | Newly completed trial created by this `tell` |
 
-**Error (400).** Returned if the trial ID is unknown or has
-already been told.
+The returned `trial.trial_id` matches the `trial_id` in the
+request.
+
+**Error (400).** Returned if the trial ID is unknown, cancelled,
+or has already been told.
 
 ```json
 {"error": "Trial 0 has already been completed"}
@@ -123,7 +161,7 @@ Get the top k trials found so far.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `k` | integer | 1 | Number of top trials to return |
+| `k` | integer | required | Number of top trials to return |
 
 **Response (200)**
 
@@ -243,11 +281,8 @@ Each element in the array has the following fields.
 | `pareto_front` | integer | 0-indexed Pareto front index |
 | `completed_at` | integer | Unix timestamp in seconds |
 
-**Error (400).** Returned for single-group (scalar) studies.
-
-```json
-"pareto_front() is only available for multi-objective studies (objectives with distinct groups)"
-```
+For scalar studies, this endpoint returns an empty array because
+there are no Pareto fronts to report.
 
 **Example**
 
@@ -271,39 +306,32 @@ Get all completed trials.
 **Response (200)**
 
 ```json
-{
-  "trials": [
-    {
-      "trial_id": 0,
-      "params": {"learning_rate": 0.01, "num_layers": 3},
-      "score_vector": {"loss": 0.85},
-      "scores": {"loss": 0.85},
-      "metrics": {"loss": 0.85, "latency": 50.2},
-      "rank": 1,
-      "pareto_front": 0,
-      "completed_at": 1736935800
-    },
-    {
-      "trial_id": 1,
-      "params": {"learning_rate": 0.001, "num_layers": 7},
-      "score_vector": {"loss": 0.42},
-      "scores": {"loss": 0.42},
-      "metrics": {"loss": 0.42, "latency": 120.5},
-      "rank": 0,
-      "pareto_front": 0,
-      "completed_at": 1736935805
-    }
-  ],
-  "total": 2
-}
+[
+  {
+    "trial_id": 0,
+    "params": {"learning_rate": 0.01, "num_layers": 3},
+    "score_vector": {"loss": 0.85},
+    "scores": {"loss": 0.85},
+    "metrics": {"loss": 0.85, "latency": 50.2},
+    "rank": 1,
+    "pareto_front": 0,
+    "completed_at": 1736935800
+  },
+  {
+    "trial_id": 1,
+    "params": {"learning_rate": 0.001, "num_layers": 7},
+    "score_vector": {"loss": 0.42},
+    "scores": {"loss": 0.42},
+    "metrics": {"loss": 0.42, "latency": 120.5},
+    "rank": 0,
+    "pareto_front": 0,
+    "completed_at": 1736935805
+  }
+]
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `trials` | array | All completed trials |
-| `total` | integer | Total number of completed trials |
-
-Each trial in the array has the following fields.
+The response is an array of completed trials. Each trial has the
+following fields.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -320,6 +348,53 @@ Each trial in the array has the following fields.
 
 ```bash
 curl http://localhost:8000/api/trials
+```
+
+---
+
+### GET /api/trial/{trial_id}
+
+Get one completed trial by public trial ID.
+
+**Path parameters**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `trial_id` | integer | Public trial ID returned by `ask` and `tell` |
+
+**Query parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `include_infeasible` | boolean | true | Whether to return infeasible completed trials |
+
+**Response (200)**
+
+```json
+{
+  "trial_id": 17,
+  "params": {"learning_rate": 0.001, "num_layers": 4},
+  "score_vector": {"loss": 0.42},
+  "scores": {"loss": 0.42},
+  "metrics": {"loss": 0.42, "latency": 95.3},
+  "rank": 0,
+  "pareto_front": 0,
+  "completed_at": 1736935800
+}
+```
+
+**Error (404).** Returned if no completed trial exists for the
+given ID, or if the trial is infeasible and `include_infeasible`
+is false.
+
+```json
+{"error": "Trial 17 not found"}
+```
+
+**Example**
+
+```bash
+curl http://localhost:8000/api/trial/17
 ```
 
 ---
@@ -458,20 +533,20 @@ curl http://localhost:8000/api/space
 
 ### POST /api/checkpoint/save
 
-Save the current state as a JSON checkpoint file.
+Save the current server state as a full JSON checkpoint file.
 
 **Request**
 
 ```json
 {
-  "path": "/tmp/checkpoint.json",
+  "path": "checkpoint.json",
   "description": "After 100 trials"
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `path` | string | no | File path for the checkpoint (default: `"checkpoint.json"`) |
+| `path` | string | no | Relative path under the configured checkpoint directory (default: `"checkpoint.json"`) |
 | `description` | string | no | Optional description stored in the checkpoint metadata |
 
 **Response (200)**
@@ -479,9 +554,19 @@ Save the current state as a JSON checkpoint file.
 ```json
 {
   "status": "ok",
-  "path": "/tmp/checkpoint.json",
+  "checkpoint_type": "full",
+  "path": "./checkpoint.json",
   "trials_saved": 100
 }
+```
+
+The saved file includes completed trials, strategy state, and study
+configuration. The returned `path` is the resolved server-side path.
+
+**Error (400)**
+
+```json
+{"error": "Checkpoint path must be relative to the configured checkpoint directory"}
 ```
 
 **Error (500)**
@@ -568,7 +653,21 @@ The dashboard uses this endpoint for live monitoring.
 **TrialCompleted.** Emitted after each successful `tell`.
 
 ```json
-{"type": "TrialCompleted", "trial_id": 42, "score": 0.42}
+{
+  "type": "TrialCompleted",
+  "trial_id": 42,
+  "score": 0.42,
+  "trial": {
+    "trial_id": 42,
+    "params": {"learning_rate": 0.001},
+    "score_vector": {"loss": 0.42},
+    "scores": {"loss": 0.42},
+    "metrics": {"loss": 0.42},
+    "rank": 0,
+    "pareto_front": 0,
+    "completed_at": 1736935800
+  }
+}
 ```
 
 **RefitOccurred.** Emitted when the GMM strategy is refit.
@@ -603,7 +702,7 @@ TRIAL_ID=$(echo "$TRIAL" | jq '.trial_id')
 curl -s -X POST http://localhost:8000/api/tell \
   -H "Content-Type: application/json" \
   -d "{\"trial_id\": $TRIAL_ID, \"metrics\": {\"loss\": 0.42, \"latency\": 120}}"
-# {"status":"ok","trial_count":1}
+# {"status":"ok","trial_count":1,"trial":{"trial_id":0,...}}
 
 # Check the top trial
 curl -s http://localhost:8000/api/top_k?k=1

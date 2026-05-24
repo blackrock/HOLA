@@ -33,6 +33,26 @@ const S = {
 // ============================================================================
 // Connection
 // ============================================================================
+function apiToken() {
+    const urlToken = new URLSearchParams(window.location.search).get('token');
+    if (urlToken) {
+        localStorage.setItem('hola_api_token', urlToken);
+        return urlToken;
+    }
+    return localStorage.getItem('hola_api_token') || '';
+}
+
+function apiFetch(url, options = {}) {
+    const headers = new Headers(options.headers || {});
+    const token = apiToken();
+    if (token) headers.set('Authorization', `Bearer ${token}`);
+    return fetch(url, { ...options, headers });
+}
+
+function clearElement(el) {
+    el.replaceChildren();
+}
+
 async function connectToServer() {
     const url = document.getElementById('server-url').value.trim().replace(/\/+$/, '')
         || 'http://localhost:8000';
@@ -74,14 +94,26 @@ function startSSE() {
     S.sse.onmessage = async (e) => {
         const event = JSON.parse(e.data);
         if (event.type === 'TrialCompleted') {
-            // Re-fetch trials
-            const resp = await fetch(`${S.serverUrl}/api/trials?sorted_by=index&include_infeasible=true`);
-            S.trials = await resp.json();
+            const trial = event.trial || await fetchCompletedTrial(event.trial_id);
+            if (!trial) return;
+            upsertTrial(trial);
             discoverMetrics();
             S.lastTrialTime = Date.now();
             if (S.previewActive) previewObjectives(); else renderAll();
         }
     };
+}
+
+async function fetchCompletedTrial(trialId) {
+    const resp = await fetch(`${S.serverUrl}/api/trial/${trialId}?include_infeasible=true`);
+    if (!resp.ok) return null;
+    return resp.json();
+}
+
+function upsertTrial(trial) {
+    const idx = S.trials.findIndex(t => t.trial_id === trial.trial_id);
+    if (idx >= 0) S.trials[idx] = trial;
+    else S.trials.push(trial);
 }
 
 function loadCheckpointFile(event) {
@@ -253,7 +285,7 @@ function renderConvergence() {
     const h = 280;
 
     // Clear any previous uPlot DOM content so it doesn't accumulate
-    container.innerHTML = '';
+    clearElement(container);
 
     const xs = S.trials.map((_, i) => i);
     // Convert NaN to null so uPlot treats them as gaps instead of broken values
@@ -339,11 +371,11 @@ function renderParetoDropdowns() {
     const allFields = [...S.metricNames];
     const prevX = xSel.value;
     const prevY = ySel.value;
-    xSel.innerHTML = '';
-    ySel.innerHTML = '';
+    clearElement(xSel);
+    clearElement(ySel);
     for (const f of allFields) {
-        xSel.innerHTML += `<option value="${f}" ${f === prevX ? 'selected' : ''}>${f}</option>`;
-        ySel.innerHTML += `<option value="${f}" ${f === prevY ? 'selected' : ''}>${f}</option>`;
+        xSel.add(new Option(f, f, false, f === prevX));
+        ySel.add(new Option(f, f, false, f === prevY));
     }
     if (!prevX && allFields.length >= 2) {
         xSel.value = allFields[0];
@@ -517,13 +549,22 @@ function attachParetoTooltip() {
         }
 
         if (nearest && nearestDist <= 10) {
-            tooltip.innerHTML =
-                `<strong>Trial ${nearest.trial.trial_id}</strong><br>` +
-                `${nearest.xField}: ${fmtCell(nearest.xVal)}<br>` +
-                `${nearest.yField}: ${fmtCell(nearest.yVal)}<br>` +
-                (nearest.onFront
-                    ? '<span style="color:var(--accent-bright)">Pareto front</span>'
-                    : '<span style="color:var(--text-2)">Dominated</span>');
+            clearElement(tooltip);
+
+            const title = document.createElement('strong');
+            title.textContent = `Trial ${fmtCell(nearest.trial.trial_id)}`;
+
+            const xLine = document.createElement('div');
+            xLine.textContent = `${nearest.xField}: ${fmtCell(nearest.xVal)}`;
+
+            const yLine = document.createElement('div');
+            yLine.textContent = `${nearest.yField}: ${fmtCell(nearest.yVal)}`;
+
+            const status = document.createElement('span');
+            status.textContent = nearest.onFront ? 'Pareto front' : 'Dominated';
+            status.style.color = nearest.onFront ? 'var(--accent-bright)' : 'var(--text-2)';
+
+            tooltip.append(title, xLine, yLine, status);
             // Position tooltip near cursor but keep it inside the container
             const container = canvas.parentElement;
             const cw = container.clientWidth;
@@ -682,10 +723,14 @@ function renderTable() {
     // Build columns
     const cols = ['trial_id', 'rank', ...S.paramNames, ...S.metricNames];
 
-    thead.innerHTML = cols.map(c => {
-        const cls = S.sortCol === c ? (S.sortAsc ? 'sorted-asc' : 'sorted-desc') : '';
-        return `<th class="${cls}" onclick="sortTable('${c}')">${c}</th>`;
-    }).join('');
+    clearElement(thead);
+    for (const c of cols) {
+        const th = document.createElement('th');
+        th.textContent = c;
+        if (S.sortCol === c) th.className = S.sortAsc ? 'sorted-asc' : 'sorted-desc';
+        th.addEventListener('click', () => sortTable(c));
+        thead.appendChild(th);
+    }
 
     // Sort trials
     let sorted = [...S.trials];
@@ -697,12 +742,18 @@ function renderTable() {
         });
     }
 
-    tbody.innerHTML = sorted.map(t => {
+    clearElement(tbody);
+    for (const t of sorted) {
         const isBest = t.trial_id === (S.bestIdx >= 0 ? S.trials[S.bestIdx].trial_id : -1);
-        return `<tr class="${isBest ? 'best-row' : ''}">` +
-            cols.map(c => `<td>${fmtCell(getCellValue(t, c))}</td>`).join('') +
-            '</tr>';
-    }).join('');
+        const tr = document.createElement('tr');
+        if (isBest) tr.className = 'best-row';
+        for (const c of cols) {
+            const td = document.createElement('td');
+            td.textContent = fmtCell(getCellValue(t, c));
+            tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+    }
 }
 
 function getCellValue(trial, col) {
@@ -733,33 +784,84 @@ function sortTable(col) {
 // ============================================================================
 function renderObjectives() {
     const container = document.getElementById('objectives-list');
+    clearElement(container);
     if (S.objectives.length === 0) {
-        container.innerHTML = '<div style="color:var(--text-2);font-size:0.82rem;padding:8px 0">No objectives configured</div>';
+        const empty = document.createElement('div');
+        empty.style.color = 'var(--text-2)';
+        empty.style.fontSize = '0.82rem';
+        empty.style.padding = '8px 0';
+        empty.textContent = 'No objectives configured';
+        container.appendChild(empty);
         return;
     }
-    container.innerHTML = S.objectives.map((obj, i) => `
-    <div class="objective-row">
-      <span class="obj-field">${obj.field}</span>
-      <span class="obj-type">${obj.obj_type || obj.type || 'minimize'}</span>
-      <label style="font-size:0.75rem;color:var(--text-2)">Priority
-        <input type="range" min="0" max="5" step="0.1" value="${obj.priority}"
-               onchange="S.objectives[${i}].priority=parseFloat(this.value);this.nextElementSibling.textContent=this.value">
-        <span style="font-family:var(--mono);color:var(--text-1);min-width:30px">${obj.priority}</span>
-      </label>
-      <label style="font-size:0.75rem;color:var(--text-2)">Target
-        <input type="number" value="${obj.target ?? ''}" step="any"
-               onchange="S.objectives[${i}].target=this.value?parseFloat(this.value):null">
-      </label>
-      <label style="font-size:0.75rem;color:var(--text-2)">Limit
-        <input type="number" value="${obj.limit ?? ''}" step="any"
-               onchange="S.objectives[${i}].limit=this.value?parseFloat(this.value):null">
-      </label>
-      <label style="font-size:0.75rem;color:var(--text-2)">Group
-        <input type="text" value="${obj.group ?? ''}" style="width:80px;padding:4px 8px;background:var(--bg-2);border:1px solid var(--border);border-radius:4px;color:var(--text-0);font-family:var(--mono);font-size:0.78rem"
-               onchange="S.objectives[${i}].group=this.value||null">
-      </label>
-    </div>
-  `).join('');
+    S.objectives.forEach((obj, i) => {
+        const row = document.createElement('div');
+        row.className = 'objective-row';
+
+        const field = document.createElement('span');
+        field.className = 'obj-field';
+        field.textContent = obj.field ?? '';
+
+        const type = document.createElement('span');
+        type.className = 'obj-type';
+        type.textContent = obj.obj_type || obj.type || 'minimize';
+
+        const priorityLabel = makeObjectiveLabel('Priority');
+        const priority = document.createElement('input');
+        priority.type = 'range';
+        priority.min = '0';
+        priority.max = '5';
+        priority.step = '0.1';
+        priority.value = obj.priority ?? 1;
+        const priorityValue = document.createElement('span');
+        priorityValue.className = 'obj-priority-value';
+        priorityValue.textContent = priority.value;
+        priority.addEventListener('input', () => {
+            S.objectives[i].priority = parseFloat(priority.value);
+            priorityValue.textContent = priority.value;
+        });
+        priorityLabel.append(priority, priorityValue);
+
+        const targetLabel = makeObjectiveLabel('Target');
+        const target = document.createElement('input');
+        target.type = 'number';
+        target.step = 'any';
+        target.value = obj.target ?? '';
+        target.addEventListener('change', () => {
+            S.objectives[i].target = target.value ? parseFloat(target.value) : null;
+        });
+        targetLabel.appendChild(target);
+
+        const limitLabel = makeObjectiveLabel('Limit');
+        const limit = document.createElement('input');
+        limit.type = 'number';
+        limit.step = 'any';
+        limit.value = obj.limit ?? '';
+        limit.addEventListener('change', () => {
+            S.objectives[i].limit = limit.value ? parseFloat(limit.value) : null;
+        });
+        limitLabel.appendChild(limit);
+
+        const groupLabel = makeObjectiveLabel('Group');
+        const group = document.createElement('input');
+        group.type = 'text';
+        group.className = 'obj-group-input';
+        group.value = obj.group ?? '';
+        group.addEventListener('change', () => {
+            S.objectives[i].group = group.value || null;
+        });
+        groupLabel.appendChild(group);
+
+        row.append(field, type, priorityLabel, targetLabel, limitLabel, groupLabel);
+        container.appendChild(row);
+    });
+}
+
+function makeObjectiveLabel(text) {
+    const label = document.createElement('label');
+    label.className = 'objective-label';
+    label.append(document.createTextNode(text));
+    return label;
 }
 
 // Client-side TLP rescalarization for preview mode.
@@ -813,7 +915,7 @@ async function applyObjectives() {
     if (S.mode !== 'live') return;
     if (!confirm('This will update the server objectives and rescalarize all trials. The server will use these objectives for future sampling. Continue?')) return;
     try {
-        const resp = await fetch(`${S.serverUrl}/api/objectives`, {
+        const resp = await apiFetch(`${S.serverUrl}/api/objectives`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ objectives: S.objectives }),
@@ -837,13 +939,16 @@ async function applyObjectives() {
 async function saveCheckpoint() {
     if (S.mode !== 'live') return;
     try {
-        const resp = await fetch(`${S.serverUrl}/api/checkpoint/save`, {
+        const resp = await apiFetch(`${S.serverUrl}/api/checkpoint/save`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ description: `Dashboard save at ${new Date().toISOString()}` }),
         });
         const data = await resp.json();
-        if (resp.ok) alert(`Checkpoint saved: ${data.path} (${data.trials_saved} trials)`);
+        if (resp.ok) {
+            const kind = data.checkpoint_type ? `${data.checkpoint_type} checkpoint` : 'checkpoint';
+            alert(`Saved ${kind}: ${data.path} (${data.trials_saved} trials)`);
+        }
         else alert('Save failed: ' + (data.error || 'unknown'));
     } catch (e) {
         alert('Save failed: ' + e.message);

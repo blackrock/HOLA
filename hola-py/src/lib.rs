@@ -232,10 +232,10 @@ impl Gmm {
         exploration_budget: Option<usize>,
     ) -> PyResult<Self> {
         if let Some(ef) = elite_fraction
-            && (ef <= 0.0 || ef > 1.0)
+            && (!ef.is_finite() || ef <= 0.0 || ef > 1.0)
         {
             return Err(PyValueError::new_err(
-                "elite_fraction must be between 0.0 (exclusive) and 1.0 (inclusive)",
+                "elite_fraction must be finite and between 0.0 (exclusive) and 1.0 (inclusive)",
             ));
         }
         if let Some(ri) = refit_interval
@@ -426,6 +426,7 @@ enum StudyInner {
     },
     Remote {
         url: String,
+        token: Option<String>,
         client: reqwest::Client,
         runtime: tokio::runtime::Runtime,
     },
@@ -476,6 +477,16 @@ fn extract_objectives(objectives: &Bound<'_, PyList>) -> PyResult<Vec<ObjectiveC
         }
     }
     Ok(obj_configs)
+}
+
+fn with_remote_auth(
+    request: reqwest::RequestBuilder,
+    token: &Option<String>,
+) -> reqwest::RequestBuilder {
+    match token.as_deref() {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
 }
 
 #[pymethods]
@@ -568,13 +579,15 @@ impl Study {
 
     /// Connect to an existing HOLA server.
     #[staticmethod]
-    fn connect(url: &str) -> PyResult<Self> {
+    #[pyo3(signature = (url, token=None))]
+    fn connect(url: &str, token: Option<String>) -> PyResult<Self> {
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| PyValueError::new_err(format!("Failed to create runtime: {e}")))?;
         let client = reqwest::Client::new();
         Ok(Self {
             inner: StudyInner::Remote {
                 url: url.trim_end_matches('/').to_string(),
+                token,
                 client,
                 runtime,
             },
@@ -621,19 +634,24 @@ impl Study {
             }
             StudyInner::Remote {
                 url,
+                token,
                 client,
                 runtime,
             } => {
                 let resp: serde_json::Value = runtime
                     .block_on(async {
-                        client
-                            .post(format!("{url}/api/ask"))
+                        let resp = with_remote_auth(client.post(format!("{url}/api/ask")), token)
                             .send()
                             .await
-                            .map_err(|e| format!("HTTP error: {e}"))?
-                            .json()
-                            .await
-                            .map_err(|e| format!("JSON error: {e}"))
+                            .map_err(|e| format!("HTTP error: {e}"))?;
+                        if !resp.status().is_success() {
+                            let body = resp
+                                .text()
+                                .await
+                                .unwrap_or_else(|_| "unknown error".to_string());
+                            return Err(format!("Server error: {body}"));
+                        }
+                        resp.json().await.map_err(|e| format!("JSON error: {e}"))
                     })
                     .map_err(PyValueError::new_err)?;
 
@@ -670,15 +688,13 @@ impl Study {
             }
             StudyInner::Remote {
                 url,
+                token,
                 client,
                 runtime,
             } => {
-                // Remote tell returns lightweight response, so we tell then
-                // fetch the trial's details via top_k.
-                runtime
+                let trial_json: serde_json::Value = runtime
                     .block_on(async {
-                        let resp = client
-                            .post(format!("{url}/api/tell"))
+                        let resp = with_remote_auth(client.post(format!("{url}/api/tell")), token)
                             .json(&serde_json::json!({
                                 "trial_id": trial_id,
                                 "metrics": raw,
@@ -694,14 +710,27 @@ impl Study {
                                 .unwrap_or_else(|_| "unknown error".to_string());
                             return Err(format!("Server error: {body}"));
                         }
-                        Ok(())
-                    })
-                    .map_err(PyValueError::new_err)?;
+                        let tell_body: serde_json::Value =
+                            resp.json().await.map_err(|e| format!("JSON error: {e}"))?;
+                        if let Some(trial) = tell_body.get("trial") {
+                            return Ok(trial.clone());
+                        }
 
-                // Fetch the trial details from the server
-                let trials_resp: Vec<serde_json::Value> = runtime
-                    .block_on(async {
-                        client
+                        let trial_resp = client
+                            .get(format!(
+                                "{url}/api/trial/{trial_id}?include_infeasible=true"
+                            ))
+                            .send()
+                            .await
+                            .map_err(|e| format!("HTTP error: {e}"))?;
+                        if trial_resp.status().is_success() {
+                            return trial_resp
+                                .json()
+                                .await
+                                .map_err(|e| format!("JSON error: {e}"));
+                        }
+
+                        let trials_resp: Vec<serde_json::Value> = client
                             .get(format!(
                                 "{url}/api/trials?sorted_by=index&include_infeasible=true"
                             ))
@@ -710,22 +739,16 @@ impl Study {
                             .map_err(|e| format!("HTTP error: {e}"))?
                             .json()
                             .await
-                            .map_err(|e| format!("JSON error: {e}"))
+                            .map_err(|e| format!("JSON error: {e}"))?;
+                        trials_resp
+                            .into_iter()
+                            .find(|t| t.get("trial_id").and_then(|v| v.as_u64()) == Some(trial_id))
+                            .ok_or_else(|| format!("Trial {trial_id} not found in server response"))
                     })
                     .map_err(PyValueError::new_err)?;
 
-                // Find the trial we just told
-                let trial_json = trials_resp
-                    .iter()
-                    .find(|t| t.get("trial_id").and_then(|v| v.as_u64()) == Some(trial_id))
-                    .ok_or_else(|| {
-                        PyValueError::new_err(format!(
-                            "Trial {trial_id} not found in server response"
-                        ))
-                    })?;
-
                 let ct: hola_engine::hola_engine::CompletedTrial =
-                    serde_json::from_value(trial_json.clone()).map_err(|e| {
+                    serde_json::from_value(trial_json).map_err(|e| {
                         PyValueError::new_err(format!("Deserialization error: {e}"))
                     })?;
                 rust_to_py_completed(py, &ct)
@@ -741,12 +764,12 @@ impl Study {
                 .map_err(PyValueError::new_err),
             StudyInner::Remote {
                 url,
+                token,
                 client,
                 runtime,
             } => runtime
                 .block_on(async {
-                    let resp = client
-                        .post(format!("{url}/api/cancel"))
+                    let resp = with_remote_auth(client.post(format!("{url}/api/cancel")), token)
                         .json(&serde_json::json!({ "trial_id": trial_id }))
                         .send()
                         .await
@@ -777,6 +800,7 @@ impl Study {
                 url,
                 client,
                 runtime,
+                ..
             } => {
                 let resp: Vec<serde_json::Value> = runtime
                     .block_on(async {
@@ -814,6 +838,7 @@ impl Study {
                 url,
                 client,
                 runtime,
+                ..
             } => {
                 let resp: Vec<serde_json::Value> = runtime
                     .block_on(async {
@@ -851,6 +876,7 @@ impl Study {
                 url,
                 client,
                 runtime,
+                ..
             } => {
                 let resp: Vec<serde_json::Value> = runtime
                     .block_on(async {
@@ -879,6 +905,7 @@ impl Study {
                 url,
                 client,
                 runtime,
+                ..
             } => {
                 let resp: serde_json::Value = runtime
                     .block_on(async {
@@ -906,22 +933,22 @@ impl Study {
     fn update_objectives(&self, objectives: &Bound<'_, PyList>) -> PyResult<()> {
         let obj_configs = extract_objectives(objectives)?;
         match &self.inner {
-            StudyInner::Local { engine, runtime } => {
-                runtime.block_on(engine.update_objectives(obj_configs));
-                Ok(())
-            }
+            StudyInner::Local { engine, runtime } => runtime
+                .block_on(engine.update_objectives(obj_configs))
+                .map_err(PyValueError::new_err),
             StudyInner::Remote {
                 url,
+                token,
                 client,
                 runtime,
             } => runtime
                 .block_on(async {
-                    let resp = client
-                        .patch(format!("{url}/api/objectives"))
-                        .json(&serde_json::json!({ "objectives": obj_configs }))
-                        .send()
-                        .await
-                        .map_err(|e| format!("HTTP error: {e}"))?;
+                    let resp =
+                        with_remote_auth(client.patch(format!("{url}/api/objectives")), token)
+                            .json(&serde_json::json!({ "objectives": obj_configs }))
+                            .send()
+                            .await
+                            .map_err(|e| format!("HTTP error: {e}"))?;
                     if !resp.status().is_success() {
                         let body = resp
                             .text()
