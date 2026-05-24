@@ -483,6 +483,8 @@ impl<D: Clone> Leaderboard<D, f64> {
 // Multi-Objective Ranking (BTreeMap<String, f64> observations)
 // =============================================================================
 
+type ScoredMultiTrial<'a, D> = (&'a Trial<D, BTreeMap<String, f64>>, f64);
+
 impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
     /// Check if a trial is feasible (all objective values are finite).
     ///
@@ -645,7 +647,7 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
             return Vec::new();
         }
 
-        let mut scored: Vec<(&Trial<D, BTreeMap<String, f64>>, f64)> = self
+        let mut scored: Vec<ScoredMultiTrial<'_, D>> = self
             .trials
             .iter()
             .filter(|t| Self::trial_is_feasible(t))
@@ -656,8 +658,7 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
             return Vec::new();
         }
 
-        let compare = |a: &(&Trial<D, BTreeMap<String, f64>>, f64),
-                       b: &(&Trial<D, BTreeMap<String, f64>>, f64)| {
+        let compare = |a: &ScoredMultiTrial<'_, D>, b: &ScoredMultiTrial<'_, D>| {
             a.1.partial_cmp(&b.1)
                 .unwrap_or(Ordering::Equal)
                 .then_with(|| a.0.trial_id.cmp(&b.0.trial_id))

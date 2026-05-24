@@ -1805,7 +1805,7 @@ async fn test_auto_strategy_counts_pending_asks_against_exploration_budget() {
     let sobol = HolaEngine::from_config(sobol_strategy_test_config(17)).unwrap();
     let gmm = HolaEngine::from_config(auto_strategy_test_config(0, 17)).unwrap();
 
-    let auto_trials = vec![
+    let auto_trials = [
         auto.ask().await.unwrap(),
         auto.ask().await.unwrap(),
         auto.ask().await.unwrap(),

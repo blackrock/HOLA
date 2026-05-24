@@ -364,9 +364,7 @@ def test_study_save_load_resume_uses_fresh_vector_trial_id(tmp_path):
         space=Space(x=Real(0.0, 1.0)),
         objectives=[Minimize("f1", priority=1.0), Minimize("f2", priority=2.0)],
     )
-    for expected_id, metrics in enumerate(
-        [{"f1": 1.0, "f2": 3.0}, {"f1": 2.0, "f2": 1.0}]
-    ):
+    for expected_id, metrics in enumerate([{"f1": 1.0, "f2": 3.0}, {"f1": 2.0, "f2": 1.0}]):
         trial = study.ask()
         assert trial.trial_id == expected_id
         completed = study.tell(trial.trial_id, metrics)
