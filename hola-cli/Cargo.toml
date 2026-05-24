@@ -1,6 +1,6 @@
 [package]
 name = "hola-cli"
-version = "1.0.1-rc5"
+version = "1.0.1-rc6"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -9,7 +9,7 @@ name = "hola"
 path = "src/main.rs"
 
 [dependencies]
-hola = { path = "../hola", features = ["server"], version = "1.0.1-rc5" }
+hola = { path = "../hola", features = ["server"], version = "1.0.1-rc6" }
 clap = { version = "4", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"

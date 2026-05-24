@@ -1,6 +1,6 @@
 [package]
 name = "hola"
-version = "1.0.1-rc5"
+version = "1.0.1-rc6"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -9,7 +9,7 @@ default = []
 server = ["axum/http1", "axum/json", "axum/query", "axum/tokio", "tokio/net", "tokio-stream", "tower-http"]
 
 [dependencies]
-opt_engine = { version = "1.0.1-rc5", path = "../opt_engine" }
+opt_engine = { version = "1.0.1-rc6", path = "../opt_engine" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Core engine needs async locks and blocking refit tasks; server adds net support.
@@ -21,7 +21,7 @@ tokio-stream = { version = "0.1", default-features = false, features = ["sync"],
 tower-http = { version = "0.6.8", default-features = false, features = ["cors", "fs"], optional = true }
 
 [dev-dependencies]
-opt_engine = { version = "1.0.1-rc5", path = "../opt_engine" }
+opt_engine = { version = "1.0.1-rc6", path = "../opt_engine" }
 serde_yaml = "0.9"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

@@ -1,6 +1,6 @@
 [package]
 name = "hola-py"
-version = "1.0.1-rc5"
+version = "1.0.1-rc6"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -9,7 +9,7 @@ name = "hola_opt"
 crate-type = ["cdylib"]
 
 [dependencies]
-hola_engine = { package = "hola", version = "1.0.1-rc5", path = "../hola", features = ["server"] }
+hola_engine = { package = "hola", version = "1.0.1-rc6", path = "../hola", features = ["server"] }
 pyo3 = { version = "0.28", features = ["extension-module", "abi3-py310"] }
 serde_json = "1"
 # Python bindings construct Tokio runtimes for local engine calls and remote HTTP.

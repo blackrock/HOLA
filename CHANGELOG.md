@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.0.1-rc6
+
+This release candidate hardens the Rust/Python HOLA 1.0 stack after
+the local audit pass.
+
+### Fixed
+
+- Prevented checkpoint restore from reusing public trial IDs after
+  loading leaderboard-only or full checkpoints.
+- Unified checkpoint save/load behavior so Rust, Python, REST, CLI,
+  and dashboard paths restore completed trials, strategy state, and
+  configuration consistently.
+- Ensured pending and cancelled in-flight trials are cleared
+  deliberately after checkpoint load.
+- Preserved correct leaderboard behavior when objective topology
+  changes between scalar and vector modes.
+- Counted issued AutoStrategy suggestions, including pending asks,
+  against the GMM exploration budget.
+
+### Security and robustness
+
+- Required bearer-token auth for write-capable REST endpoints when
+  configured, and rejected non-local server binds without auth.
+- Removed unsafe dashboard rendering of untrusted HTML-like values.
+- Validated dynamic study configuration before runtime.
+- Removed the orphaned REST API from `opt_engine`; REST serving now
+  lives in `hola`.
+
+### Performance and maintenance
+
+- Reduced leaderboard ranking lock pressure for top-k and Pareto
+  queries.
+- Minimized Tokio feature usage across crates.
+- Updated REST, checkpoint, and strategy documentation to match the
+  new behavior.
+
 ## 1.0.0
 
 This release is a ground-up rewrite. We replaced the original Python
