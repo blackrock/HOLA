@@ -141,7 +141,7 @@ jobs:
           docker-options: ${{ matrix.target == 'aarch64' && runner.os == 'Linux' && '-e CFLAGS_aarch64_unknown_linux_gnu=-D__ARM_ARCH=8' || '' }}
 
       - name: Attest wheel provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: hola-py/dist/*.whl
 
@@ -171,7 +171,7 @@ jobs:
           working-directory: hola-py
 
       - name: Attest sdist provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: hola-py/dist/*.tar.gz
 
