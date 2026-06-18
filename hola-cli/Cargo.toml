@@ -1,16 +1,19 @@
 [package]
 name = "hola-cli"
-version = "1.0.1-rc6"
+version = "1.0.1-rc7"
 edition = "2024"
 license = "Apache-2.0"
+rust-version.workspace = true
 
 [[bin]]
 name = "hola"
 path = "src/main.rs"
 
 [dependencies]
-hola = { path = "../hola", features = ["server"], version = "1.0.1-rc6" }
+hola = { path = "../hola", features = ["server"], version = "1.0.1-rc7" }
 clap = { version = "4", features = ["derive"] }
+# NOTE: serde_yaml is deprecated (0.9.34+deprecated) and unmaintained. Migration
+# to a maintained fork (serde_yaml_ng or serde_yml) is a tracked follow-up.
 serde_yaml = "0.9"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }

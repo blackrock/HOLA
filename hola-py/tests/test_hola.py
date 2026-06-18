@@ -441,6 +441,74 @@ def test_study_run_parallel():
     assert list(top[0].score_vector.values())[0] < 1.0
 
 
+def test_study_run_parallel_integrity():
+    """Parallel run() must evaluate every trial exactly once, with no drops,
+    duplicates, or mismatched score<->params pairings.
+
+    The existing parallel smoke test only checks trial_count()==n and best<1.0,
+    which would still pass if the executor silently dropped some evaluations and
+    re-ran others, or if a result were recorded against the wrong trial's params.
+    Here the objective records each invocation's params (under a lock, since it
+    runs on several worker threads) and we cross-check the engine's record of
+    completed trials against those invocations:
+
+      * the objective is invoked EXACTLY n_trials times (no drops/duplicates);
+      * the completed trial ids are distinct and number exactly n_trials;
+      * every completed trial's stored score equals the objective recomputed
+        from that same trial's params (no params/score crossing).
+    """
+    import threading
+
+    from hola_opt import Minimize, Real, Space, Study
+
+    n_trials = 20
+    n_workers = 4
+
+    study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
+
+    lock = threading.Lock()
+    recorded_calls: list[dict] = []
+
+    def score_of(x: float) -> float:
+        # Deterministic function of the params alone, so a completed trial's
+        # score can be recomputed solely from its recorded params.
+        return x**2
+
+    def objective(params):
+        with lock:
+            recorded_calls.append(dict(params))
+        return {"loss": score_of(params["x"])}
+
+    study.run(objective, n_trials=n_trials, n_workers=n_workers)
+
+    # The objective fired exactly once per trial: no dropped or duplicated work.
+    assert len(recorded_calls) == n_trials
+
+    completed = study.trials()
+    assert len(completed) == n_trials
+
+    # Completed trial ids are distinct and exactly n_trials of them.
+    ids = [t.trial_id for t in completed]
+    assert len(set(ids)) == n_trials
+
+    # Every stored score matches the objective recomputed from that trial's own
+    # params, proving no params/score pair was crossed between trials.
+    for t in completed:
+        expected = score_of(t.params["x"])
+        actual = list(t.score_vector.values())[0]
+        assert actual == pytest.approx(expected, rel=0, abs=1e-12), (
+            f"trial {t.trial_id}: stored score {actual} != "
+            f"recomputed {expected} from params {t.params}"
+        )
+
+    # The multiset of x-values the objective saw matches the multiset stored on
+    # the completed trials: every evaluation landed on exactly one trial and no
+    # trial carries a value the objective never produced.
+    seen_x = sorted(c["x"] for c in recorded_calls)
+    stored_x = sorted(t.params["x"] for t in completed)
+    assert seen_x == pytest.approx(stored_x, rel=0, abs=0.0)
+
+
 def test_study_run_parallel_default_workers():
     from hola_opt import Minimize, Real, Space, Study
 
@@ -458,6 +526,124 @@ def test_study_run_sequential_explicit():
 
     study.run(lambda p: {"loss": p["x"]}, n_trials=10, n_workers=1)
     assert study.trial_count() == 10
+
+
+# ==========================================================================
+# 9b. Study.run() orphan cancellation on objective failure
+# ==========================================================================
+
+
+def test_study_run_failure_cancels_orphan_trial_sequential():
+    """Sequential run() that fails midway must cancel its pending trial.
+
+    A trial is asked for before the objective runs; if the objective raises,
+    run() must cancel that trial so it does not linger in the engine's pending
+    set. We verify both that the failed trial_id is no longer tellable (it was
+    cancelled, not orphaned) and that the engine recovers cleanly.
+    """
+    from hola_opt import Minimize, Real, Space, Study
+
+    study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
+
+    calls = {"n": 0}
+
+    def flaky_objective(params):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("boom")
+        return {"loss": params["x"]}
+
+    with pytest.raises(RuntimeError, match="boom"):
+        study.run(flaky_objective, n_trials=5)
+
+    # First trial completed; the second was asked then cancelled on failure.
+    assert study.trial_count() == 1
+
+    # Trials are asked with monotonic ids in the sequential path, so the failed
+    # trial's id is the completed count at the moment it was asked. It was
+    # cancelled, so telling it now must raise rather than succeed.
+    failed_trial_id = 1
+    with pytest.raises(ValueError):
+        study.tell(failed_trial_id, {"loss": 0.5})
+
+    # Engine is not wedged: a fresh successful run completes fully.
+    study.run(lambda p: {"loss": p["x"]}, n_trials=3)
+    assert study.trial_count() == 4
+
+
+def test_study_run_failure_cancels_orphan_trials_parallel():
+    """Parallel run() that fails midway must cancel outstanding trials.
+
+    With multiple workers a whole batch of trials is asked for (and thus
+    pending in the engine) before any result is told. If the objective raises,
+    run() must cancel every still-outstanding trial; otherwise they linger in
+    the engine's pending set and keep consuming the exploration budget, since
+    ask() gates new trials on completed + pending against max_trials.
+
+    Outstanding ids are not individually observable, so we make the leak
+    observable through the budget. The study is created with a tight
+    max_trials equal to the worker batch size, so the failing run asks the
+    entire budget at once. With the orphans cancelled the freed budget lets a
+    subsequent clean run complete; if the cancel loop is reverted the leaked
+    pending trials keep the budget exhausted and the clean run's first ask
+    fails. trial_count() (completed only) is identical in both cases, so the
+    discriminating signal is whether the clean run completes at all.
+    """
+    from hola_opt import Minimize, Real, Space, Study
+
+    workers = 4
+    study = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("loss")],
+        max_trials=workers,
+    )
+
+    calls = {"n": 0}
+
+    def flaky_objective(params):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("boom")
+        return {"loss": params["x"]}
+
+    # The first batch asks for all `workers` trials at once (the whole budget),
+    # then one of them raises while collecting results.
+    with pytest.raises(RuntimeError, match="boom"):
+        study.run(flaky_objective, n_trials=8, n_workers=workers)
+
+    count_after_failure = study.trial_count()
+    # At least one trial in the batch raised and was never told, so the budget
+    # is not fully accounted for by completed trials.
+    assert count_after_failure < workers
+
+    # Budget freed by cancelling the orphaned pending trials. If they were left
+    # pending instead, the budget would stay at `workers` and the clean run
+    # below could not ask a single trial.
+    remaining = workers - count_after_failure
+
+    # The freed budget lets this run complete fully; leaked pending trials would
+    # keep max_trials exhausted and the first ask() of this run would raise.
+    study.run(lambda p: {"loss": p["x"]}, n_trials=remaining, n_workers=workers)
+    assert study.trial_count() == count_after_failure + remaining
+    assert study.trial_count() == workers
+
+
+def test_study_run_bad_return_cancels_orphan_trial():
+    """A non-dict objective return must also cancel the pending trial."""
+    from hola_opt import Minimize, Real, Space, Study
+
+    study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
+
+    with pytest.raises(ValueError, match="dict"):
+        study.run(lambda p: 42, n_trials=1)
+
+    # The single asked trial was cancelled, not left pending.
+    with pytest.raises(ValueError):
+        study.tell(0, {"loss": 0.5})
+
+    # Engine recovers cleanly.
+    study.run(lambda p: {"loss": p["x"]}, n_trials=3)
+    assert study.trial_count() == 3
 
 
 # ==========================================================================
@@ -567,3 +753,175 @@ def test_trials_returns_all():
         assert hasattr(trial, "trial_id")
         assert isinstance(trial.params, dict)
         assert isinstance(trial.score_vector, dict)
+
+
+# ==========================================================================
+# Bounded leaderboard
+# ==========================================================================
+
+
+def test_max_leaderboard_size_caps_retained_trials():
+    """A Study built with max_leaderboard_size retains at most that many trials.
+
+    Discriminates the opt-in cap from the default (unbounded) behavior: both
+    studies run the same number of trials, but only the bounded one evicts. If
+    max_leaderboard_size were not threaded into StudyConfig (i.e. left as None),
+    the bounded study would also retain every trial and this test would fail.
+    """
+    from hola_opt import Minimize, Real, Space, Study
+
+    cap = 5
+    n = 20
+
+    bounded = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("loss")],
+        seed=0,
+        max_leaderboard_size=cap,
+    )
+    unbounded = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("loss")],
+        seed=0,
+    )
+
+    for study in (bounded, unbounded):
+        for i in range(n):
+            trial = study.ask()
+            # Strictly improving losses so the just-told trial is never the
+            # eviction victim and tell() always succeeds.
+            study.tell(trial.trial_id, {"loss": float(n - i)})
+
+    assert bounded.trial_count() == cap
+    assert unbounded.trial_count() == n
+
+
+def test_max_leaderboard_size_rejects_zero():
+    """max_leaderboard_size must be >= 1; zero is rejected at construction."""
+    from hola_opt import Minimize, Real, Space, Study
+
+    with pytest.raises(ValueError, match="at least 1"):
+        Study(
+            space=Space(x=Real(0.0, 1.0)),
+            objectives=[Minimize("loss")],
+            max_leaderboard_size=0,
+        )
+
+
+# ==========================================================================
+# 12. GIL release: concurrent ask/tell from multiple Python threads
+# ==========================================================================
+
+
+def test_concurrent_ask_tell_no_deadlock_correct_count():
+    """Drive ask/tell from several Python threads against one local Study.
+
+    This verifies NO-DEADLOCK and CORRECT ACCOUNTING under concurrent access:
+    many threads must make progress without deadlocking, and every successful
+    tell must be reflected in the trial count. It does not by itself prove GIL
+    release (the engine's accounting is lock-protected in Rust, so the count
+    would be correct even without py.detach); GIL release for the engine path
+    is verified by inspection, and for the foreground server by
+    test_foreground_serve_releases_gil. No wall-clock timing is asserted (that
+    would be flaky); the test only checks for liveness and correct accounting.
+    """
+    import threading
+
+    from hola_opt import Minimize, Real, Space, Study
+
+    study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
+
+    n_threads = 8
+    per_thread = 25
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+
+    def worker() -> None:
+        try:
+            for _ in range(per_thread):
+                trial = study.ask()
+                study.tell(trial.trial_id, {"loss": trial.params["x"] ** 2})
+        except BaseException as exc:  # noqa: BLE001 - record for the main thread
+            with errors_lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    # A generous join timeout turns a deadlock into a test failure rather
+    # than a hung suite.
+    for t in threads:
+        t.join(timeout=60)
+
+    assert not any(t.is_alive() for t in threads), "threads did not finish (possible deadlock)"
+    assert not errors, f"worker threads raised: {errors!r}"
+    assert study.trial_count() == n_threads * per_thread
+
+    # Other GIL-releasing readers still return coherent results afterwards.
+    assert len(study.top_k(5)) == 5
+    assert len(study.trials()) == n_threads * per_thread
+
+
+def test_foreground_serve_releases_gil(free_port):
+    """Foreground serve() must release the GIL for the server's lifetime.
+
+    serve(background=False) blocks the calling thread on the running server.
+    Without py.detach the GIL is held for the whole server lifetime, freezing
+    every other Python thread. Here the foreground server runs on a background
+    daemon thread while the MAIN thread does ordinary Python work (ask/tell on
+    a SEPARATE local Study), which must run concurrently rather than block on
+    the GIL held by serve().
+
+    A C-level faulthandler watchdog ensures the test can never hang the suite:
+    a GIL-holding regression would freeze every Python thread (so a Python-level
+    timeout could never fire), but faulthandler runs in C and hard-exits the
+    process, turning a regression into a loud failure rather than an infinite hang.
+    """
+    import contextlib
+    import faulthandler
+    import threading
+    import time
+
+    from hola_opt import Minimize, Real, Space, Study
+
+    # Hard-exit the process if anything below wedges the interpreter for 45s.
+    faulthandler.dump_traceback_later(45, exit=True)
+
+    server_study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
+
+    def run_server():
+        # Blocks until the process exits; the daemon thread is reaped at exit.
+        with contextlib.suppress(Exception):
+            server_study.serve(port=free_port, background=False)
+
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+
+    # Give the server a moment to take the runtime; if the GIL were held this
+    # sleep itself could be delayed, but the discriminating check is below.
+    time.sleep(0.2)
+
+    # The key property: the main thread can run Python while the foreground
+    # server is up. Drive ask/tell on a separate local Study within a generous
+    # bound; if serve() held the GIL this would block.
+    local = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
+
+    done = threading.Event()
+
+    def main_work():
+        for _ in range(20):
+            t = local.ask()
+            local.tell(t.trial_id, {"loss": t.params["x"] ** 2})
+        done.set()
+
+    worker = threading.Thread(target=main_work)
+    worker.start()
+    worker.join(timeout=30)
+
+    # join() returned, so the interpreter is no longer at risk of wedging;
+    # disarm the watchdog before asserting (a plain assertion failure must not
+    # leave it armed to hard-exit the suite later).
+    faulthandler.cancel_dump_traceback_later()
+
+    assert done.is_set(), "main-thread Python work did not progress (GIL held by serve())"
+    assert local.trial_count() == 20

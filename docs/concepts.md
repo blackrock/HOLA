@@ -26,10 +26,11 @@ sequenceDiagram
 ## Architecture
 
 We organize HOLA into three layers. The **engine core** is a Rust
-optimization library that handles spaces, strategies, transformers,
-and the leaderboard. The **orchestration layer** wraps the engine
-core behind a JSON-based interface so that spaces and strategies
-can be resolved at runtime from configuration. The **public
+optimization library that handles spaces, strategies, scales, and
+the leaderboard. The **orchestration layer** wraps the engine
+core behind a JSON-based interface, resolving spaces and strategies
+at runtime from configuration and scalarizing metrics against the
+study objectives. The **public
 interfaces** (Python bindings, CLI, and REST server) all delegate
 to the orchestration layer, so users never interact with Rust
 internals directly.
@@ -51,8 +52,8 @@ evaluate (your code)
   └─ Returns JSON metrics dict (e.g., {"loss": 0.42, "latency": 120})
 
 tell()
-  ├─ Transformer validates metrics against objective schema
-  ├─ Transformer scalarizes metrics → single observation (f64)
+  ├─ Engine validates metrics against the objective schema
+  ├─ Engine scalarizes metrics → single observation (f64)
   ├─ Leaderboard stores the trial (params, score_vector, metrics, timestamp)
   └─ Strategy updates its model from the new observation
 ```
@@ -151,7 +152,7 @@ you define objectives.
 
 ### Single Field
 
-With `Minimize("loss")`, the score is simply the value of the
+With `Minimize("loss")`, the score is the value of the
 `"loss"` field. With `Maximize("accuracy")`, we negate the value
 since the engine always minimizes internally.
 
@@ -186,7 +187,10 @@ $$
 
 For **minimize** objectives, $t < l$ (e.g., loss target = 0.01,
 limit = 1.0). For **maximize** objectives, $t > l$ (e.g.,
-accuracy target = 0.95, limit = 0.5).
+accuracy target = 0.95, limit = 0.5). The declared objective `type` and
+this ordering must agree: a configuration whose ordering contradicts its
+`type` (for example `type: maximize` with `target < limit`) is rejected
+at validation rather than silently optimized in the wrong direction.
 
 The final score is the sum of all field contributions
 

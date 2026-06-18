@@ -26,7 +26,7 @@ import math
 
 def _extract_vec(p: dict[str, float]) -> list[float]:
     """Extract ordered vector from dict with keys x0, x1, ... or x, x1, x2, ..."""
-    keys = sorted(k for k in p if k.startswith("x"))
+    keys = sorted((k for k in p if k.startswith("x")), key=lambda k: int(k[1:]))
     return [p[k] for k in keys]
 
 

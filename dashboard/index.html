@@ -17,6 +17,8 @@ limitations under the License.
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src *; base-uri 'self'; object-src 'none'; form-action 'none'">
   <title>HOLA dashboard</title>
   <meta name="description" content="Real-time optimization dashboard for HOLA">
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -24,8 +26,12 @@ limitations under the License.
   <link
     href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
     rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"
+    integrity="sha384-XMP23k7YSCFr13Xrkxh4IO0v1W+8fB6AP+3Vycxphp2Z0V2vocAZHyuGaFCysrtM"
+    crossorigin="anonymous"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css"
+    integrity="sha384-IfV0B7MIOYuO95kO9G5ySKPz/85zqFNOAs8iy4tkK5zd9izhJAB8b7lHrwYqqmYE"
+    crossorigin="anonymous">
   <link rel="stylesheet" href="styles.css">
 </head>
 
@@ -54,9 +60,11 @@ limitations under the License.
       <div style="flex:1"></div>
       <div id="connect-panel">
         <input type="text" id="server-url" placeholder="http://localhost:8000" />
-        <button id="btn-connect" onclick="connectToServer()">Connect</button>
-        <button class="secondary" onclick="document.getElementById('file-input').click()">Load File</button>
-        <input type="file" id="file-input" accept=".json" onchange="loadCheckpointFile(event)" />
+        <input type="password" id="api-token" placeholder="API token (optional)" autocomplete="off" />
+        <button id="btn-clear-token" class="secondary" title="Forget the in-memory API token">Clear token</button>
+        <button id="btn-connect">Connect</button>
+        <button class="secondary" data-action="open-file">Load File</button>
+        <input type="file" id="file-input" accept=".json" />
       </div>
     </div>
 
@@ -67,8 +75,8 @@ limitations under the License.
       <p>Connect to a running HOLA server to view live optimization progress, or load a checkpoint file for offline
         analysis.</p>
       <div class="actions">
-        <button onclick="connectToServer()">Connect to Server</button>
-        <button class="secondary" onclick="document.getElementById('file-input').click()">Load Checkpoint</button>
+        <button data-action="connect">Connect to Server</button>
+        <button class="secondary" data-action="open-file">Load Checkpoint</button>
       </div>
     </div>
 
@@ -91,7 +99,8 @@ limitations under the License.
             <label>Y <select id="pareto-y"></select></label>
           </div>
           <div style="position:relative">
-            <canvas id="pareto-canvas" width="600" height="280"></canvas>
+            <canvas id="pareto-canvas" width="600" height="280" role="img"
+                    aria-label="Pareto front scatter chart; full trial data is available in the trials table below."></canvas>
             <div id="pareto-tooltip"></div>
           </div>
         </div>
@@ -102,7 +111,8 @@ limitations under the License.
         <div class="card-header">
           <span class="card-title">Parallel Coordinates</span>
         </div>
-        <canvas id="parallel-canvas" width="1200" height="200"></canvas>
+        <canvas id="parallel-canvas" width="1200" height="200" role="img"
+                aria-label="Parallel coordinates chart of trial parameters; full trial data is available in the trials table below."></canvas>
       </div>
 
       <!-- Trial Table -->
@@ -127,9 +137,9 @@ limitations under the License.
           <div class="card-header">
             <span class="card-title">Objectives</span>
             <div style="display:flex;gap:6px;align-items:center">
-              <button onclick="previewObjectives()">Preview</button>
-              <button class="secondary" onclick="resetObjectives()">Reset</button>
-              <button id="btn-apply-obj" onclick="applyObjectives()" disabled>Apply to server</button>
+              <button id="btn-preview-obj">Preview</button>
+              <button class="secondary" id="btn-reset-obj">Reset</button>
+              <button id="btn-apply-obj" disabled>Apply to server</button>
               <span id="preview-badge" style="display:none;font-size:0.7rem;padding:2px 8px;background:var(--orange);color:var(--bg-0);border-radius:4px;font-weight:600">PREVIEW</span>
             </div>
           </div>
@@ -145,9 +155,9 @@ limitations under the License.
             <span class="card-title">Checkpoints</span>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-            <button class="secondary" onclick="document.getElementById('file-input').click()">Open checkpoint</button>
-            <button class="secondary" id="btn-save-ckpt" onclick="saveCheckpoint()" disabled>Save server state</button>
-            <button class="secondary" onclick="exportData()">Download trials</button>
+            <button class="secondary" data-action="open-file">Open checkpoint</button>
+            <button class="secondary" id="btn-save-ckpt" disabled>Save server state</button>
+            <button class="secondary" id="btn-export">Download trials</button>
           </div>
           <p style="font-size:0.78rem;color:var(--text-2)">
             <b>Save server state</b> writes a full checkpoint (trials + strategy) to disk on the server.

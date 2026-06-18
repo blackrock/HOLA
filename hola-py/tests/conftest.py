@@ -57,12 +57,22 @@ def multi_param_space():
 # ==========================================================================
 
 
-@pytest.fixture
-def free_port():
-    """Return an available TCP port."""
+def _allocate_free_port():
+    """Return a likely-available TCP port.
+
+    There is an inherent TOCTOU race: the port may be claimed by another
+    process between this call and the subsequent bind. Callers that launch a
+    server should retry on an address-in-use failure.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
+
+
+@pytest.fixture
+def free_port():
+    """Return an available TCP port."""
+    return _allocate_free_port()
 
 
 @pytest.fixture(scope="session")
@@ -210,19 +220,35 @@ def running_server(cli_binary, free_port, tmp_path, request):
     config_kwargs = marker.kwargs if marker else {}
 
     config_path = write_yaml_config(tmp_path, **config_kwargs)
+
+    # free_port has an inherent TOCTOU race: the port can be claimed between
+    # allocation and the server's bind. Retry a few times with a fresh port
+    # when startup fails (e.g. address already in use).
+    attempts = 5
+    proc = None
+    url = None
+    last_stderr = ""
     port = free_port
-    url = f"http://localhost:{port}"
+    for attempt in range(attempts):
+        url = f"http://localhost:{port}"
+        proc = subprocess.Popen(
+            [cli_binary, "serve", str(config_path), "--port", str(port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
-    proc = subprocess.Popen(
-        [cli_binary, "serve", str(config_path), "--port", str(port)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+        if _wait_for_server(url):
+            break
 
-    if not _wait_for_server(url):
         proc.kill()
-        stderr = proc.stderr.read().decode() if proc.stderr else ""
-        pytest.fail(f"Server failed to start within timeout. stderr: {stderr}")
+        proc.wait(timeout=5)
+        last_stderr = proc.stderr.read().decode() if proc.stderr else ""
+        proc = None
+        if attempt < attempts - 1:
+            port = _allocate_free_port()
+
+    if proc is None:
+        pytest.fail(f"Server failed to start within timeout. stderr: {last_stderr}")
 
     yield url
 

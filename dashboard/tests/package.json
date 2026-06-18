@@ -1,0 +1,13 @@
+{
+  "name": "hola-dashboard-tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DOM-rendering XSS regression tests for the HOLA dashboard.",
+  "scripts": {
+    "test": "node xss_dom.test.mjs"
+  },
+  "dependencies": {
+    "jsdom": "^24.1.0"
+  }
+}

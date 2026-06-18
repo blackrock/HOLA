@@ -102,6 +102,7 @@ async fn test_e2e_checkpoint_resume_continues() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     // Phase 1: run 50 trials

@@ -1,3 +1,8 @@
 [advisories]
-# paste is a transitive dep via simba -> nalgebra; waiting on upstream to switch to pastey
+# RUSTSEC-2024-0436: `paste` is unmaintained. Rationale: it is only a transitive
+# build-time proc-macro dep pulled in via nalgebra -> simba -> paste; it is not
+# reachable at runtime and there is no available patched version. We cannot drop
+# it until nalgebra/simba migrate to the maintained `pastey` fork.
+# Review-by: 2026-09-01 (re-check whether nalgebra/simba have migrated; drop this
+# ignore once they do).
 ignore = ["RUSTSEC-2024-0436"]

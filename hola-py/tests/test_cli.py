@@ -262,3 +262,101 @@ def test_worker_receives_params_env(cli_binary, tmp_path):
     finally:
         server.terminate()
         server.wait(timeout=5)
+
+
+def test_worker_exec_failure_cancels_not_reports(cli_binary, tmp_path):
+    """A non-zero exit must cancel the trial, not POST a fake result.
+
+    A failing command cancels the trial rather than reporting a synthetic
+    metrics object that would scalarize to an infeasible (but completed)
+    trial, so no trials are ever marked completed.
+    """
+    port = _find_free_port()
+    config_path = write_yaml_config(tmp_path)
+    url = f"http://localhost:{port}"
+
+    server = subprocess.Popen(
+        [cli_binary, "serve", str(config_path), "--port", str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert _wait_for_server(url), "Server did not start"
+
+        # Command always exits non-zero and writes to stderr.
+        worker = subprocess.Popen(
+            [
+                cli_binary,
+                "worker",
+                "--server",
+                url,
+                "--mode",
+                "exec",
+                "--exec",
+                "echo boom >&2; exit 1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            # Give the worker time to pull and fail several trials.
+            time.sleep(5)
+            _, body = http_json(f"{url}/api/trial_count")
+            assert body["trial_count"] == 0, (
+                "Failing exec command should cancel trials, "
+                f"but {body['trial_count']} were completed"
+            )
+            _, trials = http_json(f"{url}/api/trials?sorted_by=index&include_infeasible=true")
+            assert trials == [], (
+                "Failing exec command must not report any (even infeasible) "
+                f"trial results, got {trials}"
+            )
+        finally:
+            worker.kill()
+            worker.wait(timeout=5)
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+
+
+def test_worker_exec_invalid_json_cancels(cli_binary, tmp_path):
+    """A zero-exit command with non-JSON stdout must cancel, not report."""
+    port = _find_free_port()
+    config_path = write_yaml_config(tmp_path)
+    url = f"http://localhost:{port}"
+
+    server = subprocess.Popen(
+        [cli_binary, "serve", str(config_path), "--port", str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert _wait_for_server(url), "Server did not start"
+
+        worker = subprocess.Popen(
+            [
+                cli_binary,
+                "worker",
+                "--server",
+                url,
+                "--mode",
+                "exec",
+                "--exec",
+                "echo not-json-at-all",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            time.sleep(5)
+            _, body = http_json(f"{url}/api/trial_count")
+            assert body["trial_count"] == 0, (
+                "Invalid-JSON exec output should cancel trials, "
+                f"but {body['trial_count']} were completed"
+            )
+        finally:
+            worker.kill()
+            worker.wait(timeout=5)
+    finally:
+        server.terminate()
+        server.wait(timeout=5)

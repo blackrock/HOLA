@@ -46,6 +46,7 @@ fn minimal_config() -> StudyConfig {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     }
 }
 
@@ -77,6 +78,7 @@ fn sobol_config(seed: u64) -> StudyConfig {
         }),
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     }
 }
 
@@ -113,6 +115,7 @@ fn multi_param_config() -> StudyConfig {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     }
 }
 
@@ -173,7 +176,7 @@ async fn options_request(
 #[tokio::test]
 async fn test_server_ask_endpoint() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     let req = hyper::Request::builder()
         .method("POST")
@@ -192,7 +195,7 @@ async fn test_server_ask_endpoint() {
 #[tokio::test]
 async fn test_server_ask_tell_top_k_flow() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     // Ask
     let (_, trial) = json_request(app.clone(), "POST", "/api/ask", None).await;
@@ -252,7 +255,7 @@ async fn test_server_ask_tell_top_k_flow() {
 #[tokio::test]
 async fn test_server_top_k_empty() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     let (status, top) =
         json_request(app, "GET", "/api/top_k?k=1&include_infeasible=false", None).await;
@@ -263,7 +266,7 @@ async fn test_server_top_k_empty() {
 #[tokio::test]
 async fn test_server_trial_count() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     let (status, body) = json_request(app, "GET", "/api/trial_count", None).await;
     assert_eq!(status, 200);
@@ -279,7 +282,7 @@ async fn test_server_auth_rejects_missing_and_invalid_bearer() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
     let mut options = ServerOptions::new(8000);
     options.auth_token = Some("secret".to_string());
-    let app = create_router_with_options(engine, options);
+    let app = create_router_with_options(engine, options).unwrap();
 
     let (status, body) = json_request(app.clone(), "POST", "/api/ask", None).await;
     assert_eq!(status, 401);
@@ -325,7 +328,7 @@ async fn test_server_auth_accepts_valid_bearer_for_mutations() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
     let mut options = ServerOptions::new(8000);
     options.auth_token = Some("secret".to_string());
-    let app = create_router_with_options(engine, options);
+    let app = create_router_with_options(engine, options).unwrap();
 
     let (status, trial) = json_request_with_headers(
         app.clone(),
@@ -351,11 +354,96 @@ async fn test_server_auth_accepts_valid_bearer_for_mutations() {
 }
 
 #[tokio::test]
+async fn test_server_reads_open_by_default_with_token() {
+    // Default (read auth off): read endpoints stay open even when a write token
+    // is configured.
+    let engine = HolaEngine::from_config(minimal_config()).unwrap();
+    let mut options = ServerOptions::new(8000);
+    options.auth_token = Some("secret".to_string());
+    let app = create_router_with_options(engine, options).unwrap();
+
+    let (status, _) = json_request(app.clone(), "GET", "/api/trial_count", None).await;
+    assert_eq!(
+        status, 200,
+        "reads must remain open without --require-read-auth"
+    );
+
+    // SSE stream is open too. Check the initial response status only; the body
+    // is a long-lived stream, so don't consume it.
+    let req = hyper::Request::builder()
+        .method("GET")
+        .uri("/api/events")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "SSE must remain open without --require-read-auth"
+    );
+}
+
+#[tokio::test]
+async fn test_server_read_auth_opt_in_gates_reads_and_sse() {
+    // With read auth enabled, read endpoints and the SSE stream require the
+    // bearer token, while remaining accessible with it.
+    let engine = HolaEngine::from_config(minimal_config()).unwrap();
+    let mut options = ServerOptions::new(8000);
+    options.auth_token = Some("secret".to_string());
+    options.require_read_auth = true;
+    let app = create_router_with_options(engine, options).unwrap();
+
+    let (status, _) = json_request(app.clone(), "GET", "/api/trial_count", None).await;
+    assert_eq!(
+        status, 401,
+        "read endpoint must reject a missing token when read-auth is on"
+    );
+
+    let (status, _) = json_request_with_headers(
+        app.clone(),
+        "GET",
+        "/api/trial_count",
+        None,
+        &[("authorization", "Bearer secret")],
+    )
+    .await;
+    assert_eq!(status, 200, "read endpoint must accept the valid token");
+
+    // SSE stream is gated too.
+    let req = hyper::Request::builder()
+        .method("GET")
+        .uri("/api/events")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "SSE must require the token when read-auth is on"
+    );
+
+    // SSE accepts the valid token. Check the initial response status only; the
+    // body is a long-lived stream, so don't consume it.
+    let req = hyper::Request::builder()
+        .method("GET")
+        .uri("/api/events")
+        .header("authorization", "Bearer secret")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "SSE must accept the valid token when read-auth is on"
+    );
+}
+
+#[tokio::test]
 async fn test_server_cors_allows_configured_origin_only() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
     let mut options = ServerOptions::new(8000);
     options.cors_allowed_origins = vec!["http://allowed.example".to_string()];
-    let app = create_router_with_options(engine, options);
+    let app = create_router_with_options(engine, options).unwrap();
 
     let allowed = options_request(app.clone(), "/api/ask", "http://allowed.example", "POST").await;
     assert_eq!(
@@ -375,6 +463,24 @@ async fn test_server_cors_allows_configured_origin_only() {
     );
 }
 
+#[tokio::test]
+async fn test_server_cors_malformed_origin_errors_without_panic() {
+    // A bad operator-configured origin must surface a clean error naming the
+    // offending value, not panic while building the router.
+    let engine = HolaEngine::from_config(minimal_config()).unwrap();
+    let mut options = ServerOptions::new(8000);
+    // Control characters are not valid HTTP header values.
+    options.cors_allowed_origins = vec!["http://bad\norigin".to_string()];
+
+    let result = create_router_with_options(engine, options);
+    assert!(result.is_err());
+    let message = result.err().unwrap().to_string();
+    assert!(
+        message.contains("CORS origin"),
+        "error should name the CORS origin, got: {message}"
+    );
+}
+
 // ==========================================================================
 // Error handling
 // ==========================================================================
@@ -382,7 +488,7 @@ async fn test_server_cors_allows_configured_origin_only() {
 #[tokio::test]
 async fn test_server_tell_unknown_trial() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     let tell = json!({"trial_id": 999, "metrics": {"loss": 0.5}});
     let (status, err) = json_request(app, "POST", "/api/tell", Some(tell)).await;
@@ -393,7 +499,7 @@ async fn test_server_tell_unknown_trial() {
 #[tokio::test]
 async fn test_server_double_tell_returns_400() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     let (_, trial) = json_request(app.clone(), "POST", "/api/ask", None).await;
     let tell = json!({"trial_id": trial["trial_id"], "metrics": {"loss": 0.5}});
@@ -418,7 +524,7 @@ async fn test_server_double_tell_returns_400() {
 #[tokio::test]
 async fn test_server_cancel_endpoint() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     let (_, trial) = json_request(app.clone(), "POST", "/api/ask", None).await;
     let cancel = json!({"trial_id": trial["trial_id"]});
@@ -434,7 +540,7 @@ async fn test_server_cancel_endpoint() {
 #[tokio::test]
 async fn test_server_space_endpoint() {
     let engine = HolaEngine::from_config(multi_param_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     let (status, body) = json_request(app, "GET", "/api/space", None).await;
     assert_eq!(status, 200);
@@ -450,7 +556,7 @@ async fn test_server_space_endpoint() {
 #[tokio::test]
 async fn test_server_space_with_all_param_types() {
     let engine = HolaEngine::from_config(multi_param_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     let (_, body) = json_request(app, "GET", "/api/space", None).await;
     let params = body["params"].as_array().unwrap();
@@ -466,7 +572,7 @@ async fn test_server_space_with_all_param_types() {
 #[tokio::test]
 async fn test_server_get_objectives_endpoint() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     let (status, body) = json_request(app, "GET", "/api/objectives", None).await;
     assert_eq!(status, 200);
@@ -481,7 +587,7 @@ async fn test_server_get_objectives_endpoint() {
 #[tokio::test]
 async fn test_server_update_objectives() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     let patch = json!({"objectives": [{"field": "accuracy", "type": "maximize", "priority": 1.0}]});
     let (status, result) = json_request(app, "PATCH", "/api/objectives", Some(patch)).await;
@@ -492,7 +598,7 @@ async fn test_server_update_objectives() {
 #[tokio::test]
 async fn test_server_update_objectives_rejects_invalid_type() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     let patch = json!({"objectives": [{"field": "accuracy", "type": "larger", "priority": 1.0}]});
     let (status, result) = json_request(app, "PATCH", "/api/objectives", Some(patch)).await;
@@ -508,7 +614,7 @@ async fn test_server_update_objectives_rejects_invalid_type() {
 #[tokio::test]
 async fn test_server_update_objectives_rescalarizes() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     let (_, trial) = json_request(app.clone(), "POST", "/api/ask", None).await;
     let tell = json!({"trial_id": trial["trial_id"], "metrics": {"loss": 0.5, "accuracy": 0.9}});
@@ -540,7 +646,7 @@ async fn test_server_update_objectives_rescalarizes() {
 #[tokio::test]
 async fn test_server_ask_sequential_ids() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     let mut prev_id: Option<u64> = None;
     for _ in 0..5 {
@@ -564,7 +670,7 @@ async fn test_server_checkpoint_save_endpoint() {
     let dir = tempfile::tempdir().unwrap();
     let mut options = ServerOptions::new(8000);
     options.checkpoint_dir = dir.path().to_path_buf();
-    let app = create_router_with_options(engine, options);
+    let app = create_router_with_options(engine, options).unwrap();
 
     let (_, trial) = json_request(app.clone(), "POST", "/api/ask", None).await;
     let tell = json!({"trial_id": trial["trial_id"], "metrics": {"loss": 0.5}});
@@ -576,7 +682,8 @@ async fn test_server_checkpoint_save_endpoint() {
     let (status, body) = json_request(app, "POST", "/api/checkpoint/save", Some(save_req)).await;
     assert_eq!(status, 200);
     assert_eq!(body["checkpoint_type"], "full");
-    assert_eq!(body["path"].as_str().unwrap(), path.to_string_lossy());
+    // The response returns the resolved checkpoint path so clients can load it back.
+    assert_eq!(body["path"].as_str().unwrap(), path.to_str().unwrap());
     assert!(path.exists());
 
     let saved: serde_json::Value =
@@ -593,7 +700,7 @@ async fn test_server_checkpoint_save_preserves_sobol_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let mut options = ServerOptions::new(8000);
     options.checkpoint_dir = dir.path().to_path_buf();
-    let app = create_router_with_options(engine, options);
+    let app = create_router_with_options(engine, options).unwrap();
 
     for _ in 0..3 {
         let baseline_trial = baseline.ask().await.unwrap();
@@ -633,7 +740,7 @@ async fn test_server_checkpoint_save_rejects_unconfined_paths() {
     let dir = tempfile::tempdir().unwrap();
     let mut options = ServerOptions::new(8000);
     options.checkpoint_dir = dir.path().to_path_buf();
-    let app = create_router_with_options(engine, options);
+    let app = create_router_with_options(engine, options).unwrap();
 
     let absolute_req = json!({"path": dir.path().join("escape.json").to_string_lossy()});
     let (status, body) = json_request(
@@ -647,10 +754,90 @@ async fn test_server_checkpoint_save_rejects_unconfined_paths() {
     assert!(body["error"].as_str().unwrap().contains("relative"));
 
     let traversal_req = json!({"path": "../escape.json"});
-    let (status, body) =
-        json_request(app, "POST", "/api/checkpoint/save", Some(traversal_req)).await;
+    let (status, body) = json_request(
+        app.clone(),
+        "POST",
+        "/api/checkpoint/save",
+        Some(traversal_req),
+    )
+    .await;
     assert_eq!(status, 400);
     assert!(body["error"].as_str().unwrap().contains("relative"));
+
+    // An empty path is rejected outright (cannot resolve to a file).
+    let empty_req = json!({"path": ""});
+    let (status, body) =
+        json_request(app.clone(), "POST", "/api/checkpoint/save", Some(empty_req)).await;
+    assert_eq!(status, 400);
+    assert!(body["error"].as_str().unwrap().contains("empty"));
+
+    // A symlink that lives inside the checkpoint dir but points outside it must
+    // not let a lexically-confined path escape after canonicalization.
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let escape_req = json!({"path": "link/escape.json"});
+        let (status, body) =
+            json_request(app, "POST", "/api/checkpoint/save", Some(escape_req)).await;
+        assert_eq!(status, 400);
+        assert!(body["error"].as_str().unwrap().contains("relative"));
+        // The file must not have been written through the symlink.
+        assert!(!outside.path().join("escape.json").exists());
+    }
+}
+
+// ==========================================================================
+// Request limits: body size and max_trials cap
+// ==========================================================================
+
+#[tokio::test]
+async fn test_server_rejects_oversized_body() {
+    let engine = HolaEngine::from_config(minimal_config()).unwrap();
+    let app = create_router(engine).unwrap();
+
+    // Build a JSON body well above the 64 KiB cap; the body-size limit must
+    // reject it before the handler ever parses it.
+    let big = "a".repeat(128 * 1024);
+    let req = hyper::Request::builder()
+        .method("POST")
+        .uri("/api/tell")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(big))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    // Must be 413 (Payload Too Large) from the body-size layer, which rejects on
+    // size before the JSON extractor runs. Without the layer this body would
+    // instead reach the extractor and fail JSON parsing with 400, so asserting
+    // exactly 413 discriminates a regression of the size cap.
+    assert_eq!(
+        status, 413,
+        "oversized body must be rejected by the size cap"
+    );
+}
+
+fn max_trials_config(max_trials: usize) -> StudyConfig {
+    let mut config = minimal_config();
+    config.max_trials = Some(max_trials);
+    config
+}
+
+#[tokio::test]
+async fn test_server_ask_rejects_past_max_trials() {
+    let engine = HolaEngine::from_config(max_trials_config(1)).unwrap();
+    let app = create_router(engine).unwrap();
+
+    // First ask consumes the only budgeted trial (now pending).
+    let (status, _) = json_request(app.clone(), "POST", "/api/ask", None).await;
+    assert_eq!(status, 200);
+
+    // Second ask is past the configured limit and must surface the engine error.
+    let (status, body) = json_request(app, "POST", "/api/ask", None).await;
+    assert_eq!(status, 400);
+    assert!(body["error"].as_str().unwrap().contains("max_trials"));
 }
 
 // ==========================================================================
@@ -688,13 +875,14 @@ fn multi_objective_config() -> StudyConfig {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     }
 }
 
 #[tokio::test]
 async fn test_server_pareto_front_multi_objective() {
     let engine = HolaEngine::from_config(multi_objective_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     // Complete a few trials
     for i in 0..3 {
@@ -730,7 +918,7 @@ async fn test_server_pareto_front_multi_objective() {
 #[tokio::test]
 async fn test_server_pareto_front_scalar_returns_empty() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     // Scalar study with no trials: pareto_front returns empty array
     let (status, body) = json_request(
@@ -751,7 +939,7 @@ async fn test_server_pareto_front_scalar_returns_empty() {
 #[tokio::test]
 async fn test_server_tell_with_multiple_fields() {
     let engine = HolaEngine::from_config(minimal_config()).unwrap();
-    let app = create_router(engine);
+    let app = create_router(engine).unwrap();
 
     let (_, trial) = json_request(app.clone(), "POST", "/api/ask", None).await;
     let tell = json!({

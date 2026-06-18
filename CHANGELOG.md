@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+## 1.0.1-rc7
+
+This release candidate continues the audit and hardening pass for the
+Rust/Python HOLA 1.0 stack with high-severity correctness, security, and
+release-process fixes.
+
+### Fixed
+
+- Refit no longer drops concurrent sampling-counter or model updates
+  under concurrency.
+- Degenerate fixed parameters (`min == max`) no longer produce `NaN`.
+- `Study.run` now cancels orphaned trials and shuts down its executor
+  when the objective function fails.
+- WFG benchmark functions evaluate via pymoo, so IGD is measured
+  against the matching reference front.
+- Corrected documentation examples.
+
+### Security and robustness
+
+- Objective validation now rejects configurations whose declared type
+  contradicts the target/limit ordering, including `target == limit`.
+  This may reject contradictory configurations that were previously
+  accepted.
+- Added optional read-endpoint and SSE authentication via
+  `--require-read-auth`. This is off by default: reads remain open
+  unless explicitly enabled.
+
+### Dependencies
+
+- Upgraded PyO3 to 0.29, clearing RUSTSEC-2026-0176 and
+  RUSTSEC-2026-0177.
+- Declared MSRV 1.87 and added Dependabot coverage for Cargo and Python
+  dependencies.
+
+### Build and release
+
+- Enforced locked Cargo builds in CI and release workflows.
+- Hardened release provenance with GitHub attestations and a generated
+  PEP 503-compatible simple index with hashed release assets.
+- Added pip-audit coverage for the Python package.
+
 ## 1.0.1-rc6
 
 This release candidate hardens the Rust/Python HOLA 1.0 stack after

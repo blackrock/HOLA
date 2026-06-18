@@ -25,7 +25,7 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 // =============================================================================
 // Core Data Structures
@@ -100,11 +100,79 @@ impl<D, Obs> Trial<D, Obs> {
 /// let best = lb.top_k(2);  // Returns 2 trials with lowest observations
 /// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(
+    from = "LeaderboardData<D, Obs>",
+    bound(deserialize = "D: Deserialize<'de>, Obs: Deserialize<'de>")
+)]
 pub struct Leaderboard<D, Obs> {
     /// Trials stored in insertion order (append-only).
     trials: Vec<Trial<D, Obs>>,
     /// Next trial ID to assign.
     next_id: u64,
+    /// Optional cap on the number of stored trials. `None` (default) keeps the
+    /// leaderboard unbounded.
+    #[serde(default)]
+    max_size: Option<usize>,
+    /// Count of trials ever stored, incremented on every push and never
+    /// decremented by eviction. For an unbounded leaderboard this equals
+    /// `len()`; for a capped one it keeps growing past the cap. This is the
+    /// correct basis for a `max_trials` stopping check.
+    #[serde(default)]
+    total_completed: u64,
+    /// Maps `trial_id -> index` into `trials` for O(1) id lookups.
+    ///
+    /// Derived state: never serialized, and rebuilt from `trials` whenever the
+    /// leaderboard is deserialized (see the `From<LeaderboardData>` impl) or
+    /// mutated. It is always kept consistent with `trials`.
+    #[serde(skip)]
+    id_index: HashMap<u64, usize>,
+}
+
+/// Serialized shape of a [`Leaderboard`].
+///
+/// Deserialization targets this type and then rebuilds the derived
+/// `id_index` via `From`. This keeps the on-disk format identical to a plain
+/// `{ trials, next_id, max_size }` object and avoids persisting the index.
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "D: Deserialize<'de>, Obs: Deserialize<'de>"))]
+struct LeaderboardData<D, Obs> {
+    trials: Vec<Trial<D, Obs>>,
+    #[serde(default)]
+    next_id: u64,
+    #[serde(default)]
+    max_size: Option<usize>,
+    #[serde(default)]
+    total_completed: u64,
+}
+
+impl<D, Obs> From<LeaderboardData<D, Obs>> for Leaderboard<D, Obs> {
+    fn from(data: LeaderboardData<D, Obs>) -> Self {
+        let id_index = build_id_index(&data.trials);
+        // Old checkpoints lack the counter (default 0) and were always
+        // unbounded, so total pushed equals stored len. Newer checkpoints
+        // restore the real count, which can exceed len under a cap.
+        let total_completed = data.total_completed.max(data.trials.len() as u64);
+        Self {
+            trials: data.trials,
+            next_id: data.next_id,
+            // Normalize a persisted Some(0) to unbounded, matching set_max_size.
+            max_size: data.max_size.filter(|&cap| cap > 0),
+            total_completed,
+            id_index,
+        }
+    }
+}
+
+/// Build a fresh `trial_id -> index` map from a slice of trials.
+///
+/// On duplicate trial IDs the last occurrence wins, matching how `get` would
+/// observe the most recently pushed trial.
+fn build_id_index<D, Obs>(trials: &[Trial<D, Obs>]) -> HashMap<u64, usize> {
+    let mut index = HashMap::with_capacity(trials.len());
+    for (i, trial) in trials.iter().enumerate() {
+        index.insert(trial.trial_id, i);
+    }
+    index
 }
 
 impl<D, Obs> Default for Leaderboard<D, Obs> {
@@ -119,6 +187,9 @@ impl<D, Obs> Leaderboard<D, Obs> {
         Self {
             trials: Vec::new(),
             next_id: 0,
+            max_size: None,
+            total_completed: 0,
+            id_index: HashMap::new(),
         }
     }
 
@@ -127,7 +198,133 @@ impl<D, Obs> Leaderboard<D, Obs> {
         Self {
             trials: Vec::with_capacity(capacity),
             next_id: 0,
+            max_size: None,
+            total_completed: 0,
+            id_index: HashMap::with_capacity(capacity),
         }
+    }
+
+    /// Set an optional maximum number of stored trials (builder form).
+    ///
+    /// `None` (the default) leaves the leaderboard unbounded. `Some(0)` is
+    /// normalized to unbounded; see
+    /// [`set_max_size`](Self::set_max_size) for the rationale and for the
+    /// eviction policy applied when a positive cap is set.
+    pub fn with_max_size(mut self, max_size: Option<usize>) -> Self {
+        self.set_max_size(max_size);
+        self
+    }
+
+    /// Set or clear the optional cap on the number of stored trials.
+    ///
+    /// # Eviction policy
+    ///
+    /// When a cap is set and a `push` would exceed it, the leaderboard evicts
+    /// the single oldest trial (lowest index, i.e. earliest inserted). Oldest
+    /// eviction is chosen because it is O(1) amortized for the scalar and
+    /// vector cases alike and keeps `push` cheap; ranking helpers that the
+    /// optimizer relies on (`top_k`, `pareto_front`, `rank_of`) all recompute
+    /// from the retained set, so they stay correct over whatever window
+    /// survives. Callers that need the global best preserved should leave the
+    /// leaderboard unbounded.
+    ///
+    /// Setting a cap smaller than the current length immediately evicts the
+    /// oldest trials down to the cap. Passing `None` clears the cap and never
+    /// evicts. `next_id` is preserved so trial IDs remain unique across
+    /// evictions.
+    ///
+    /// A cap of `Some(0)` is not a valid bound: a zero-capacity leaderboard
+    /// could not even hold the trial a caller just pushed. It is therefore
+    /// normalized to `None` (unbounded) here so every code path treats it the
+    /// same way. This matches the `cap > 0` guard in
+    /// [`enforce_max_size`](Self::enforce_max_size) and keeps `max_size()` from
+    /// ever reporting a `Some(0)` that would not actually be enforced. The
+    /// product layer rejects `Some(0)` during validation; this normalization is
+    /// the library-level backstop.
+    pub fn set_max_size(&mut self, max_size: Option<usize>) {
+        // Treat Some(0) as unbounded (see method docs): a zero cap is invalid
+        // and must never evict the just-pushed trial.
+        let max_size = max_size.filter(|&cap| cap > 0);
+        self.max_size = max_size;
+        if let Some(cap) = max_size {
+            self.evict_to(cap);
+        }
+    }
+
+    /// Current cap on stored trials, if any.
+    pub fn max_size(&self) -> Option<usize> {
+        self.max_size
+    }
+
+    /// Evict the oldest trials until at most `cap` remain.
+    ///
+    /// Rebuilds the id index only when at least one trial is removed. With a
+    /// single eviction per push the common path drains one element.
+    fn evict_to(&mut self, cap: usize) {
+        if self.trials.len() <= cap {
+            return;
+        }
+        let remove = self.trials.len() - cap;
+        self.trials.drain(0..remove);
+        self.id_index = build_id_index(&self.trials);
+    }
+
+    /// Enforce `max_size` after a push, evicting the oldest trial if needed.
+    ///
+    /// A push adds exactly one trial, so at most one eviction is required.
+    ///
+    /// The `cap > 0` guard is a defensive backstop. `set_max_size` already
+    /// normalizes `Some(0)` to `None`, so `self.max_size` should never be
+    /// `Some(0)` here; the guard makes the no-evict-on-zero contract explicit
+    /// and keeps a zero cap from ever dropping the just-pushed trial.
+    fn enforce_max_size(&mut self) {
+        if let Some(cap) = self.max_size
+            && cap > 0
+            && self.trials.len() > cap
+        {
+            self.evict_to(cap);
+        }
+    }
+
+    /// Append a trial record, updating the id index and enforcing `max_size`.
+    ///
+    /// Index update is O(1); eviction (only when a cap is set and exceeded)
+    /// removes one trial and rebuilds the index over the retained set.
+    fn store_trial(&mut self, trial: Trial<D, Obs>) {
+        let index = self.trials.len();
+        self.id_index.insert(trial.trial_id, index);
+        self.trials.push(trial);
+        // Count every stored trial. Eviction below must not lower this, so it
+        // tracks trials ever pushed rather than currently stored.
+        self.total_completed += 1;
+        self.enforce_max_size();
+    }
+
+    /// Number of trials ever stored, incremented on every push and never
+    /// decremented by eviction.
+    ///
+    /// For an unbounded leaderboard this equals [`len`](Self::len). For a capped
+    /// one it keeps growing past the cap as pushes continue. This is the correct
+    /// basis for a `max_trials` stopping check, which must not be fooled by
+    /// eviction shrinking the stored set.
+    pub fn total_completed(&self) -> u64 {
+        self.total_completed
+    }
+
+    /// Set the monotonic completed counter, clamping up to the number of
+    /// currently stored trials.
+    ///
+    /// This is the mechanism for carrying the completed count across a
+    /// leaderboard rebuild (e.g. an objective-topology migration that
+    /// reconstructs the board with a different observation type). The rebuilt
+    /// board starts with a fresh counter, so the caller transplants the prior
+    /// count here rather than relying on a serialization round-trip.
+    ///
+    /// The value is clamped to `self.trials.len()` so the counter can never
+    /// report fewer trials than are actually stored, preserving the invariant
+    /// that `total_completed() >= len()`.
+    pub fn set_total_completed(&mut self, value: u64) {
+        self.total_completed = value.max(self.trials.len() as u64);
     }
 
     /// Append a new trial. Returns the assigned trial ID.
@@ -136,8 +333,7 @@ impl<D, Obs> Leaderboard<D, Obs> {
     pub fn push(&mut self, candidate: D, observation: Obs) -> u64 {
         let trial_id = self.next_id;
         self.next_id += 1;
-        self.trials
-            .push(Trial::new(candidate, observation, trial_id));
+        self.store_trial(Trial::new(candidate, observation, trial_id));
         trial_id
     }
 
@@ -148,8 +344,7 @@ impl<D, Obs> Leaderboard<D, Obs> {
     /// the provided ID.
     pub fn push_with_trial_id(&mut self, candidate: D, observation: Obs, trial_id: u64) -> u64 {
         self.next_id = self.next_id.max(trial_id.saturating_add(1));
-        self.trials
-            .push(Trial::new(candidate, observation, trial_id));
+        self.store_trial(Trial::new(candidate, observation, trial_id));
         trial_id
     }
 
@@ -162,7 +357,7 @@ impl<D, Obs> Leaderboard<D, Obs> {
     ) -> u64 {
         let trial_id = self.next_id;
         self.next_id += 1;
-        self.trials.push(Trial::with_raw_metrics(
+        self.store_trial(Trial::with_raw_metrics(
             candidate,
             observation,
             raw_metrics,
@@ -181,7 +376,7 @@ impl<D, Obs> Leaderboard<D, Obs> {
         trial_id: u64,
     ) -> u64 {
         self.next_id = self.next_id.max(trial_id.saturating_add(1));
-        self.trials.push(Trial::with_raw_metrics(
+        self.store_trial(Trial::with_raw_metrics(
             candidate,
             observation,
             raw_metrics,
@@ -197,7 +392,7 @@ impl<D, Obs> Leaderboard<D, Obs> {
     pub fn push_existing_trial(&mut self, trial: Trial<D, Obs>) -> u64 {
         let trial_id = trial.trial_id;
         self.next_id = self.next_id.max(trial_id.saturating_add(1));
-        self.trials.push(trial);
+        self.store_trial(trial);
         trial_id
     }
 
@@ -252,10 +447,18 @@ impl<D, Obs> Leaderboard<D, Obs> {
 
     /// Get a trial by its ID.
     ///
-    /// Note: This is O(n) since trials are not indexed by ID.
-    /// For frequent ID lookups, consider maintaining a separate index.
+    /// O(1): backed by an internal `trial_id -> index` map kept in sync with
+    /// `trials` on every push, eviction, and after deserialization.
     pub fn get(&self, trial_id: u64) -> Option<&Trial<D, Obs>> {
-        self.trials.iter().find(|t| t.trial_id == trial_id)
+        let &index = self.id_index.get(&trial_id)?;
+        self.trials.get(index)
+    }
+
+    /// Return whether a trial with the given ID is stored.
+    ///
+    /// O(1): backed by the same internal id index as [`get`](Self::get).
+    pub fn contains_trial_id(&self, trial_id: u64) -> bool {
+        self.id_index.contains_key(&trial_id)
     }
 
     /// Iterator over all trials in insertion order.
@@ -269,6 +472,8 @@ impl<D, Obs> Leaderboard<D, Obs> {
 
     pub fn clear(&mut self) {
         self.trials.clear();
+        self.id_index.clear();
+        self.total_completed = 0;
         // Note: we don't reset next_id to preserve uniqueness across clears
     }
 }
@@ -445,7 +650,13 @@ impl<D: Clone> Leaderboard<D, f64> {
     /// Compute the quantile threshold for feasible observations.
     ///
     /// `quantile` should be in [0, 1]. Returns the observation value at that quantile.
-    /// E.g., `quantile_threshold(0.25)` returns the value below which 25% of observations fall.
+    /// E.g., `quantile_threshold(0.25)` returns the value below which ~25% of observations fall.
+    ///
+    /// This is a **nearest-rank** (non-interpolated) estimator: it rounds
+    /// `quantile * (n - 1)` to the closest integer rank and returns the
+    /// observation at that rank. It does not interpolate between adjacent
+    /// observations, so the result may differ by one rank from a
+    /// linear-interpolation quantile estimator (e.g. NumPy's default).
     pub fn quantile_threshold(&self, quantile: f64) -> Option<f64> {
         let mut observations: Vec<f64> = self
             .trials
@@ -476,6 +687,35 @@ impl<D: Clone> Leaderboard<D, f64> {
             .filter(|t| Self::trial_is_feasible(t) && t.observation <= threshold)
             .cloned()
             .collect()
+    }
+
+    /// Compute the 0-indexed rank of a single trial without sorting or cloning
+    /// the whole leaderboard.
+    ///
+    /// The rank is the number of stored trials that sort strictly before the
+    /// target under the same ordering as [`top_k`](Self::top_k) /
+    /// [`sorted`](Self::sorted): observation ascending, ties broken by
+    /// `trial_id` (earlier first). A return of `0` means best.
+    ///
+    /// When `include_infeasible` is `false`, infeasible trials are ignored when
+    /// counting and the method returns `None` if the target itself is
+    /// infeasible. When `true`, all trials participate (matching
+    /// [`sorted_all`](Self::sorted_all)).
+    ///
+    /// Complexity: O(n) over a single pass, with no allocation and no clones.
+    /// Returns `None` if no trial with `trial_id` exists.
+    pub fn rank_of(&self, trial_id: u64, include_infeasible: bool) -> Option<usize> {
+        let target = self.get(trial_id)?;
+        if !include_infeasible && !Self::trial_is_feasible(target) {
+            return None;
+        }
+        let rank = self
+            .trials
+            .iter()
+            .filter(|other| include_infeasible || Self::trial_is_feasible(other))
+            .filter(|other| Self::compare_best(other, target) == Ordering::Less)
+            .count();
+        Some(rank)
     }
 }
 
@@ -514,11 +754,30 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
     /// Check if trial `a` dominates trial `b` (all objectives better or equal, at least one strictly better).
     ///
     /// Assumes minimization for all objectives.
+    ///
+    /// NaN objective values are treated as strictly worst (worse than any
+    /// finite value or infinity), so that ordering stays deterministic:
+    /// - a NaN in `a` but finite in `b` makes `a` worse in that objective, so
+    ///   `a` cannot dominate;
+    /// - a NaN in `b` but finite in `a` counts as `a` being strictly better;
+    /// - both NaN is a tie in that objective.
     fn dominates(a: &BTreeMap<String, f64>, b: &BTreeMap<String, f64>) -> bool {
         let mut dominated_some = false;
         for key in a.keys() {
             let va = a.get(key).copied().unwrap_or(f64::INFINITY);
             let vb = b.get(key).copied().unwrap_or(f64::INFINITY);
+            // Deterministic NaN policy: NaN is strictly worst. Handle the cases
+            // involving NaN explicitly because `>` / `<` are always false for
+            // NaN and would otherwise be silently treated as a tie.
+            match (va.is_nan(), vb.is_nan()) {
+                (true, false) => return false, // a is worst here, cannot dominate
+                (false, true) => {
+                    dominated_some = true; // a is strictly better than NaN
+                    continue;
+                }
+                (true, true) => continue, // both NaN: tie in this objective
+                (false, false) => {}
+            }
             if va > vb {
                 return false; // a is worse in this objective
             }
@@ -705,6 +964,75 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
                 let vb = b.observation.get(group).unwrap();
                 va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal)
             })
+    }
+
+    /// Compute the 0-indexed Pareto front membership of a single trial without
+    /// cloning trials or running a full non-dominated sort of every front.
+    ///
+    /// The result is the front index the trial belongs to under the same
+    /// non-domination relation as [`non_dominated_sort`](Self::non_dominated_sort)
+    /// (`0` = Pareto front, `1` = second front, etc.), which equals the
+    /// `rank - 1` that `ranked_trials` would assign. It is computed by peeling
+    /// fronts and stopping as soon as the target is placed, so it never has to
+    /// rank trials in later fronts and clones nothing (it works on observation
+    /// references and indices only).
+    ///
+    /// When `include_infeasible` is `false`, only feasible trials participate
+    /// and the method returns `None` if the target is infeasible. When `true`,
+    /// all trials participate (matching the `*_all` variants).
+    ///
+    /// Complexity: O(M * N^2) worst case like the full sort, but typically far
+    /// less since front peeling halts once the target lands. Returns `None` if
+    /// no trial with `trial_id` exists.
+    pub fn pareto_rank_of(&self, trial_id: u64, include_infeasible: bool) -> Option<usize> {
+        let target = self.get(trial_id)?;
+        if !include_infeasible && !Self::trial_is_feasible(target) {
+            return None;
+        }
+
+        // Work on references to the participating observations to avoid clones.
+        let participants: Vec<(u64, &BTreeMap<String, f64>)> = self
+            .trials
+            .iter()
+            .filter(|t| include_infeasible || Self::trial_is_feasible(t))
+            .map(|t| (t.trial_id, &t.observation))
+            .collect();
+
+        let n = participants.len();
+        let mut domination_count: Vec<usize> = vec![0; n];
+        let mut dominated_by: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if Self::dominates(participants[i].1, participants[j].1) {
+                    dominated_by[i].push(j);
+                    domination_count[j] += 1;
+                } else if Self::dominates(participants[j].1, participants[i].1) {
+                    dominated_by[j].push(i);
+                    domination_count[i] += 1;
+                }
+            }
+        }
+
+        let mut current: Vec<usize> = (0..n).filter(|&i| domination_count[i] == 0).collect();
+        let mut front = 0usize;
+        while !current.is_empty() {
+            if current.iter().any(|&i| participants[i].0 == trial_id) {
+                return Some(front);
+            }
+            let mut next = Vec::new();
+            for &i in &current {
+                for &j in &dominated_by[i] {
+                    domination_count[j] -= 1;
+                    if domination_count[j] == 0 {
+                        next.push(j);
+                    }
+                }
+            }
+            current = next;
+            front += 1;
+        }
+        None
     }
 
     // =========================================================================
@@ -1152,6 +1480,23 @@ mod tests {
     }
 
     #[test]
+    fn test_set_total_completed_sets_and_clamps() {
+        let mut lb: Leaderboard<f64, f64> = Leaderboard::new();
+        lb.push(0.1, 0.1);
+        lb.push(0.2, 0.2);
+        assert_eq!(lb.total_completed(), 2);
+
+        // Carries a larger prior count onto the board (the rebuild case).
+        lb.set_total_completed(10);
+        assert_eq!(lb.total_completed(), 10);
+
+        // Clamps up to len() when given a value below the stored count,
+        // never reporting fewer trials than are actually stored.
+        lb.set_total_completed(1);
+        assert_eq!(lb.total_completed(), 2);
+    }
+
+    #[test]
     fn test_top_k_scalar() {
         let mut lb: Leaderboard<&str, f64> = Leaderboard::new();
 
@@ -1238,6 +1583,46 @@ mod tests {
         assert!(candidates.contains(&"A"));
         assert!(candidates.contains(&"C"));
         assert!(!candidates.contains(&"B"));
+    }
+
+    #[test]
+    fn test_dominates_nan_is_strictly_worst() {
+        // A NaN objective must be treated as strictly worst, not a tie.
+        // A finite trial that is better in the NaN objective and equal/better
+        // elsewhere must dominate the NaN trial, and the NaN trial must never
+        // spuriously dominate the finite one.
+        let mut lb: Leaderboard<&str, BTreeMap<String, f64>> = Leaderboard::new();
+
+        // "good": finite and better in y, equal in x.
+        lb.push("good", [("x".into(), 0.1), ("y".into(), 0.1)].into());
+        // "nan": NaN in y (strictly worst there), equal in x.
+        lb.push("nan", [("x".into(), 0.1), ("y".into(), f64::NAN)].into());
+
+        // pareto_front_all includes infeasible trials but still applies
+        // dominance, so the NaN trial must be dropped as dominated by "good".
+        let front = lb.pareto_front_all();
+        let candidates: Vec<_> = front.iter().map(|t| t.candidate).collect();
+        assert!(
+            candidates.contains(&"good"),
+            "finite-better trial must be on the front"
+        );
+        assert!(
+            !candidates.contains(&"nan"),
+            "NaN-objective trial must be dominated, not tie"
+        );
+
+        // Direct dominance checks: NaN must not spuriously dominate, and finite
+        // must dominate NaN.
+        let good_obs: BTreeMap<String, f64> = [("x".into(), 0.1), ("y".into(), 0.1)].into();
+        let nan_obs: BTreeMap<String, f64> = [("x".into(), 0.1), ("y".into(), f64::NAN)].into();
+        assert!(
+            Leaderboard::<&str, BTreeMap<String, f64>>::dominates(&good_obs, &nan_obs),
+            "finite-better must dominate NaN"
+        );
+        assert!(
+            !Leaderboard::<&str, BTreeMap<String, f64>>::dominates(&nan_obs, &good_obs),
+            "NaN must never dominate a finite trial"
+        );
     }
 
     #[test]
@@ -2071,5 +2456,317 @@ mod tests {
         let fronts = lb.non_dominated_sort();
         let total: usize = fronts.iter().map(|f| f.len()).sum();
         assert_eq!(total, 2);
+    }
+
+    // ==================================================================
+    // Id index, single-trial rank, and bounded mode
+    // ==================================================================
+
+    #[test]
+    fn test_contains_trial_id_after_push() {
+        let mut lb = Leaderboard::<&str, f64>::new();
+        let a = lb.push("a", 0.1);
+        let b = lb.push_with_trial_id("b", 0.2, 42);
+
+        assert!(lb.contains_trial_id(a));
+        assert!(lb.contains_trial_id(b));
+        assert!(!lb.contains_trial_id(7));
+        assert_eq!(lb.get(b).unwrap().candidate, "b");
+        assert!(lb.get(7).is_none());
+    }
+
+    #[test]
+    fn test_id_index_survives_serde_roundtrip() {
+        let mut lb = Leaderboard::<&str, f64>::new();
+        lb.push("a", 0.1);
+        lb.push_with_trial_id("b", 0.2, 100);
+
+        let json = serde_json::to_string(&lb).unwrap();
+        // The derived index must not be persisted.
+        assert!(!json.contains("id_index"));
+
+        let restored: Leaderboard<String, f64> = serde_json::from_str(&json).unwrap();
+        // O(1) lookup works without any explicit rebuild call.
+        assert!(restored.contains_trial_id(0));
+        assert!(restored.contains_trial_id(100));
+        assert!(!restored.contains_trial_id(1));
+        assert_eq!(restored.get(100).unwrap().candidate, "b");
+        // next_id is preserved across the roundtrip.
+        assert_eq!(restored.next_trial_id(), 101);
+    }
+
+    #[test]
+    fn test_legacy_json_without_max_size_deserializes() {
+        // Legacy checkpoints have only trials and next_id.
+        let json = r#"{"trials":[{"candidate":"a","observation":0.5,"trial_id":3,"timestamp":7}],"next_id":4}"#;
+        let lb: Leaderboard<String, f64> = serde_json::from_str(json).unwrap();
+        assert_eq!(lb.len(), 1);
+        assert_eq!(lb.max_size(), None);
+        assert!(lb.contains_trial_id(3));
+        assert_eq!(lb.next_trial_id(), 4);
+    }
+
+    #[test]
+    fn test_rank_of_matches_full_ranking_scalar() {
+        let mut lb = Leaderboard::<&str, f64>::new();
+        lb.push("c", 0.3);
+        lb.push("a", 0.1);
+        lb.push("inf", f64::INFINITY);
+        lb.push("b", 0.2);
+        lb.push("a_tie", 0.1); // ties with "a" by observation, later trial_id
+
+        // Build the ground-truth rank from the full sorted order.
+        let sorted = lb.sorted();
+        for (expected_rank, t) in sorted.iter().enumerate() {
+            assert_eq!(
+                lb.rank_of(t.trial_id, false),
+                Some(expected_rank),
+                "feasible rank mismatch for trial {}",
+                t.trial_id
+            );
+        }
+
+        // Infeasible target is excluded unless include_infeasible is set.
+        let inf_id = lb.iter().find(|t| t.candidate == "inf").unwrap().trial_id;
+        assert_eq!(lb.rank_of(inf_id, false), None);
+
+        let sorted_all = lb.sorted_all();
+        for (expected_rank, t) in sorted_all.iter().enumerate() {
+            assert_eq!(
+                lb.rank_of(t.trial_id, true),
+                Some(expected_rank),
+                "all rank mismatch for trial {}",
+                t.trial_id
+            );
+        }
+
+        assert_eq!(lb.rank_of(9999, false), None);
+    }
+
+    #[test]
+    fn test_pareto_rank_of_matches_full_sort() {
+        let mut lb = Leaderboard::<&str, BTreeMap<String, f64>>::new();
+        lb.push("A", [("x".into(), 0.1), ("y".into(), 0.1)].into()); // front 0
+        lb.push("B", [("x".into(), 0.3), ("y".into(), 0.3)].into()); // front 1
+        lb.push("C", [("x".into(), 0.5), ("y".into(), 0.5)].into()); // front 2
+        lb.push("D", [("x".into(), 0.1), ("y".into(), 0.9)].into()); // front 0 (non-dominated)
+        lb.push(
+            "inf",
+            [("x".into(), 0.0), ("y".into(), f64::INFINITY)].into(),
+        );
+
+        // Ground truth: front index from the full non-dominated sort.
+        let fronts = lb.non_dominated_sort();
+        for (front_idx, front) in fronts.iter().enumerate() {
+            for t in front {
+                assert_eq!(
+                    lb.pareto_rank_of(t.trial_id, false),
+                    Some(front_idx),
+                    "front mismatch for trial {}",
+                    t.trial_id
+                );
+            }
+        }
+
+        let inf_id = lb.iter().find(|t| t.candidate == "inf").unwrap().trial_id;
+        assert_eq!(lb.pareto_rank_of(inf_id, false), None);
+        assert!(lb.pareto_rank_of(inf_id, true).is_some());
+        assert_eq!(lb.pareto_rank_of(123, false), None);
+    }
+
+    #[test]
+    fn test_unbounded_default_keeps_everything() {
+        let mut lb = Leaderboard::<u32, f64>::new();
+        for i in 0..50 {
+            lb.push(i, i as f64);
+        }
+        assert_eq!(lb.max_size(), None);
+        assert_eq!(lb.len(), 50);
+        // First and last still present.
+        assert!(lb.contains_trial_id(0));
+        assert!(lb.contains_trial_id(49));
+    }
+
+    #[test]
+    fn test_bounded_mode_caps_and_evicts_oldest() {
+        let mut lb = Leaderboard::<u32, f64>::new().with_max_size(Some(3));
+        for i in 0..6 {
+            lb.push(i, i as f64);
+        }
+        // Only the 3 most recent (oldest evicted) remain.
+        assert_eq!(lb.len(), 3);
+        let ids: Vec<u64> = lb.iter().map(|t| t.trial_id).collect();
+        assert_eq!(ids, vec![3, 4, 5]);
+
+        // Evicted ids are gone from the index; survivors resolve correctly.
+        assert!(!lb.contains_trial_id(0));
+        assert!(!lb.contains_trial_id(2));
+        assert!(lb.contains_trial_id(3));
+        assert_eq!(lb.get(5).unwrap().candidate, 5);
+        for t in lb.iter() {
+            assert_eq!(lb.get(t.trial_id).unwrap().candidate, t.candidate);
+        }
+
+        // Ranking still consistent over the retained window.
+        assert_eq!(lb.rank_of(3, false), Some(0));
+        assert_eq!(lb.rank_of(5, false), Some(2));
+
+        // next_id keeps growing so ids stay unique after eviction.
+        assert_eq!(lb.push(99, 99.0), 6);
+    }
+
+    #[test]
+    fn test_set_max_size_shrinks_immediately_then_clears() {
+        let mut lb = Leaderboard::<u32, f64>::new();
+        for i in 0..5 {
+            lb.push(i, i as f64);
+        }
+        lb.set_max_size(Some(2));
+        assert_eq!(lb.len(), 2);
+        let ids: Vec<u64> = lb.iter().map(|t| t.trial_id).collect();
+        assert_eq!(ids, vec![3, 4]);
+
+        // Clearing the cap stops eviction; further pushes accumulate.
+        lb.set_max_size(None);
+        for i in 5..8 {
+            lb.push(i, i as f64);
+        }
+        assert_eq!(lb.len(), 5);
+    }
+
+    #[test]
+    fn test_cap_of_one_keeps_only_newest() {
+        let mut lb = Leaderboard::<u32, f64>::new().with_max_size(Some(1));
+        // Each push evicts the previous trial; the newest survives.
+        for i in 0..5 {
+            let id = lb.push(i, i as f64);
+            assert_eq!(lb.len(), 1, "len must stay 1 after pushing {i}");
+            // The trial just pushed is readable and is the only survivor.
+            let only = lb.last().unwrap();
+            assert_eq!(only.candidate, i, "newest trial must survive push {i}");
+            assert_eq!(only.trial_id, id);
+            assert_eq!(lb.get(id).unwrap().candidate, i);
+            // Earlier trials have been evicted from the index.
+            if i > 0 {
+                assert!(!lb.contains_trial_id(id - 1));
+            }
+        }
+    }
+
+    #[test]
+    fn test_total_completed_unbounded_equals_len() {
+        let mut lb = Leaderboard::<u32, f64>::new();
+        assert_eq!(lb.total_completed(), 0);
+        // Exercise every push route; each must bump the counter by one.
+        lb.push(0, 0.0);
+        lb.push_with_trial_id(1, 1.0, 10);
+        lb.push_with_raw(2, 2.0, serde_json::json!({"loss": 2.0}));
+        lb.push_with_raw_trial_id(3, 3.0, serde_json::json!({"loss": 3.0}), 20);
+        lb.push_existing_trial(Trial {
+            candidate: 4,
+            observation: 4.0,
+            raw_metrics: None,
+            trial_id: 30,
+            timestamp: 1,
+        });
+        assert_eq!(lb.total_completed(), 5);
+        // Unbounded: counter and stored length stay in lockstep.
+        assert_eq!(lb.total_completed(), lb.len() as u64);
+    }
+
+    #[test]
+    fn test_total_completed_grows_past_cap() {
+        let mut lb = Leaderboard::<u32, f64>::new().with_max_size(Some(3));
+        for i in 0..10 {
+            lb.push(i, i as f64);
+            // Counter tracks pushes, not the evicted stored set.
+            assert_eq!(lb.total_completed(), (i + 1) as u64);
+        }
+        // Eviction held len at the cap but never lowered the counter.
+        assert_eq!(lb.len(), 3);
+        assert_eq!(lb.total_completed(), 10);
+        assert!(lb.total_completed() > lb.len() as u64);
+    }
+
+    #[test]
+    fn test_total_completed_reset_by_clear() {
+        let mut lb = Leaderboard::<u32, f64>::new().with_max_size(Some(2));
+        for i in 0..5 {
+            lb.push(i, i as f64);
+        }
+        assert_eq!(lb.total_completed(), 5);
+        lb.clear();
+        assert_eq!(lb.total_completed(), 0);
+        // Counting resumes from zero after a clear.
+        lb.push(99, 9.0);
+        assert_eq!(lb.total_completed(), 1);
+    }
+
+    #[test]
+    fn test_total_completed_survives_serde_roundtrip() {
+        let mut lb = Leaderboard::<u32, f64>::new().with_max_size(Some(3));
+        for i in 0..7 {
+            lb.push(i, i as f64);
+        }
+        assert_eq!(lb.total_completed(), 7);
+        assert_eq!(lb.len(), 3);
+
+        let json = serde_json::to_string(&lb).unwrap();
+        let restored: Leaderboard<u32, f64> = serde_json::from_str(&json).unwrap();
+        // The real count survives even though only 3 trials are stored.
+        assert_eq!(restored.total_completed(), 7);
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored.max_size(), Some(3));
+    }
+
+    #[test]
+    fn test_total_completed_legacy_json_defaults_to_len() {
+        // Pre-counter checkpoints lack total_completed and were unbounded, so
+        // total pushed equals stored len.
+        let json = r#"{"trials":[
+            {"candidate":1,"observation":0.1,"trial_id":0,"timestamp":1},
+            {"candidate":2,"observation":0.2,"trial_id":1,"timestamp":2}
+        ],"next_id":2}"#;
+        let lb: Leaderboard<u32, f64> = serde_json::from_str(json).unwrap();
+        assert_eq!(lb.len(), 2);
+        assert_eq!(lb.total_completed(), 2);
+    }
+
+    #[test]
+    fn test_total_completed_new_checkpoint_count_beats_len() {
+        // A new checkpoint can record a count above stored len (post-cap). The
+        // max() reconstruction must keep that real count, not clamp to len.
+        let json = r#"{"trials":[
+            {"candidate":1,"observation":0.1,"trial_id":5,"timestamp":1}
+        ],"next_id":6,"max_size":1,"total_completed":42}"#;
+        let lb: Leaderboard<u32, f64> = serde_json::from_str(json).unwrap();
+        assert_eq!(lb.len(), 1);
+        assert_eq!(lb.total_completed(), 42);
+    }
+
+    #[test]
+    fn test_cap_zero_is_normalized_to_unbounded() {
+        // Some(0) is invalid and treated as unbounded: it must never evict the
+        // just-pushed trial. Builder, setter, and deserialization all agree.
+        let mut lb = Leaderboard::<u32, f64>::new().with_max_size(Some(0));
+        assert_eq!(lb.max_size(), None, "with_max_size(Some(0)) must normalize");
+        for i in 0..4 {
+            lb.push(i, i as f64);
+        }
+        assert_eq!(lb.len(), 4, "cap 0 must behave as unbounded");
+        assert!(lb.contains_trial_id(0));
+        assert!(lb.contains_trial_id(3));
+
+        // set_max_size(Some(0)) on a populated leaderboard must not drop trials.
+        lb.set_max_size(Some(0));
+        assert_eq!(lb.max_size(), None, "set_max_size(Some(0)) must normalize");
+        assert_eq!(lb.len(), 4, "cap 0 must not evict existing trials");
+
+        // A persisted Some(0) deserializes to unbounded as well.
+        let json = r#"{"trials":[{"candidate":1,"observation":0.5,"trial_id":0,"timestamp":7}],"next_id":1,"max_size":0}"#;
+        let restored: Leaderboard<u32, f64> = serde_json::from_str(json).unwrap();
+        assert_eq!(restored.max_size(), None);
+        assert_eq!(restored.len(), 1);
+        assert!(restored.contains_trial_id(0));
     }
 }

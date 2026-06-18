@@ -30,11 +30,21 @@ pub struct DiscreteSpace {
 impl DiscreteSpace {
     pub fn new(min: i64, max: i64) -> Self {
         assert!(min <= max, "DiscreteSpace: min must be <= max");
+        // Compute the inclusive width using i128 so a range wider than
+        // i64::MAX (e.g. [i64::MIN, i64::MAX]) does not overflow, then ensure
+        // it is representable as a usize cardinality.
+        let width = (max as i128) - (min as i128) + 1;
+        assert!(
+            width <= usize::MAX as i128,
+            "DiscreteSpace: range width {width} exceeds usize::MAX and cannot be represented as a cardinality"
+        );
         Self { min, max }
     }
 
     pub fn cardinality(&self) -> usize {
-        (self.max - self.min + 1) as usize
+        // Widen to i128 before subtracting to avoid i64 overflow for ranges
+        // wider than i64::MAX. new() guarantees this fits in a usize.
+        ((self.max as i128) - (self.min as i128) + 1) as usize
     }
 }
 
@@ -59,7 +69,8 @@ impl StandardizedSpace for DiscreteSpace {
         let n = self.cardinality() as f64;
         // Map integer to the center of its bucket
         // Integer i gets bucket [(i-min)/n, (i-min+1)/n), center at (i-min+0.5)/n
-        let bucket_center = (*point - self.min) as f64 + 0.5;
+        // Widen to i128 so the offset does not overflow for ranges wider than i64::MAX.
+        let bucket_center = ((*point as i128) - (self.min as i128)) as f64 + 0.5;
         vec![bucket_center / n]
     }
 
@@ -70,11 +81,14 @@ impl StandardizedSpace for DiscreteSpace {
         let val = vec[0].clamp(0.0, 1.0);
         let n = self.cardinality() as f64;
         // Map from [0,1] to bucket index, then to actual integer
-        // val * n gives us a value in [0, n], floor gives bucket index
-        let index = (val * n).floor() as i64;
+        // val * n gives us a value in [0, n], floor gives bucket index.
+        // Compute in i128 so adding the index to min cannot overflow for ranges
+        // wider than i64::MAX.
+        let index = (val * n).floor() as i128;
         // Clamp to valid range (handles edge case where val = 1.0 exactly)
-        let index = index.min(self.max - self.min);
-        Some(self.min + index)
+        let max_index = (self.max as i128) - (self.min as i128);
+        let index = index.min(max_index);
+        Some(((self.min as i128) + index) as i64)
     }
 }
 
@@ -157,5 +171,43 @@ mod tests {
         let space = DiscreteSpace::new(0, 2);
         assert_eq!(space.from_unit_cube(&[0.0]).unwrap(), 0);
         assert_eq!(space.from_unit_cube(&[1.0]).unwrap(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds usize::MAX")]
+    fn test_full_i64_range_panics_clean() {
+        // [i64::MIN, i64::MAX] has width 2^64 which exceeds usize::MAX; new()
+        // must panic with a clear message rather than overflow silently.
+        DiscreteSpace::new(i64::MIN, i64::MAX);
+    }
+
+    #[test]
+    fn test_near_i64_max_width_clean() {
+        // A range narrower than usize::MAX but still wider than i64::MAX must
+        // construct and round-trip without i64 overflow.
+        let min = i64::MIN;
+        let max = i64::MIN + (i64::MAX); // width = i64::MAX + 1, fits in usize on 64-bit
+        let space = DiscreteSpace::new(min, max);
+        // cardinality must be computed via i128 without overflow.
+        let card = space.cardinality();
+        assert_eq!(card as i128, (max as i128) - (min as i128) + 1);
+
+        // Endpoints and an interior point round-trip cleanly.
+        for &pt in &[min, max, min / 2 + max / 2] {
+            let unit = space.to_unit_cube(&pt);
+            assert_eq!(unit.len(), 1);
+            assert!(
+                unit[0] >= 0.0 && unit[0] <= 1.0,
+                "unit out of range for {pt}"
+            );
+            let restored = space.from_unit_cube(&unit).unwrap();
+            // For a span this enormous, floating-point bucketing cannot recover
+            // the exact integer, but the result must stay within bounds and not
+            // overflow.
+            assert!(
+                restored >= min && restored <= max,
+                "restored {restored} out of bounds"
+            );
+        }
     }
 }

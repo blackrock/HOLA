@@ -59,10 +59,13 @@ where
     }
 
     fn from_unit_cube(&self, vec: &[f64]) -> Option<Self::Domain> {
-        let split = self.a.dimensionality();
-        if vec.len() < split {
+        // Reject any vector that is not exactly the product dimensionality:
+        // an over-length vector would silently feed trailing dims into the
+        // right child, and an under-length one cannot be split.
+        if vec.len() != self.dimensionality() {
             return None;
         }
+        let split = self.a.dimensionality();
 
         let (left_vec, right_vec) = vec.split_at(split);
 
@@ -81,7 +84,7 @@ pub enum EitherDomain<A, B> {
     Right(B),
 }
 
-/// Disjoint union of two spaces — the domain is either a value from `A` or
+/// Disjoint union of two spaces: the domain is either a value from `A` or
 /// from `B`, but not both.
 ///
 /// In the unit-hypercube representation, the first dimension is a routing
@@ -158,7 +161,12 @@ where
     }
 
     fn from_unit_cube(&self, vec: &[f64]) -> Option<Self::Domain> {
-        if vec.is_empty() {
+        // Require the full layout: [selector, ...max-padded branch dims].
+        // Rejecting any other length stops both under-length vectors (which
+        // cannot supply the active branch) and over-length vectors (whose
+        // trailing dims would otherwise be silently dropped). The branch's
+        // own dims are then the leading slice of the zero-padded remainder.
+        if vec.len() != self.dimensionality() {
             return None;
         }
 
@@ -167,16 +175,10 @@ where
 
         if selector < 0.5 {
             let left_dim = self.left.dimensionality();
-            if branch_dims.len() < left_dim {
-                return None;
-            }
             let val = self.left.from_unit_cube(&branch_dims[..left_dim])?;
             Some(EitherDomain::Left(val))
         } else {
             let right_dim = self.right.dimensionality();
-            if branch_dims.len() < right_dim {
-                return None;
-            }
             let val = self.right.from_unit_cube(&branch_dims[..right_dim])?;
             Some(EitherDomain::Right(val))
         }
@@ -472,5 +474,117 @@ mod tests {
         };
         assert!(space.from_unit_cube(&[0.75, 0.5]).is_none());
         assert!(space.from_unit_cube(&[]).is_none());
+    }
+
+    #[test]
+    fn test_product_space_from_unit_cube_over_length() {
+        // An over-length vector must be rejected, not silently truncated with
+        // trailing dims dropped.
+        let space = ProductSpace {
+            a: ContinuousSpace::new(0.0, 1.0),
+            b: ContinuousSpace::new(0.0, 1.0),
+        };
+        assert_eq!(space.dimensionality(), 2);
+        assert!(space.from_unit_cube(&[0.5, 0.5, 0.5]).is_none());
+        assert!(space.from_unit_cube(&[0.1, 0.2, 0.3, 0.4]).is_none());
+    }
+
+    #[test]
+    fn test_branching_space_from_unit_cube_over_length() {
+        // A vector longer than the branching dimensionality must be rejected so
+        // trailing dims are not silently dropped.
+        let space = BranchingSpace {
+            left: ContinuousSpace::new(0.0, 1.0),
+            right: ProductSpace {
+                a: ContinuousSpace::new(0.0, 1.0),
+                b: ContinuousSpace::new(0.0, 1.0),
+            },
+        };
+        assert_eq!(space.dimensionality(), 3);
+        // Right branch needs 2 dims -> total 3; supplying 4 must be rejected.
+        assert!(space.from_unit_cube(&[0.75, 0.1, 0.2, 0.3]).is_none());
+        // Left branch only needs 1 active dim but the layout is still 3 dims
+        // wide (zero-padded); an over-length 4-vector must be rejected.
+        assert!(space.from_unit_cube(&[0.25, 0.1, 0.0, 0.0]).is_none());
+    }
+
+    // ======================================================================
+    // Property tests
+    // ======================================================================
+
+    proptest::proptest! {
+        /// Over a Product tree, to_unit_cube output length == dimensionality()
+        /// and the value round-trips. Also locks in exact-length rejection.
+        #[test]
+        fn prop_product_roundtrip_and_length(
+            x in -100.0f64..100.0,
+            y in 0.0f64..50.0,
+            z in -10.0f64..10.0,
+        ) {
+            let space = ProductSpace {
+                a: ProductSpace {
+                    a: ContinuousSpace::new(-100.0, 100.0),
+                    b: ContinuousSpace::new(0.0, 50.0),
+                },
+                b: ContinuousSpace::new(-10.0, 10.0),
+            };
+            let point = ((x, y), z);
+            let unit = space.to_unit_cube(&point);
+            proptest::prop_assert_eq!(unit.len(), space.dimensionality());
+
+            let recon = space.from_unit_cube(&unit).unwrap();
+            proptest::prop_assert!((recon.0.0 - x).abs() < 1e-6);
+            proptest::prop_assert!((recon.0.1 - y).abs() < 1e-6);
+            proptest::prop_assert!((recon.1 - z).abs() < 1e-6);
+
+            // Exact-length rejection: one too many / one too few must be None.
+            let mut too_long = unit.clone();
+            too_long.push(0.5);
+            proptest::prop_assert!(space.from_unit_cube(&too_long).is_none());
+            let too_short = &unit[..unit.len() - 1];
+            proptest::prop_assert!(space.from_unit_cube(too_short).is_none());
+        }
+
+        /// Over a Branching tree, to_unit_cube output length == dimensionality()
+        /// for both branches, the value round-trips, and exact-length is enforced.
+        #[test]
+        fn prop_branching_roundtrip_and_length(
+            pick_right in proptest::bool::ANY,
+            l in 0.0f64..10.0,
+            ra in -5.0f64..5.0,
+            rb in 0.0f64..1.0,
+        ) {
+            let space = BranchingSpace {
+                left: ContinuousSpace::new(0.0, 10.0),
+                right: ProductSpace {
+                    a: ContinuousSpace::new(-5.0, 5.0),
+                    b: ContinuousSpace::new(0.0, 1.0),
+                },
+            };
+            let point = if pick_right {
+                EitherDomain::Right((ra, rb))
+            } else {
+                EitherDomain::Left(l)
+            };
+            let unit = space.to_unit_cube(&point);
+            proptest::prop_assert_eq!(unit.len(), space.dimensionality());
+
+            let recon = space.from_unit_cube(&unit).unwrap();
+            match (recon, pick_right) {
+                (EitherDomain::Left(v), false) => proptest::prop_assert!((v - l).abs() < 1e-6),
+                (EitherDomain::Right((a, b)), true) => {
+                    proptest::prop_assert!((a - ra).abs() < 1e-6);
+                    proptest::prop_assert!((b - rb).abs() < 1e-6);
+                }
+                _ => proptest::prop_assert!(false, "branch routing mismatch"),
+            }
+
+            // Exact-length rejection.
+            let mut too_long = unit.clone();
+            too_long.push(0.5);
+            proptest::prop_assert!(space.from_unit_cube(&too_long).is_none());
+            let too_short = &unit[..unit.len() - 1];
+            proptest::prop_assert!(space.from_unit_cube(too_short).is_none());
+        }
     }
 }

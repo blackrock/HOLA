@@ -93,6 +93,10 @@ jobs:
     name: Wheel (${{ matrix.os }} ${{ matrix.target }})
     needs: [validate-release]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -116,7 +120,7 @@ jobs:
 
       - name: Set up QEMU
         if: matrix.target == 'aarch64' && runner.os == 'Linux'
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4
         with:
           platforms: arm64
 
@@ -127,14 +131,19 @@ jobs:
           cp dashboard/index.html dashboard/styles.css dashboard/app.js hola-py/hola_opt/dashboard/
 
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist ${{ runner.os == 'Linux' && '-i python3.10' || '' }}
+          args: --release --locked --out dist ${{ runner.os == 'Linux' && '-i python3.10' || '' }}
           manylinux: auto
           working-directory: hola-py
           # ring (via rustls) needs __ARM_ARCH when cross-compiling aarch64 from x86 in manylinux Docker
           docker-options: ${{ matrix.target == 'aarch64' && runner.os == 'Linux' && '-e CFLAGS_aarch64_unknown_linux_gnu=-D__ARM_ARCH=8' || '' }}
+
+      - name: Attest wheel provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: hola-py/dist/*.whl
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v7
@@ -147,15 +156,24 @@ jobs:
     name: Source distribution
     needs: [validate-release]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v6
 
       - name: Build sdist
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: sdist
-          args: --out dist
+          args: --locked --out dist
           working-directory: hola-py
+
+      - name: Attest sdist provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: hola-py/dist/*.tar.gz
 
       - name: Upload sdist artifact
         uses: actions/upload-artifact@v7
@@ -190,11 +208,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         continue-on-error: true
 
       - name: Install cross-compilation tools
@@ -204,7 +222,7 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Build CLI binary
-        run: cargo build --release --target ${{ matrix.target }} -p hola-cli
+        run: cargo build --locked --release --target ${{ matrix.target }} -p hola-cli
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CFLAGS_aarch64_unknown_linux_gnu: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '-D__ARM_ARCH=8' || '' }}
@@ -274,7 +292,7 @@ jobs:
           merge-multiple: true
 
       - name: Create release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           files: dist/*
           generate_release_notes: true
@@ -297,50 +315,36 @@ jobs:
           CURRENT_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          mkdir -p index/simple/hola-opt
 
-          # Collect wheel/sdist download URLs from stable releases. If no stable
-          # release exists yet, index only the current prerelease so old RC assets
-          # with obsolete package versions do not remain install candidates.
-          # gh release view returns browser-downloadable URLs in .assets[].url.
-          gh release list --limit 100 --json tagName,isPrerelease \
+          # Collect download URLs from stable releases. If no stable release
+          # exists yet, index only the current tag so the index is never empty.
+          gh release list --limit 1000 --json tagName,isPrerelease \
             --jq '.[] | select(.isPrerelease == false) | .tagName' > /tmp/index_tags.txt
           if [[ ! -s /tmp/index_tags.txt ]]; then
             echo "${CURRENT_TAG}" > /tmp/index_tags.txt
           fi
 
+          # Emit one JSON array of {name,url} per tag, then union them into a
+          # single JSON array for the index builder (filtering/hashing/escaping
+          # all happen in build_simple_index.py).
           while read -r tag; do
             gh release view "$tag" --json assets \
-              --jq '[.assets[] | select(.name | test("\\.(whl|tar\\.gz)$")) | .url] | .[]'
-          done < /tmp/index_tags.txt | sort -u > /tmp/asset_urls.txt
+              --jq '[.assets[] | {name: .name, url: .url}]'
+          done < /tmp/index_tags.txt \
+            | python3 .github/scripts/build_simple_index.py
 
-          if [[ ! -s /tmp/asset_urls.txt ]]; then
-            echo "No wheel or sdist assets found for the package index" >&2
-            exit 1
-          fi
-
-          # Build the per-package index page (PEP 503)
-          {
-            echo '<!DOCTYPE html><html><body>'
-            while IFS= read -r url; do
-              filename=$(basename "$url")
-              echo "  <a href=\"${url}\">${filename}</a><br/>"
-            done < /tmp/asset_urls.txt
-            echo '</body></html>'
-          } > index/simple/hola-opt/index.html
-
-          # Build the root index page
-          cat > index/simple/index.html <<'ROOTHTML'
-          <!DOCTYPE html><html><body>
-            <a href="hola-opt/">hola-opt</a>
-          </body></html>
-          ROOTHTML
-
-          echo "Generated index with $(wc -l < /tmp/asset_urls.txt) assets"
           cat index/simple/hola-opt/index.html
 
+      - name: Verify generated index is installable
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/idxtest
+          /tmp/idxtest/bin/python -m pip install --quiet --upgrade pip
+          /tmp/idxtest/bin/python -m pip download --no-deps \
+            --index-url "file://$PWD/index/simple/" hola-opt -d /tmp/idxdl
+
       - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./index

@@ -78,7 +78,7 @@ study.run(forrester, n_trials=50)
 
 # Inspect the result
 best = study.top_k(1)[0]
-print(f"Best value: {best.score_vector:.4f}")
+print(f"Best value: {best.score_vector['value']:.4f}")
 print(f"At x = {best.params['x']:.4f}")
 ```
 
@@ -91,8 +91,9 @@ Here is what each step does.
 3. `study.run(forrester, n_trials=50)` runs 50 ask/tell iterations
    automatically.
 4. `study.top_k(1)` returns a list with the best `CompletedTrial`,
-   which has `.score_vector` (scalar score), `.params` (parameter
-   values), and `.id`.
+   which has `.score_vector` (a dict mapping each objective group to
+   its scalarized score), `.params` (parameter values), and
+   `.trial_id`.
 
 ## Your First Optimization (CLI)
 
@@ -139,7 +140,7 @@ We lint with
 
 ```bash
 cargo clippy --workspace --all-features -- -D warnings
-uv run ruff check .
+uv run --project hola-py ruff check .
 ```
 
 ## Running Examples

@@ -207,17 +207,26 @@ def _write_sobol_server_config(tmp_path, *, load_from=None):
 
 
 def _start_server(cli_binary, config_path, port):
-    url = f"http://localhost:{port}"
-    proc = subprocess.Popen(
-        [cli_binary, "serve", str(config_path), "--port", str(port)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if not _wait_for_server(url):
+    # The port was chosen via a bind-to-0 probe, which is racy: another
+    # process may grab it before the server binds. Retry a few times with a
+    # fresh free port on startup failure (e.g. address already in use).
+    attempts = 5
+    last_stderr = ""
+    for attempt in range(attempts):
+        url = f"http://localhost:{port}"
+        proc = subprocess.Popen(
+            [cli_binary, "serve", str(config_path), "--port", str(port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if _wait_for_server(url):
+            return proc, url
         proc.kill()
-        stderr = proc.stderr.read().decode() if proc.stderr else ""
-        pytest.fail(f"Server failed to start within timeout. stderr: {stderr}")
-    return proc, url
+        proc.wait(timeout=5)
+        last_stderr = proc.stderr.read().decode() if proc.stderr else ""
+        if attempt < attempts - 1:
+            port = _free_port()
+    pytest.fail(f"Server failed to start within timeout. stderr: {last_stderr}")
 
 
 def _stop_server(proc):

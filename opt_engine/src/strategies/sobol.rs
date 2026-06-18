@@ -14,13 +14,41 @@
 //! Sobol' sequences are low-discrepancy sequences that provide better coverage
 //! of the search space compared to pseudo-random sampling. This makes them
 //! particularly effective for initial exploration in optimization.
+//!
+//! `sobol_burley` provides a valid low-discrepancy Sobol' sequence only for the
+//! first `2^16` points: `sobol_burley::sample` debug-asserts the sample index is
+//! below `2^16`, and in release it masks the index, yielding unspecified or
+//! duplicate points beyond that. It also supports at most 256 dimensions. This
+//! strategy therefore uses Sobol' for the first `2^16` draws on spaces of at
+//! most 256 dimensions, and otherwise falls back to deterministic seeded
+//! pseudo-random sampling, so it never panics and never emits invalid or
+//! duplicate points.
 
 use crate::traits::{StandardizedSpace, Strategy};
+use rand::SeedableRng;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Maximum dimensionality supported by `sobol_burley::sample`.
+///
+/// The crate ships 256 dimensions of direction numbers and has an always-on
+/// `assert!(dimension < 256)` that panics in release as well as debug. This
+/// constant backs a defensive secondary net in `suggest`; the product layer
+/// (hola) is the primary guard and rejects Sobol on spaces beyond 256
+/// dimensions with a clear error.
+const MAX_SOBOL_DIMS: usize = 256;
+
+/// Maximum number of points `sobol_burley::sample` produces before its sequence
+/// stops being valid.
+///
+/// `sobol_burley::sample` has a `debug_assert!(sample_index < 1 << 16)` that
+/// panics in debug builds past `2^16`, and in release builds it masks the index
+/// to the top bits, yielding unspecified or duplicate points. `suggest` switches
+/// to deterministic pseudo-random sampling once the index reaches this bound.
+const MAX_SOBOL_SAMPLES: u32 = 1 << 16;
 
 /// Quasi-random sampling via Sobol' sequences with Owen scrambling.
 ///
@@ -108,8 +136,13 @@ impl<S, Obs> SobolStrategy<S, Obs> {
 }
 
 impl<S, Obs> Default for SobolStrategy<S, Obs> {
+    /// Deterministic default using a fixed seed of 0.
+    ///
+    /// `Default` must honor the reproducibility contract, so it delegates to
+    /// `Self::new(0)` rather than `auto_seed()` (which draws a nondeterministic
+    /// seed). Use `auto_seed()` explicitly when a random seed is wanted.
     fn default() -> Self {
-        Self::auto_seed()
+        Self::new(0)
     }
 }
 
@@ -126,16 +159,48 @@ where
         // Atomically fetch the current index and increment it
         let current_index = self.index.fetch_add(1, Ordering::Relaxed);
 
-        // Generate Sobol' point for each dimension
-        let sobol_vec: Vec<f64> = (0..dim)
-            .map(|d| sobol_burley::sample(current_index, d as u32, self.seed) as f64)
-            .collect();
+        // Two conditions make `sobol_burley::sample` unsafe to call:
+        //   - dimensions beyond 256: the crate has an always-on
+        //     `assert!(dimension < 256)` that panics in release as well as
+        //     debug. The product layer (hola) is the primary guard and rejects
+        //     Sobol on such spaces; this is a defensive secondary net.
+        //   - sample index at or beyond `2^16`: the crate `debug_assert!`s the
+        //     index is below `2^16` (panicking in debug) and masks the index in
+        //     release, producing unspecified or duplicate points.
+        // In either case fall back to deterministic seeded pseudo-random
+        // sampling so the strategy never panics and never emits invalid points.
+        let unit_vec: Vec<f64> = if dim > MAX_SOBOL_DIMS || current_index >= MAX_SOBOL_SAMPLES {
+            // Silent fallback. The hola product layer is the primary guard for
+            // the dimension limit and emits a single construction-time warning,
+            // so a per-call warning here would be redundant and noisy during the
+            // exploration phase.
+            let call_seed = (self.seed as u64)
+                .wrapping_add((current_index as u64).wrapping_mul(6364136223846793005));
+            let mut rng = rand::rngs::SmallRng::seed_from_u64(call_seed);
+            (0..dim)
+                .map(|_| rand::Rng::random_range(&mut rng, 0.0..1.0))
+                .collect()
+        } else {
+            (0..dim)
+                .map(|d| sobol_burley::sample(current_index, d as u32, self.seed) as f64)
+                .collect()
+        };
 
-        space.from_unit_cube(&sobol_vec).expect("Mapping failed")
+        space.from_unit_cube(&unit_vec).unwrap_or_else(|| {
+            // `from_unit_cube` only returns `None` on a length mismatch, which
+            // should not happen since the vector matches `dimensionality()`.
+            // Fall back to a deterministic in-cube midpoint rather than panic.
+            eprintln!(
+                "Warning: Sobol' unit-cube mapping failed; falling back to the cube midpoint"
+            );
+            space
+                .from_unit_cube(&vec![0.5; dim])
+                .expect("midpoint of the unit cube is always a valid mapping")
+        })
     }
 
     fn update(&mut self, _candidate: &S::Domain, _result: Obs) {
-        // Pure sampler — nothing to update.
+        // Pure sampler: nothing to update.
     }
 }
 
@@ -273,5 +338,130 @@ mod tests {
         let strat1 = SobolStrategy::<UnitInterval>::auto_seed();
         let strat2 = SobolStrategy::<UnitInterval>::auto_seed();
         assert_ne!(strat1.suggest(&space), strat2.suggest(&space));
+    }
+
+    #[test]
+    fn test_sobol_default_is_deterministic() {
+        // `Default` must honor the reproducibility contract: two default-
+        // constructed strategies use the same fixed seed and so produce
+        // identical sequences.
+        let space = UnitInterval;
+        let strat1 = SobolStrategy::<UnitInterval>::default();
+        let strat2 = SobolStrategy::<UnitInterval>::default();
+        for i in 0..20 {
+            let a = strat1.suggest(&space);
+            let b = strat2.suggest(&space);
+            assert_eq!(a, b, "Default strategies diverged at suggestion {i}");
+        }
+    }
+
+    use crate::traits::SampleSpace;
+
+    /// A test space with arbitrary dimensionality mapping to a `Vec<f64>`.
+    struct HighDimSpace {
+        dim: usize,
+    }
+
+    impl SampleSpace for HighDimSpace {
+        type Domain = Vec<f64>;
+
+        fn contains(&self, point: &Self::Domain) -> bool {
+            point.len() == self.dim && point.iter().all(|x| (0.0..=1.0).contains(x))
+        }
+    }
+
+    impl StandardizedSpace for HighDimSpace {
+        fn dimensionality(&self) -> usize {
+            self.dim
+        }
+
+        fn to_unit_cube(&self, point: &Self::Domain) -> Vec<f64> {
+            point.clone()
+        }
+
+        fn from_unit_cube(&self, vec: &[f64]) -> Option<Self::Domain> {
+            if vec.len() == self.dim {
+                Some(vec.to_vec())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// A space whose `from_unit_cube` rejects the strategy's raw sample (here,
+    /// any vector other than the exact midpoint) but accepts the `vec![0.5; n]`
+    /// fallback. This exercises the non-panicking fallback path without making
+    /// a valid domain point unconstructible.
+    struct MismatchSpace;
+
+    impl SampleSpace for MismatchSpace {
+        type Domain = f64;
+
+        fn contains(&self, _point: &Self::Domain) -> bool {
+            true
+        }
+    }
+
+    impl StandardizedSpace for MismatchSpace {
+        fn dimensionality(&self) -> usize {
+            1
+        }
+
+        fn to_unit_cube(&self, point: &Self::Domain) -> Vec<f64> {
+            vec![*point]
+        }
+
+        fn from_unit_cube(&self, vec: &[f64]) -> Option<Self::Domain> {
+            match vec.first() {
+                Some(&x) if x == 0.5 => Some(x),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn test_sobol_high_dimensional_does_not_panic() {
+        // More than the 256-dimension limit of `sobol_burley::sample`: must not
+        // reach the crate's always-on assert.
+        let space = HighDimSpace { dim: 300 };
+        let strat = SobolStrategy::<HighDimSpace>::new(42);
+        let point = strat.suggest(&space);
+        assert_eq!(point.len(), 300);
+        assert!(space.contains(&point), "fallback point should be in bounds");
+    }
+
+    #[test]
+    fn test_sobol_mapping_mismatch_does_not_panic() {
+        let space = MismatchSpace;
+        let strat = SobolStrategy::<MismatchSpace>::new(42);
+        // The raw Sobol' sample is rejected; `suggest` must fall back to the
+        // midpoint instead of panicking on `expect`.
+        let point = strat.suggest(&space);
+        assert_eq!(point, 0.5, "expected the midpoint fallback value");
+    }
+
+    #[test]
+    fn test_sobol_sample_count_limit_does_not_panic() {
+        // Low-dimensional space so the dimension guard is not exercised; only the
+        // sample-count guard can prevent a panic here.
+        let space = UnitInterval;
+        let strat = SobolStrategy::<UnitInterval>::new(42);
+
+        // Position the next draw at `2^16 - 1` (still valid for Sobol').
+        strat.index.store(MAX_SOBOL_SAMPLES - 1, Ordering::Relaxed);
+
+        // Index `2^16 - 1`: last valid Sobol' draw.
+        let p1 = strat.suggest(&space);
+        assert!((0.0..=1.0).contains(&p1), "Sobol point {p1} out of bounds");
+
+        // Index `2^16`: without the sample-count guard this would trip
+        // `sobol_burley::sample`'s `debug_assert!(sample_index < 1 << 16)` and
+        // panic in a test build. The guard routes it to the deterministic
+        // pseudo-random fallback instead.
+        let p2 = strat.suggest(&space);
+        assert!(
+            (0.0..=1.0).contains(&p2),
+            "fallback point {p2} out of bounds"
+        );
     }
 }

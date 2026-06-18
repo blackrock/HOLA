@@ -14,8 +14,7 @@
 //! This module is only compiled in `#[cfg(test)]` mode.
 //! Import with `use crate::test_helpers::*;` in any `mod tests` block.
 
-use crate::traits::{SampleSpace, StandardizedSpace, Strategy, Transformer};
-use std::marker::PhantomData;
+use crate::traits::{SampleSpace, StandardizedSpace};
 
 // =============================================================================
 // Mock Spaces
@@ -72,42 +71,5 @@ impl StandardizedSpace for UnitSquare {
         } else {
             None
         }
-    }
-}
-
-// =============================================================================
-// Mock Strategies
-// =============================================================================
-
-/// A strategy that always suggests the same fixed value.
-pub struct ConstantStrategy<Sp> {
-    pub value: f64,
-    pub _marker: PhantomData<Sp>,
-}
-
-impl<Sp: SampleSpace<Domain = f64> + StandardizedSpace> Strategy for ConstantStrategy<Sp> {
-    type Space = Sp;
-    type Observation = f64;
-
-    fn suggest(&self, _space: &Self::Space) -> f64 {
-        self.value
-    }
-
-    fn update(&mut self, _candidate: &f64, _observation: f64) {}
-}
-
-// =============================================================================
-// Mock Transformers
-// =============================================================================
-
-/// A transformer that passes f64 values through unchanged.
-pub struct IdentityTransformer;
-
-impl Transformer for IdentityTransformer {
-    type ForeignInput = f64;
-    type Output = f64;
-
-    fn transform(&self, input: f64) -> Result<f64, String> {
-        Ok(input)
     }
 }

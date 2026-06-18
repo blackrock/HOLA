@@ -45,7 +45,7 @@ def forrester(params):
 study.run(forrester, n_trials=50)
 
 best = study.top_k(1)[0]
-print(f"Best value: {best.score_vector}")
+print(f"Best value: {best.score_vector['value']:.4f}")
 print(f"At x = {best.params['x']:.4f}")
 ```
 
@@ -53,8 +53,10 @@ print(f"At x = {best.params['x']:.4f}")
 `Minimize("value")` tells HOLA to minimize the `"value"` field
 returned by the objective function.
 `study.run(forrester, n_trials=50)` automates 50 ask/tell iterations.
-`study.top_k(1)` returns the best `CompletedTrial`, which carries
-`.score_vector`, `.params`, and `.metrics`.
+`study.top_k(1)` returns a one-element list; element `[0]` is the best
+`CompletedTrial`. Its `.score_vector` maps each objective group to its
+scalarized score (here the single `"value"` objective), alongside
+`.params` and `.metrics`.
 
 ## Going Distributed
 

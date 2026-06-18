@@ -21,22 +21,19 @@
 //!    all spaces or strategies in general.
 //! 3. **[`Strategy`]** — the search algorithm. Proposes candidates and
 //!    incorporates observed results.
-//! 4. **[`Transformer`]** — the trust boundary between raw external results
-//!    (e.g., JSON from a worker) and the typed observations the strategy expects.
-//! 5. **[`RefittableStrategy`]** — optional extension for strategies that can
+//! 4. **[`RefittableStrategy`]** — optional extension for strategies that can
 //!    rebuild their internal model from a batch of historical trials (e.g., GMM
 //!    refitting from the top quantile of the leaderboard).
 
-use crate::leaderboard::{Leaderboard, Trial};
 use serde::{Serialize, de::DeserializeOwned};
 use std::fmt::Debug;
 
 /// Defines the structure and validity rules for a hyperparameter search space.
 ///
 /// Every optimization problem starts with a `SampleSpace` that describes what
-/// a valid configuration looks like. The [`Engine`](crate::engine::Engine)
-/// uses `contains` to validate strategy proposals and `clamp` to snap
-/// out-of-bounds candidates back into the feasible region.
+/// a valid configuration looks like. Callers use `contains` to validate
+/// strategy proposals and `clamp` to snap out-of-bounds candidates back into
+/// the feasible region.
 pub trait SampleSpace: Send + Sync + 'static {
     /// A single point in this space — the type that gets serialized to JSON
     /// and sent to the worker process (e.g., `f64`, `(f64, i64)`, or a
@@ -89,8 +86,8 @@ pub trait StandardizedSpace: SampleSpace {
 pub trait Strategy: Send + Sync + 'static {
     type Space: SampleSpace;
 
-    /// The result type the strategy consumes (must match the
-    /// [`Transformer::Output`] used by the engine).
+    /// The result type the strategy consumes (typically `f64` for scalar
+    /// optimization, or a map of named objectives for multi-objective).
     type Observation: Serialize + DeserializeOwned + Send + Sync + Clone + Debug;
 
     fn suggest(&self, space: &Self::Space) -> <Self::Space as SampleSpace>::Domain;
@@ -100,32 +97,6 @@ pub trait Strategy: Send + Sync + 'static {
         candidate: &<Self::Space as SampleSpace>::Domain,
         observation: Self::Observation,
     );
-}
-
-/// Converts raw external results into the typed observation the strategy expects.
-///
-/// A transformer has two responsibilities:
-///
-/// 1. **Schema validation** — parse untrusted input (typically JSON from a
-///    worker), extract the relevant fields, and reject malformed data. This
-///    is the only component in the pipeline that can fail at runtime; spaces
-///    and strategies are statically verified.
-/// 2. **Objective processing** — reduce the parsed fields into the
-///    observation type the strategy consumes. This includes negating values
-///    for maximization, computing weighted sums, or applying
-///    target-limit-priority (TLP) scalarization.
-///
-/// The built-in implementations (e.g., [`JsonFieldTransformer`],
-/// [`JsonWeightedTransformer`], [`JsonTlpTransformer`]) bundle both
-/// concerns into a single step.
-pub trait Transformer: Send + Sync + 'static {
-    /// Raw input from the outside world (usually `serde_json::Value`).
-    type ForeignInput: Debug + Send + Sync;
-
-    /// Validated output (must equal the strategy's `Observation` type).
-    type Output;
-
-    fn transform(&self, input: Self::ForeignInput) -> Result<Self::Output, String>;
 }
 
 // =============================================================================
@@ -181,40 +152,23 @@ pub trait RefittableStrategy: Strategy {
         trials: &[(<Self::Space as SampleSpace>::Domain, Self::Observation)],
     );
 
-    /// Refit from a leaderboard using a custom selector.
+    /// Reconcile a strategy produced by an off-lock refit with the strategy
+    /// currently installed in the engine, before it is swapped back in.
     ///
-    /// This is a convenience method that extracts trials from a leaderboard
-    /// using the provided selector function.
+    /// `self` is the freshly refit strategy carrying the new model; `live` is
+    /// the strategy in the engine, which may have advanced its sampling
+    /// counters via concurrent `suggest`/`update` calls while the refit ran on
+    /// a blocking thread. Implementations copy that volatile sampling state
+    /// forward from `live` into `self`, so swapping `self` back in does not
+    /// rewind trial counters or replay an already-issued sample.
     ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Refit from top 20% of trials
-    /// strategy.refit_from_leaderboard(&space, &leaderboard, |lb| {
-    ///     lb.top_quantile(0.2)
-    ///         .into_iter()
-    ///         .map(|t| (t.candidate, t.observation))
-    ///         .collect()
-    /// });
-    /// ```
-    fn refit_from_leaderboard<F>(
-        &mut self,
-        space: &Self::Space,
-        leaderboard: &Leaderboard<<Self::Space as SampleSpace>::Domain, Self::Observation>,
-        selector: F,
-    ) where
-        F: FnOnce(
-            &Leaderboard<<Self::Space as SampleSpace>::Domain, Self::Observation>,
-        ) -> Vec<Trial<<Self::Space as SampleSpace>::Domain, Self::Observation>>,
-        <Self::Space as SampleSpace>::Domain: Clone,
-        Self::Observation: Clone,
+    /// The default keeps `self` unchanged, which is correct for strategies that
+    /// carry no concurrently-mutated sampling state.
+    fn reconcile_after_refit(&mut self, live: &Self)
+    where
+        Self: Sized,
     {
-        let selected = selector(leaderboard);
-        let trials: Vec<_> = selected
-            .into_iter()
-            .map(|t| (t.candidate, t.observation))
-            .collect();
-        self.refit(space, &trials);
+        let _ = live;
     }
 }
 
@@ -254,6 +208,10 @@ impl RefitConfig {
     }
 
     pub fn with_quantile(min_trials: usize, refit_interval: usize, quantile: f64) -> Self {
+        assert!(
+            quantile > 0.0 && quantile <= 1.0,
+            "RefitConfig::with_quantile: quantile must be in (0, 1], got {quantile}"
+        );
         Self {
             min_trials,
             refit_interval,
@@ -271,7 +229,10 @@ impl RefitConfig {
         if let Some(k) = self.top_k {
             k.min(n_trials)
         } else if let Some(q) = self.top_quantile {
-            ((n_trials as f64) * q).ceil() as usize
+            let count = ((n_trials as f64) * q).ceil() as usize;
+            // Ensure at least one trial is selected when there are trials to
+            // select from, so a tiny quantile never yields an empty refit set.
+            if n_trials > 0 { count.max(1) } else { count }
         } else {
             n_trials
         }
@@ -325,5 +286,28 @@ mod tests {
 
         assert_eq!(config.selection_count(100), 10);
         assert_eq!(config.selection_count(7), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "quantile must be in (0, 1]")]
+    fn test_with_quantile_rejects_zero() {
+        RefitConfig::with_quantile(5, 3, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "quantile must be in (0, 1]")]
+    fn test_with_quantile_rejects_above_one() {
+        RefitConfig::with_quantile(5, 3, 1.5);
+    }
+
+    #[test]
+    fn test_selection_count_floors_to_one() {
+        // A tiny quantile must still select at least one trial when there are
+        // trials available, so a refit never gets an empty selection.
+        let config = RefitConfig::with_quantile(1, 1, 1e-6);
+        assert_eq!(config.selection_count(10), 1);
+        assert_eq!(config.selection_count(1), 1);
+        // With no trials, the count is zero (nothing to floor to).
+        assert_eq!(config.selection_count(0), 0);
     }
 }

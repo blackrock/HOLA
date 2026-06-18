@@ -27,7 +27,7 @@ from sklearn.model_selection import train_test_split
 
 
 def _extract_vec(p: dict[str, float]) -> np.ndarray:
-    keys = sorted(k for k in p if k.startswith("x"))
+    keys = sorted((k for k in p if k.startswith("x")), key=lambda k: int(k[1:]))
     return np.array([p[k] for k in keys])
 
 

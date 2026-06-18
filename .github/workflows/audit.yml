@@ -7,10 +7,14 @@ on:
     paths:
       - "**/Cargo.toml"
       - "Cargo.lock"
+      - "hola-py/pyproject.toml"
+      - "hola-py/uv.lock"
   pull_request:
     paths:
       - "**/Cargo.toml"
       - "Cargo.lock"
+      - "hola-py/pyproject.toml"
+      - "hola-py/uv.lock"
 
 permissions:
   contents: read
@@ -42,3 +46,20 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  python-audit:
+    name: Python dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.1.0
+      - name: pip-audit (hola-py)
+        working-directory: hola-py
+        run: |
+          # Export hola-py's locked dependency set and audit THAT. A bare
+          # `uvx pip-audit` with no arguments audits pip-audit's own ephemeral
+          # environment, not this project's dependencies.
+          uv export --format requirements-txt --no-emit-project --no-hashes -o /tmp/hola-py-requirements.txt
+          uvx pip-audit --requirement /tmp/hola-py-requirements.txt
