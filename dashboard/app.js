@@ -15,7 +15,8 @@
 const S = {
     mode: 'disconnected',   // 'disconnected' | 'live' | 'offline'
     serverUrl: '',
-    sse: null,
+    sse: null,                // AbortController for the live event stream
+
     trials: [],              // CompletedTrial[] from /api/trials
     space: [],               // [{name, type, min, max, scale}]
     objectives: [],           // [{field, type, target, limit, priority, group}]
@@ -33,13 +34,35 @@ const S = {
 // ============================================================================
 // Connection
 // ============================================================================
+// API token is kept in memory only (never localStorage) so it cannot be read
+// by extensions or persisted XSS. If supplied via ?token= for convenience it is
+// captured once and stripped from the URL to avoid leaking through history,
+// referrer headers, and access logs.
+let _apiToken = '';
+
+function captureUrlToken() {
+    const params = new URLSearchParams(window.location.search);
+    const urlToken = params.get('token');
+    if (!urlToken) return;
+    _apiToken = urlToken;
+    params.delete('token');
+    const query = params.toString();
+    const newUrl = window.location.pathname + (query ? '?' + query : '') + window.location.hash;
+    window.history.replaceState(null, '', newUrl);
+}
+
 function apiToken() {
-    const urlToken = new URLSearchParams(window.location.search).get('token');
-    if (urlToken) {
-        localStorage.setItem('hola_api_token', urlToken);
-        return urlToken;
-    }
-    return localStorage.getItem('hola_api_token') || '';
+    return _apiToken;
+}
+
+function setApiToken(token) {
+    _apiToken = token || '';
+}
+
+function clearApiToken() {
+    _apiToken = '';
+    const field = document.getElementById('api-token');
+    if (field) field.value = '';
 }
 
 function apiFetch(url, options = {}) {
@@ -53,59 +76,157 @@ function clearElement(el) {
     el.replaceChildren();
 }
 
+// Single-pass min/max. Math.min/max with the spread operator throws RangeError
+// (call stack exceeded) once the array is large enough (~100k+ elements), so we
+// fold instead of spreading. Returns {min, max} (both NaN for an empty array).
+function minMax(arr) {
+    let min = Infinity, max = -Infinity;
+    for (let i = 0; i < arr.length; i++) {
+        const v = arr[i];
+        if (v < min) min = v;
+        if (v > max) max = v;
+    }
+    if (min === Infinity) return { min: NaN, max: NaN };
+    return { min, max };
+}
+
 async function connectToServer() {
     const url = document.getElementById('server-url').value.trim().replace(/\/+$/, '')
         || 'http://localhost:8000';
     document.getElementById('server-url').value = url;
     S.serverUrl = url;
 
+    const tokenField = document.getElementById('api-token');
+    if (tokenField && tokenField.value) setApiToken(tokenField.value);
+
     try {
-        // Probe server by fetching space
-        const spaceResp = await fetch(`${url}/api/space`);
+        // Probe server by fetching space. All reads go through apiFetch so the
+        // bearer token rides along when the server opts into read auth.
+        const spaceResp = await apiFetch(`${url}/api/space`);
+        if (spaceResp.status === 401) throw new Error('Authentication failed: missing or invalid API token');
         if (!spaceResp.ok) throw new Error('Server not responding');
         const spaceData = await spaceResp.json();
         S.space = spaceData.params || [];
         S.paramNames = S.space.map(p => p.name);
 
         // Fetch objectives
-        const objResp = await fetch(`${url}/api/objectives`);
+        const objResp = await apiFetch(`${url}/api/objectives`);
         const objData = await objResp.json();
         S.objectives = objData.objectives || [];
         S.serverObjectives = JSON.parse(JSON.stringify(S.objectives));
 
         // Fetch trials
-        const trialsResp = await fetch(`${url}/api/trials?sorted_by=index&include_infeasible=true`);
+        const trialsResp = await apiFetch(`${url}/api/trials?sorted_by=index&include_infeasible=true`);
         S.trials = await trialsResp.json();
 
         discoverMetrics();
         setMode('live');
         renderAll();
-        startSSE();
+        startStream();
     } catch (e) {
         alert('Failed to connect: ' + e.message);
     }
 }
 
-function startSSE() {
-    if (S.sse) S.sse.close();
-    S.sse = new EventSource(`${S.serverUrl}/api/events`);
-    S.sse.onopen = () => setDot('connected');
-    S.sse.onerror = () => setDot('disconnected');
-    S.sse.onmessage = async (e) => {
-        const event = JSON.parse(e.data);
-        if (event.type === 'TrialCompleted') {
-            const trial = event.trial || await fetchCompletedTrial(event.trial_id);
-            if (!trial) return;
-            upsertTrial(trial);
-            discoverMetrics();
-            S.lastTrialTime = Date.now();
-            if (S.previewActive) previewObjectives(); else renderAll();
+// Live event stream. EventSource cannot send an Authorization header, so we
+// stream /api/events via fetch (which carries the bearer token through
+// apiFetch) and parse the text/event-stream body incrementally. This keeps the
+// token out of the URL and works whether or not read auth is enabled. The
+// stream reconnects on drop.
+function startStream() {
+    stopStream();
+    const controller = new AbortController();
+    S.sse = controller;
+    streamEvents(controller);
+}
+
+function stopStream() {
+    if (S.sse) {
+        S.sse.abort();
+        S.sse = null;
+    }
+}
+
+async function streamEvents(controller) {
+    try {
+        const resp = await apiFetch(`${S.serverUrl}/api/events`, {
+            headers: { Accept: 'text/event-stream' },
+            signal: controller.signal,
+        });
+        if (!resp.ok || !resp.body) {
+            setDot('disconnected');
+            scheduleReconnect(controller);
+            return;
         }
-    };
+        setDot('connected');
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            // Events are separated by a blank line; process each complete one
+            // and keep any partial trailing event in the buffer.
+            let sep;
+            while ((sep = buffer.indexOf('\n\n')) >= 0) {
+                const chunk = buffer.slice(0, sep);
+                buffer = buffer.slice(sep + 2);
+                handleStreamEvent(chunk);
+            }
+        }
+        // Stream ended cleanly; reconnect unless this stream was superseded.
+        setDot('disconnected');
+        scheduleReconnect(controller);
+    } catch (e) {
+        if (controller.signal.aborted) return; // intentionally stopped
+        setDot('disconnected');
+        scheduleReconnect(controller);
+    }
+}
+
+function scheduleReconnect(controller) {
+    // Only reconnect if this controller is still the active stream.
+    if (S.sse !== controller || S.mode !== 'live') return;
+    setTimeout(() => {
+        if (S.sse === controller && S.mode === 'live') streamEvents(controller);
+    }, 2000);
+}
+
+// Parse one text/event-stream record (lines separated by \n) and dispatch its
+// JSON data payload to handleEngineEvent.
+function handleStreamEvent(chunk) {
+    const dataLines = [];
+    for (const line of chunk.split('\n')) {
+        if (line.startsWith('data:')) {
+            // Strip the "data:" prefix and a single optional leading space.
+            dataLines.push(line.slice(line[5] === ' ' ? 6 : 5));
+        }
+        // Lines starting with ':' are keep-alive comments; ignore them.
+    }
+    if (dataLines.length === 0) return;
+    let event;
+    try {
+        event = JSON.parse(dataLines.join('\n'));
+    } catch {
+        return;
+    }
+    handleEngineEvent(event);
+}
+
+async function handleEngineEvent(event) {
+    if (event.type === 'TrialCompleted') {
+        const trial = event.trial || await fetchCompletedTrial(event.trial_id);
+        if (!trial) return;
+        upsertTrial(trial);
+        discoverMetrics();
+        S.lastTrialTime = Date.now();
+        if (S.previewActive) previewObjectives(); else renderAll();
+    }
 }
 
 async function fetchCompletedTrial(trialId) {
-    const resp = await fetch(`${S.serverUrl}/api/trial/${trialId}?include_infeasible=true`);
+    const resp = await apiFetch(`${S.serverUrl}/api/trial/${trialId}?include_infeasible=true`);
     if (!resp.ok) return null;
     return resp.json();
 }
@@ -119,6 +240,18 @@ function upsertTrial(trial) {
 function loadCheckpointFile(event) {
     const file = event.target.files[0];
     if (!file) return;
+    // Guard against oversized files: readAsText buffers the whole file into a
+    // string on the main thread, so a multi-hundred-MB drop would hang the tab
+    // or exhaust memory. Reject anything beyond a reasonable checkpoint size.
+    const MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024; // 8 MB
+    if (file.size > MAX_CHECKPOINT_BYTES) {
+        alert(`Checkpoint file is too large (${(file.size / (1024 * 1024)).toFixed(1)} MB). ` +
+            `Maximum supported size is ${MAX_CHECKPOINT_BYTES / (1024 * 1024)} MB.`);
+        event.target.value = '';
+        return;
+    }
+    // Tear down any live stream so its events do not bleed into offline data.
+    stopStream();
     const reader = new FileReader();
     reader.onload = (e) => {
         try {
@@ -126,17 +259,23 @@ function loadCheckpointFile(event) {
             // Support both Checkpoint and LeaderboardCheckpoint formats
             const lb = data.leaderboard;
             if (!lb || !lb.trials) throw new Error('Invalid checkpoint format');
-            // Map old checkpoint format to new CompletedTrial shape
+            // Map persisted/checkpoint formats to the CompletedTrial shape.
+            // A real persisted leaderboard carries only `observation` (the
+            // engine's per-group scores: a scalar or a {group: score} map) plus
+            // `raw_metrics`; it has no rank/pareto_front/score_vector. Derive
+            // score_vector from the observation so single-objective checkpoints
+            // are detected, then compute rank/pareto_front client-side below.
             S.trials = lb.trials.map((t, i) => ({
                 trial_id: t.trial_id ?? t.id ?? i,
                 params: t.candidate ?? t.params ?? {},
                 metrics: t.raw_metrics ?? t.metrics ?? {},
                 scores: t.scores ?? {},
-                score_vector: t.score_vector ?? {},
-                rank: t.rank ?? i,
-                pareto_front: t.pareto_front ?? i,
+                score_vector: t.score_vector ?? observationToScoreVector(t.observation),
+                rank: t.rank,
+                pareto_front: t.pareto_front,
                 completed_at: t.timestamp ?? t.completed_at ?? 0,
             }));
+            computeRanksIfMissing(S.trials);
             // Try to extract param names from first trial
             S.space = [];
             S.paramNames = [];
@@ -150,8 +289,9 @@ function loadCheckpointFile(event) {
                 for (const p of S.space) {
                     const vals = S.trials.map(t => t.params?.[p.name]).filter(v => v != null);
                     if (vals.length > 0) {
-                        p.min = Math.min(...vals);
-                        p.max = Math.max(...vals);
+                        const mm = minMax(vals);
+                        p.min = mm.min;
+                        p.max = mm.max;
                     }
                 }
             }
@@ -165,6 +305,86 @@ function loadCheckpointFile(event) {
     };
     reader.readAsText(file);
     event.target.value = ''; // Reset so same file can be loaded again
+}
+
+// Convert a persisted leaderboard observation into the dashboard's score_vector
+// shape ({group: score}). The engine stores either a scalar (single objective)
+// or a {group: score} map (multi-group). Anything else yields an empty vector.
+function observationToScoreVector(observation) {
+    if (typeof observation === 'number') return { score: observation };
+    if (observation === 'inf') return { score: Infinity };
+    if (observation && typeof observation === 'object') return { ...observation };
+    return {};
+}
+
+// Compute rank and pareto_front client-side for any trial that lacks them (a
+// real persisted leaderboard has neither). Defaulting rank to the insertion
+// index would always flag trial 0 as best, so we rank off the derived scores
+// instead. Trials that already carry server-provided rank are left untouched.
+function computeRanksIfMissing(trials) {
+    const needs = trials.filter(t => typeof t.rank !== 'number');
+    if (needs.length === 0) return;
+
+    const groupsOf = t => {
+        const sv = t.score_vector;
+        return sv && typeof sv === 'object' ? Object.keys(sv) : [];
+    };
+    const groupNames = new Set();
+    for (const t of trials) for (const g of groupsOf(t)) groupNames.add(g);
+    const scoreVal = (t, g) => {
+        const v = t.score_vector?.[g];
+        if (v === 'inf') return Infinity;
+        return typeof v === 'number' ? v : NaN;
+    };
+
+    if (groupNames.size <= 1) {
+        // Scalar case: order by the sole score ascending (lower is better).
+        const g = [...groupNames][0];
+        const sumScore = t => {
+            if (g != null) return scoreVal(t, g);
+            // No groups at all: sum whatever numeric scores exist.
+            return Object.values(t.score_vector || {}).reduce(
+                (acc, v) => acc + (typeof v === 'number' ? v : 0), 0);
+        };
+        const order = trials
+            .map((t, i) => ({ t, i, s: sumScore(t) }))
+            .sort((a, b) => {
+                const av = isFinite(a.s) ? a.s : Infinity;
+                const bv = isFinite(b.s) ? b.s : Infinity;
+                return av - bv || a.i - b.i;
+            });
+        order.forEach((entry, rank) => {
+            if (typeof entry.t.rank !== 'number') entry.t.rank = rank;
+            if (typeof entry.t.pareto_front !== 'number') entry.t.pareto_front = rank;
+        });
+        return;
+    }
+
+    // Multi-group case: client-side non-dominated rank. A trial is rank 0 when
+    // no other trial dominates it (every group <= and at least one <). Higher
+    // ranks count how many trials dominate it, so the front is pareto_front 0.
+    const cols = [...groupNames];
+    const dominates = (a, b) => {
+        let strictly = false;
+        for (const g of cols) {
+            const av = scoreVal(a, g);
+            const bv = scoreVal(b, g);
+            if (!isFinite(av) || !isFinite(bv)) return false;
+            if (av > bv) return false;
+            if (av < bv) strictly = true;
+        }
+        return strictly;
+    };
+    for (const t of trials) {
+        if (typeof t.rank === 'number') continue;
+        let dominatedBy = 0;
+        for (const other of trials) {
+            if (other === t) continue;
+            if (dominates(other, t)) dominatedBy++;
+        }
+        t.rank = dominatedBy;
+        t.pareto_front = dominatedBy === 0 ? 0 : dominatedBy;
+    }
 }
 
 function discoverMetrics() {
@@ -181,18 +401,41 @@ function discoverMetrics() {
 // Helpers for score extraction
 // ============================================================================
 
-/// Get the primary scalar score from a trial's score_vector.
-/// For single-objective, returns the only value.
-/// For multi-objective, returns the sum of all group scores.
+/// True when every trial carries a single comparable scalar score, i.e. there
+/// is a single objective group. Summing across multiple groups would collapse
+/// incomparable Pareto axes into a meaningless scalar, so callers must treat the
+/// multi-objective case via rank / pareto_front instead.
+function isSingleObjective() {
+    let count = 0;
+    for (const t of S.trials) {
+        const sv = t.score_vector;
+        if (sv && typeof sv === 'object') {
+            count = Math.max(count, Object.keys(sv).length);
+            if (count > 1) return false;
+        }
+    }
+    return count === 1;
+}
+
+/// Get the single scalar score from a trial's score_vector. Returns a finite
+/// number only when there is exactly one objective group; for multi-objective
+/// trials it returns NaN because no scalar is meaningful across Pareto axes.
 function getTrialScore(trial) {
     const sv = trial.score_vector;
     if (!sv || typeof sv !== 'object') return NaN;
     const vals = Object.values(sv).map(v =>
         typeof v === 'number' ? v : v === 'inf' ? Infinity : NaN
     );
-    if (vals.length === 0) return NaN;
-    if (vals.length === 1) return vals[0];
-    return vals.reduce((a, b) => a + b, 0);
+    if (vals.length !== 1) return NaN;
+    return vals[0];
+}
+
+/// The authoritative "best" trial. The server provides rank and pareto_front;
+/// the rank-0 / pareto_front-0 trial is the best (or a Pareto-optimal trial in
+/// the multi-objective case) without inventing a cross-axis scalar.
+function getTrialRank(trial) {
+    const r = typeof trial.rank === 'number' ? trial.rank : NaN;
+    return isFinite(r) ? r : Infinity;
 }
 
 // ============================================================================
@@ -234,9 +477,18 @@ function renderAll() {
 function updateStats() {
     const best = findBest();
     document.getElementById('stat-trials').textContent = S.trials.length;
-    const bestScore = best != null ? getTrialScore(best) : NaN;
-    document.getElementById('stat-best').textContent =
-        isFinite(bestScore) ? bestScore.toPrecision(6) : '—';
+    // For a single objective the scalar score is meaningful; for multiple
+    // objectives report the best trial id (rank 0) instead of a fabricated sum.
+    let bestText = '—';
+    if (best != null) {
+        if (isSingleObjective()) {
+            const bestScore = getTrialScore(best);
+            if (isFinite(bestScore)) bestText = bestScore.toPrecision(6);
+        } else {
+            bestText = `#${fmtCell(best.trial_id)}`;
+        }
+    }
+    document.getElementById('stat-best').textContent = bestText;
     if (S.lastTrialTime) {
         const ago = Math.round((Date.now() - S.lastTrialTime) / 1000);
         document.getElementById('stat-last-time').textContent = ago < 60 ? `${ago}s ago` : `${Math.round(ago / 60)}m ago`;
@@ -244,12 +496,17 @@ function updateStats() {
     document.getElementById('table-count').textContent = `${S.trials.length} trials`;
 }
 
+// Best trial is driven off the server-provided rank (rank 0 / pareto_front 0)
+// rather than any client-side scalarization, which is invalid across multiple
+// objectives. Ties (multiple rank-0 Pareto trials) resolve to the first.
 function findBest() {
     let best = null;
     let bestIdx = -1;
+    let bestRank = Infinity;
     for (let i = 0; i < S.trials.length; i++) {
-        const score = getTrialScore(S.trials[i]);
-        if (isFinite(score) && (best === null || score < getTrialScore(best))) {
+        const rank = getTrialRank(S.trials[i]);
+        if (rank < bestRank) {
+            bestRank = rank;
             best = S.trials[i];
             bestIdx = i;
         }
@@ -288,29 +545,54 @@ function renderConvergence() {
     clearElement(container);
 
     const xs = S.trials.map((_, i) => i);
-    // Convert NaN to null so uPlot treats them as gaps instead of broken values
-    const ys = S.trials.map(t => {
-        const v = getTrialScore(t);
-        return isFinite(v) ? v : null;
-    });
+    const single = isSingleObjective();
 
-    // Running best
-    const runBest = [];
-    let best = Infinity;
-    for (const y of ys) {
-        if (y !== null && y < best) best = y;
-        runBest.push(best === Infinity ? null : best);
+    // Single objective: plot each trial's scalar score plus the running best.
+    // Multi-objective: a single scalar is not comparable across Pareto axes, so
+    // instead track the size of the rank-0 Pareto front as trials accumulate,
+    // which is a meaningful convergence signal.
+    let ys, runBest, scoreLabel, bestLabel;
+    if (single) {
+        // Convert NaN to null so uPlot treats them as gaps instead of broken values
+        ys = S.trials.map(t => {
+            const v = getTrialScore(t);
+            return isFinite(v) ? v : null;
+        });
+        runBest = [];
+        let best = Infinity;
+        for (const y of ys) {
+            if (y !== null && y < best) best = y;
+            runBest.push(best === Infinity ? null : best);
+        }
+        scoreLabel = 'Score';
+        bestLabel = 'Best';
+    } else {
+        ys = null;
+        runBest = [];
+        let frontCount = 0;
+        for (const t of S.trials) {
+            if (t.pareto_front === 0) frontCount++;
+            runBest.push(frontCount);
+        }
+        bestLabel = 'Pareto front size';
     }
 
     // Compute y-axis range from finite values only.
     // If the data spans many orders of magnitude, use log scale.
-    const finiteYs = ys.filter(v => v !== null && v > 0);
+    const plotted = (single ? ys : runBest);
+    const finiteAll = plotted.filter(v => v !== null && isFinite(v));
+    // A log axis cannot represent 0 (running-best can legitimately reach 0), so
+    // if any plotted finite value is exactly 0, force a linear axis.
+    const hasZero = finiteAll.some(v => v === 0);
+    const finiteYs = finiteAll.filter(v => v > 0);
     let useLog = false;
     let yScaleRange;
     if (finiteYs.length > 1) {
-        const yMin = Math.min(...finiteYs);
-        const yMax = Math.max(...finiteYs);
-        useLog = yMax / (yMin || 1) > 1000;
+        const { min: posMin, max: yMax } = minMax(finiteYs);
+        // Range still spans every finite value (including 0) so the axis frames
+        // the actual data, while the log-scale decision uses only positives.
+        const { min: yMin } = minMax(finiteAll);
+        useLog = !hasZero && yMax / (posMin || 1) > 1000;
         if (!useLog) {
             const yPad = (yMax - yMin) * 0.05 || 1;
             yScaleRange = (u, dataMin, dataMax) => [yMin - yPad, yMax + yPad];
@@ -346,20 +628,29 @@ function renderConvergence() {
                 }),
             },
         ],
-        series: [
-            { label: 'Trial' },
-            {
-                label: 'Score', stroke: '#6c5ce7', width: 1.5,
-                points: { show: true, size: 4, fill: '#6c5ce7' }
-            },
-            {
-                label: 'Best', stroke: '#00cec9', width: 2, dash: [6, 3],
-                points: { show: false }
-            },
-        ],
+        series: single
+            ? [
+                { label: 'Trial' },
+                {
+                    label: scoreLabel, stroke: '#6c5ce7', width: 1.5,
+                    points: { show: true, size: 4, fill: '#6c5ce7' }
+                },
+                {
+                    label: bestLabel, stroke: '#00cec9', width: 2, dash: [6, 3],
+                    points: { show: false }
+                },
+            ]
+            : [
+                { label: 'Trial' },
+                {
+                    label: bestLabel, stroke: '#00cec9', width: 2,
+                    points: { show: false }
+                },
+            ],
     };
 
-    S.uplot = new uPlot(opts, [xs, ys, runBest], container);
+    const data = single ? [xs, ys, runBest] : [xs, runBest];
+    S.uplot = new uPlot(opts, data, container);
 }
 
 // ============================================================================
@@ -416,10 +707,10 @@ function renderPareto() {
     if (points.length === 0) return;
 
     // Scale
-    let xMin = Math.min(...points.map(p => p.x));
-    let xMax = Math.max(...points.map(p => p.x));
-    let yMin = Math.min(...points.map(p => p.y));
-    let yMax = Math.max(...points.map(p => p.y));
+    const xmm = minMax(points.map(p => p.x));
+    const ymm = minMax(points.map(p => p.y));
+    let xMin = xmm.min, xMax = xmm.max;
+    let yMin = ymm.min, yMax = ymm.max;
     const xRange = xMax - xMin || 1;
     const yRange = yMax - yMin || 1;
     xMin -= xRange * 0.05; xMax += xRange * 0.05;
@@ -465,9 +756,13 @@ function renderPareto() {
         ctx.fillText(fmt(yVal), pad.left - 6, gy + 3);
     }
 
-    // Draw Pareto front line (using pareto_front == 0 from server)
+    // Draw the Pareto front connecting line only for a true 2-objective view,
+    // i.e. when the optimization has exactly two objective fields and the chosen
+    // axes are those fields. Sorting front points on an arbitrary axis pair would
+    // produce a misleading zig-zag, so for any other axis pair we only mark the
+    // pareto_front == 0 points (drawn below) without connecting them.
     const front = points.filter(p => p.onFront);
-    if (front.length >= 2) {
+    if (front.length >= 2 && isParetoAxisPair(xField, yField)) {
         const sorted = [...front].sort((a, b) => a.x - b.x);
         ctx.strokeStyle = 'rgba(108, 92, 231, 0.5)';
         ctx.lineWidth = 2;
@@ -512,6 +807,18 @@ function getMetric(trial, field) {
     const v = trial.metrics?.[field];
     if (v === 'inf') return Infinity;
     return v ?? NaN;
+}
+
+// The Pareto front is a true frontier in objective space only. Connecting the
+// front points is meaningful only when there are exactly two objectives and the
+// selected scatter axes are precisely those two objective fields.
+function isParetoAxisPair(xField, yField) {
+    const fields = S.objectives
+        .map(o => o.field)
+        .filter(f => f != null);
+    if (fields.length !== 2) return false;
+    const set = new Set(fields);
+    return xField !== yField && set.has(xField) && set.has(yField);
 }
 
 // ============================================================================
@@ -624,13 +931,16 @@ function renderParallel() {
         }
         if (sp) return { min: sp.min, max: sp.max };
         const vals = S.trials.map(t => t.params?.[name]).filter(v => v != null);
-        return { min: Math.min(...vals), max: Math.max(...vals) };
+        return minMax(vals);
     });
 
-    // Score range for coloring
-    const scores = S.trials.map(t => getTrialScore(t)).filter(isFinite);
-    const sMin = Math.min(...scores);
-    const sMax = Math.max(...scores);
+    // Coloring metric: the scalar score when single-objective, otherwise the
+    // server-provided rank (lower is better) so multi-objective lines still
+    // convey relative quality without an invalid cross-axis scalar.
+    const single = isSingleObjective();
+    const colorValue = single ? (t => getTrialScore(t)) : (t => getTrialRank(t));
+    const scores = S.trials.map(colorValue).filter(isFinite);
+    const { min: sMin, max: sMax } = minMax(scores);
     const sRange = sMax - sMin || 1;
 
     // Draw axes
@@ -670,7 +980,7 @@ function renderParallel() {
 
     // Draw lines
     for (const trial of S.trials) {
-        const score = getTrialScore(trial);
+        const score = colorValue(trial);
         if (!isFinite(score)) continue;
         const t = (score - sMin) / sRange;
         const r = Math.round(108 + t * (68 - 108));
@@ -735,11 +1045,11 @@ function renderTable() {
     // Sort trials
     let sorted = [...S.trials];
     if (S.sortCol) {
-        sorted.sort((a, b) => {
-            const va = getCellValue(a, S.sortCol);
-            const vb = getCellValue(b, S.sortCol);
-            return S.sortAsc ? va - vb : vb - va;
-        });
+        sorted.sort((a, b) => compareCellValues(
+            getCellValue(a, S.sortCol),
+            getCellValue(b, S.sortCol),
+            S.sortAsc,
+        ));
     }
 
     clearElement(tbody);
@@ -761,6 +1071,39 @@ function getCellValue(trial, col) {
     if (col === 'rank') return trial.rank;
     if (S.paramNames.includes(col)) return trial.params?.[col] ?? NaN;
     return trial.metrics?.[col] ?? NaN;
+}
+
+// Normalize a raw cell value to a sortable form: the string 'inf'/'-inf'
+// sentinels become +/-Infinity (matching getMetric), everything else is left
+// as-is. Numbers (finite or Infinity) sort numerically; non-numeric/missing
+// values are handled separately by compareCellValues.
+function normalizeSortValue(v) {
+    if (v === 'inf') return Infinity;
+    if (v === '-inf') return -Infinity;
+    return v;
+}
+
+// Deterministic ordering for table cells. Numeric values (including +/-Infinity
+// via the 'inf' sentinels) compare numerically; remaining values compare as
+// strings via localeCompare. NaN/null/undefined always sort to the very end of
+// the table regardless of `asc`, so the missing-value handling is applied after
+// the ascending/descending decision rather than being inverted by it.
+function compareCellValues(a, b, asc) {
+    const na = normalizeSortValue(a);
+    const nb = normalizeSortValue(b);
+    const aMissing = na == null || (typeof na === 'number' && isNaN(na));
+    const bMissing = nb == null || (typeof nb === 'number' && isNaN(nb));
+    if (aMissing || bMissing) {
+        if (aMissing && bMissing) return 0;
+        return aMissing ? 1 : -1; // missing last in both directions
+    }
+    let cmp;
+    if (typeof na === 'number' && typeof nb === 'number') {
+        cmp = na < nb ? -1 : na > nb ? 1 : 0;
+    } else {
+        cmp = String(na).localeCompare(String(nb));
+    }
+    return asc ? cmp : -cmp;
 }
 
 function fmtCell(v) {
@@ -871,7 +1214,7 @@ async function resetObjectives() {
     document.getElementById('preview-badge').style.display = 'none';
     if (S.mode === 'live') {
         // Re-fetch trials with the server's actual scores
-        const resp = await fetch(`${S.serverUrl}/api/trials?sorted_by=index&include_infeasible=true`);
+        const resp = await apiFetch(`${S.serverUrl}/api/trials?sorted_by=index&include_infeasible=true`);
         S.trials = await resp.json();
     }
     renderAll();
@@ -886,7 +1229,12 @@ function previewObjectives() {
         const groups = {};
         let feasible = true;
         for (const obj of S.objectives) {
-            const raw = m[obj.field];
+            // Normalize the engine's string sentinels to match getMetric so a
+            // persisted 'inf'/'-inf' metric is treated as +/-Infinity (and thus
+            // infeasible) rather than as a non-numeric value.
+            let raw = m[obj.field];
+            if (raw === 'inf') raw = Infinity;
+            else if (raw === '-inf') raw = -Infinity;
             if (raw == null || !isFinite(raw)) { feasible = false; continue; }
             const isMin = (obj.obj_type || obj.type || 'minimize') === 'minimize';
             let score;
@@ -925,7 +1273,7 @@ async function applyObjectives() {
         document.getElementById('preview-badge').style.display = 'none';
         S.serverObjectives = JSON.parse(JSON.stringify(S.objectives));
         // Re-fetch trials with server-side rescalarization
-        const trialsResp = await fetch(`${S.serverUrl}/api/trials?sorted_by=index&include_infeasible=true`);
+        const trialsResp = await apiFetch(`${S.serverUrl}/api/trials?sorted_by=index&include_infeasible=true`);
         S.trials = await trialsResp.json();
         renderAll();
     } catch (e) {
@@ -989,16 +1337,46 @@ window.addEventListener('resize', () => {
 });
 
 // ============================================================================
-// Auto-connect from URL params
+// Event wiring and startup
 // ============================================================================
-(() => {
+// All UI events are bound here via addEventListener so the markup needs no
+// inline on* handlers, which lets the page run under a script-src CSP without
+// 'unsafe-inline'.
+function wireEvents() {
+    const openFile = () => document.getElementById('file-input').click();
+
+    document.getElementById('btn-connect').addEventListener('click', connectToServer);
+    document.getElementById('btn-clear-token').addEventListener('click', clearApiToken);
+    document.getElementById('file-input').addEventListener('change', loadCheckpointFile);
+
+    document.getElementById('btn-preview-obj').addEventListener('click', previewObjectives);
+    document.getElementById('btn-reset-obj').addEventListener('click', resetObjectives);
+    document.getElementById('btn-apply-obj').addEventListener('click', applyObjectives);
+    document.getElementById('btn-save-ckpt').addEventListener('click', saveCheckpoint);
+    document.getElementById('btn-export').addEventListener('click', exportData);
+
+    for (const el of document.querySelectorAll('[data-action="connect"]')) {
+        el.addEventListener('click', connectToServer);
+    }
+    for (const el of document.querySelectorAll('[data-action="open-file"]')) {
+        el.addEventListener('click', openFile);
+    }
+}
+
+function startup() {
+    wireEvents();
+    // Capture a ?token= once into memory and strip it from the URL.
+    captureUrlToken();
+    // Auto-connect from URL params
     const params = new URLSearchParams(location.search);
     const server = params.get('server');
     if (server) {
         document.getElementById('server-url').value = server;
         connectToServer();
     }
-})();
+}
+
+startup();
 
 // Update "last trial" timer
 setInterval(() => {

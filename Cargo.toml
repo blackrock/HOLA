@@ -6,3 +6,9 @@ members = [
     "hola-py",
     "hola-cli",
 ]
+
+[workspace.package]
+# Minimum Supported Rust Version. The code uses std features stabilized in
+# Rust 1.87 (e.g. integer `is_multiple_of`), so this is the true floor.
+# Verified to build with `cargo build --locked --workspace`.
+rust-version = "1.87"

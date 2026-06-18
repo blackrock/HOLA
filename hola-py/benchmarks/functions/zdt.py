@@ -26,7 +26,7 @@ import numpy as np
 
 
 def _extract_vec(p: dict[str, float]) -> list[float]:
-    keys = sorted(k for k in p if k.startswith("x"))
+    keys = sorted((k for k in p if k.startswith("x")), key=lambda k: int(k[1:]))
     return [p[k] for k in keys]
 
 
@@ -98,7 +98,7 @@ def zdt2_pareto_front(n_points: int = 500) -> np.ndarray:
 
 
 def zdt3_pareto_front(n_points: int = 500) -> np.ndarray:
-    f1 = np.linspace(0, 0.8518, n_points)
+    f1 = np.linspace(0, 0.8518328654, n_points)
     f2 = 1 - np.sqrt(f1) - f1 * np.sin(10 * np.pi * f1)
     # Filter to non-dominated points
     front = np.column_stack([f1, f2])

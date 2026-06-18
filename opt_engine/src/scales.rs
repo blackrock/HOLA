@@ -13,7 +13,7 @@
 //!
 //! A scale defines a bijection between a linear *internal* space (where
 //! unit-cube normalization is performed) and the *actual* space of user-facing
-//! values. Users specify bounds in actual space; the scale handles the rest.
+//! values. Users specify bounds in actual space; the scale converts between the two spaces.
 
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -22,6 +22,13 @@ use std::fmt::Debug;
 /// user-facing actual space.
 ///
 /// `forward` maps internal → actual; `inverse` maps actual → internal.
+///
+/// The bijection is only defined over each scale's valid domain. Logarithmic
+/// scales, for example, are bijective only for actual values `x > 0`; inputs
+/// outside the valid domain are not part of the bijection and round-trips are
+/// not guaranteed for them. Implementations must still return a well-defined
+/// (non-NaN) `f64` for any input so callers see predictable behavior; see the
+/// individual scale types for the sentinel used out of domain.
 pub trait Scale: Send + Sync + Clone + Debug + 'static {
     /// Short identifier used for dashboard axis labels and config serialization.
     fn name() -> &'static str;
@@ -32,10 +39,13 @@ pub trait Scale: Send + Sync + Clone + Debug + 'static {
 
     /// Transform from actual space to internal space.
     /// e.g., for LogScale: inverse(x) = ln(x)
+    ///
+    /// Inputs outside the scale's valid domain are not part of the bijection;
+    /// see the implementing type for the out-of-domain behavior.
     fn inverse(&self, x: f64) -> f64;
 }
 
-/// Identity scale — the internal and actual spaces are the same.
+/// Identity scale: the internal and actual spaces are the same.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LinearScale;
 
@@ -57,6 +67,11 @@ impl Scale for LinearScale {
 ///
 /// Useful for parameters that vary over orders of magnitude.
 ///
+/// The valid domain of `inverse` (actual → internal) is `x > 0`, where it
+/// computes `ln(x)`. Non-positive inputs are outside the bijection; rather than
+/// returning NaN (as `ln` does for negatives), `inverse` maps them to the
+/// sentinel [`f64::NEG_INFINITY`] so the result is always well-defined.
+///
 /// # Example
 /// ```ignore
 /// // Learning rate between 1e-4 and 0.1, sampled on a natural log scale
@@ -75,13 +90,20 @@ impl Scale for LogScale {
     }
     #[inline]
     fn inverse(&self, x: f64) -> f64 {
-        x.ln()
+        // Valid domain is x > 0; map non-positive inputs to a defined sentinel
+        // instead of letting ln produce NaN for negatives.
+        if x > 0.0 { x.ln() } else { f64::NEG_INFINITY }
     }
 }
 
 /// Base-10 logarithmic scale: actual = 10^internal.
 ///
 /// Convenient when thinking in orders of magnitude.
+///
+/// The valid domain of `inverse` (actual → internal) is `x > 0`, where it
+/// computes `log10(x)`. Non-positive inputs are outside the bijection; rather
+/// than returning NaN (as `log10` does for negatives), `inverse` maps them to
+/// the sentinel [`f64::NEG_INFINITY`] so the result is always well-defined.
 ///
 /// # Example
 /// ```ignore
@@ -101,7 +123,13 @@ impl Scale for Log10Scale {
     }
     #[inline]
     fn inverse(&self, x: f64) -> f64 {
-        x.log10()
+        // Valid domain is x > 0; map non-positive inputs to a defined sentinel
+        // instead of letting log10 produce NaN for negatives.
+        if x > 0.0 {
+            x.log10()
+        } else {
+            f64::NEG_INFINITY
+        }
     }
 }
 
@@ -125,5 +153,25 @@ mod tests {
     fn test_log10_scale() {
         assert!((Log10Scale.forward(2.0) - 100.0).abs() < 1e-9); // 10^2 = 100
         assert!((Log10Scale.inverse(100.0) - 2.0).abs() < 1e-9); // log10(100) = 2
+    }
+
+    #[test]
+    fn test_log_scales_inverse_out_of_domain() {
+        // Non-positive inputs are outside the bijection and must map to the
+        // documented NEG_INFINITY sentinel rather than NaN.
+        for &x in &[0.0, -1.0, -1e-12, f64::NEG_INFINITY] {
+            let log = LogScale.inverse(x);
+            let log10 = Log10Scale.inverse(x);
+            assert!(!log.is_nan(), "LogScale.inverse({x}) should not be NaN");
+            assert!(!log10.is_nan(), "Log10Scale.inverse({x}) should not be NaN");
+            assert_eq!(log, f64::NEG_INFINITY);
+            assert_eq!(log10, f64::NEG_INFINITY);
+        }
+
+        // Positive-domain round-trips are unaffected by the guard.
+        for &x in &[1e-4, 0.5, 1.0, 100.0] {
+            assert!((LogScale.forward(LogScale.inverse(x)) - x).abs() < 1e-9);
+            assert!((Log10Scale.forward(Log10Scale.inverse(x)) - x).abs() < 1e-9);
+        }
     }
 }

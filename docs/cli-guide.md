@@ -207,6 +207,7 @@ hola serve config.yaml --port 8000
 | `--port` | `8000` | Port to listen on |
 | `--dashboard` | none | Path to a dashboard directory to serve at `/` (e.g. `--dashboard ./dashboard`) |
 | `--auth-token` | none | Bearer token required for write-capable API endpoints |
+| `--require-read-auth` | off | Also require the bearer token for read-only endpoints and the SSE stream (only meaningful with `--auth-token`) |
 | `--checkpoint-dir` | checkpoint config directory or config file directory | Directory where dashboard/API checkpoint saves are allowed |
 | `--cors-origin` | none | Allowed browser CORS origin. Repeat for multiple origins |
 
@@ -232,12 +233,18 @@ hola worker --server http://localhost:8000 --exec "python train.py"
 In callback mode, the worker loop works as follows.
 
 1. `POST /api/ask` to get a trial from the server
-2. Run the `--exec` command via `sh -c` with three
+2. Run the `--exec` command via `sh -c` with these
    environment variables set
    - `HOLA_SERVER`. The server URL
      (e.g., `http://localhost:8000`).
    - `HOLA_TRIAL_ID`. The numeric trial ID.
    - `HOLA_PARAMS`. Trial parameters as a JSON string.
+   - `HOLA_API_TOKEN`. Set only when the worker has a token
+     configured (via `--token` or the `HOLA_API_TOKEN`
+     environment variable). When present, the script must send
+     it as a `Bearer` header on its `POST /api/tell` and
+     `POST /api/cancel` requests, since those write endpoints
+     require authorization on a token-protected server.
 3. The script is responsible for calling `POST /api/tell` to
    report results back to the server
 4. If the script exits with non-zero status, the worker
@@ -332,14 +339,14 @@ curl -s -X POST "$HOLA_SERVER/api/tell" \
   -d "{\"trial_id\": $HOLA_TRIAL_ID, \"metrics\": {\"loss\": $LOSS}}"
 ```
 
-#### Python (callback mode, hola Python client)
+#### Python (callback mode, hola-opt Python client)
 
-If you have the `hola` Python package installed, you can use
-`Study.connect()` for a nicer API.
+If you have the `hola-opt` Python package (imported as `hola_opt`)
+installed, you can use `Study.connect()` for a nicer API.
 
 ```python
 #!/usr/bin/env python3
-# train.py - worker script using the hola Python client
+# train.py - worker script using the hola-opt Python client
 import json
 import os
 from hola_opt import Study

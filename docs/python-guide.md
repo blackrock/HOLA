@@ -33,7 +33,7 @@ The Python API exposes these classes:
 | `Sobol` | Sobol strategy configuration |
 | `Random` | Random strategy configuration |
 
-All classes are imported from the `hola` module.
+All classes are imported from the `hola_opt` module.
 
 ```python
 from hola_opt import (
@@ -301,7 +301,7 @@ study.run(objective, n_trials=100)
 |-----------|------|---------|-------------|
 | `func` | callable | required | Function that takes a params dict and returns a metrics dict |
 | `n_trials` | `int` | required | Number of trials to run |
-| `n_workers` | `int` | `0` | Parallel workers: `0` = auto-detect CPU count, `1` = sequential, `N` = N parallel threads |
+| `n_workers` | `int` | `1` | Parallel workers: `<=1` = sequential, `N` = N parallel threads |
 
 `run()` returns `self`, so you can chain.
 
@@ -311,7 +311,7 @@ best = study.run(objective, n_trials=100).top_k(1)[0]
 
 ### Parallel Evaluation
 
-With `n_workers > 1` (or the default `0` for auto-detect),
+With `n_workers > 1`,
 `run()` dispatches trials concurrently using Python's
 `ThreadPoolExecutor`. Each batch asks for `n_workers` trials,
 evaluates them in parallel, then tells the results.
@@ -370,9 +370,9 @@ import math
 best_so_far = float("inf")
 trace = []
 for trial in study.trials():
-    sv = trial.score_vector
-    obs = sv if isinstance(sv, (int, float)) else sv[0] if sv else float("inf")
-    if isinstance(obs, (int, float)) and math.isfinite(obs):
+    sv = trial.score_vector  # dict of {objective group: scalarized score}
+    obs = sum(sv.values()) if sv else float("inf")
+    if math.isfinite(obs):
         best_so_far = min(best_so_far, obs)
     trace.append(best_so_far)
 ```
@@ -496,6 +496,7 @@ study.run(objective, n_trials=100)  # runs locally while server is active
 |-----------|------|---------|-------------|
 | `port` | `int` | `8000` | TCP port to listen on |
 | `background` | `bool` | `False` | If `True`, runs in a background thread and returns immediately |
+| `dashboard_path` | `str` or `None` | `None` | Path to a dashboard directory to serve the bundled UI. When omitted, no dashboard is served. Use `str(dashboard_dir())` to serve the bundled dashboard. |
 
 When `background=True`, the study continues to work locally. Both
 local calls and remote HTTP requests share the same engine state,

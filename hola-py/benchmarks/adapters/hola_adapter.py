@@ -27,7 +27,7 @@ from benchmarks.problems.registry import (
     MultiObjectiveProblem,
     SingleObjectiveProblem,
 )
-from hola_opt import Minimize, Real, Space, Study
+from hola_opt import Maximize, Minimize, Real, Space, Study
 
 
 class HolaSingleObjectiveAdapter:
@@ -81,13 +81,26 @@ class HolaSingleObjectiveAdapter:
 class HolaMultiObjectiveAdapter:
     """HOLA multi-objective adapter.
 
-    Each objective maps to its own priority group via distinct priority values.
+    Each objective is its own priority group (the group defaults to the field
+    name), so all objectives are Pareto-ranked equally. Priorities are kept at
+    1.0 to avoid weighting any objective more heavily than the others, matching
+    the symmetric configuration used by the optuna/pymoo competitors.
     """
 
     def __init__(self, strategy: str = "gmm") -> None:
         self.strategy = strategy
         label = "GMM" if strategy == "gmm" else strategy
         self.name = f"HOLA MO ({label})"
+
+    @staticmethod
+    def _build_objectives(problem: MultiObjectiveProblem) -> list[Minimize | Maximize]:
+        # Each objective is its own group (group defaults to the field name).
+        # Use equal priority=1.0 so no objective is weighted more heavily.
+        objectives: list[Minimize | Maximize] = []
+        for i, obj_name in enumerate(problem.objective_names):
+            ref = problem.reference_point[i]
+            objectives.append(Minimize(obj_name, target=0.0, limit=ref, priority=1.0))
+        return objectives
 
     def optimize(
         self,
@@ -97,11 +110,7 @@ class HolaMultiObjectiveAdapter:
     ) -> MultiObjectiveResult:
         space_kwargs = {k: Real(lo, hi) for k, (lo, hi) in problem.bounds.items()}
 
-        # Each objective gets a distinct priority to form separate groups
-        objectives = []
-        for i, obj_name in enumerate(problem.objective_names):
-            ref = problem.reference_point[i]
-            objectives.append(Minimize(obj_name, target=0.0, limit=ref, priority=float(i + 1)))
+        objectives = self._build_objectives(problem)
 
         study = Study(
             space=Space(**space_kwargs),

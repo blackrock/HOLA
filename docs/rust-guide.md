@@ -10,9 +10,10 @@
 ## Architecture
 
 We organize the Rust internals into three layers. The **engine
-core** (`opt_engine`) provides a generic, type-safe optimization
-loop parameterized over space, strategy, and transformer. The
-**orchestration layer** (`hola`) wraps that core behind a
+core** (`opt_engine`) provides generic, type-safe optimization
+building blocks: spaces, strategies, scales, and the leaderboard.
+The **orchestration layer** (`hola`) composes those blocks into the
+optimization loop behind a
 JSON-based, type-erased interface that resolves spaces and
 strategies at runtime from configuration. The **public
 interfaces** (Python bindings, the CLI, and the REST server) all
@@ -26,5 +27,5 @@ If you want to browse the internal API documentation, run
 cargo doc -p opt_engine --open
 ```
 
-The inline doc comments are comprehensive and serve as the primary
+The inline doc comments serve as the primary
 reference for Rust-level details.

@@ -20,7 +20,9 @@
 //! - **REST server** (feature-gated behind `server`) — Axum HTTP server with
 //!   SSE, CORS, and dashboard integration.
 //!
-//! For compile-time type-safe optimization, use [`opt_engine::Engine`] directly.
+//! The [`opt_engine`] crate provides the underlying building blocks (spaces,
+//! strategies, the leaderboard, and scales) that this crate composes into the
+//! HOLA optimization loop.
 
 pub mod hola_engine;
 #[cfg(feature = "server")]

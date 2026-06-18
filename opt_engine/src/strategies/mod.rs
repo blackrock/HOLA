@@ -14,7 +14,7 @@
 //! Three built-in strategies cover the typical optimization lifecycle:
 //!
 //! - [`RandomStrategy`] — uniform random sampling; useful as a baseline.
-//! - [`SobolStrategy`] — quasi-random Sobol’ sequences for space-filling
+//! - [`SobolStrategy`] — quasi-random Sobol' sequences for space-filling
 //!   exploration with better coverage than pseudo-random sampling.
 //! - [`GmmStrategy`] — samples from a Gaussian mixture model fit to elite
 //!   trials; enables informed search after an initial exploration phase.

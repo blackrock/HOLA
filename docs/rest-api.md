@@ -29,9 +29,12 @@ Authorization: Bearer <TOKEN>
 
 This applies to `POST /api/ask`, `POST /api/tell`,
 `POST /api/cancel`, `PATCH /api/objectives`, and
-`POST /api/checkpoint/save`. Read-only endpoints remain
-available without a token. The CLI requires an auth token when
-binding the server to a non-local host.
+`POST /api/checkpoint/save`. By default, read-only endpoints and the
+`GET /api/events` SSE stream remain available without a token. To also
+require the bearer token on those read endpoints, start the server with
+`--require-read-auth` (only meaningful together with `--auth-token`).
+The CLI requires an auth token when binding the server to a non-local
+host.
 
 ## Error Format
 
@@ -500,8 +503,8 @@ Get parameter space metadata.
     {
       "name": "learning_rate",
       "type": "real",
-      "min": -4.0,
-      "max": -1.0,
+      "min": 0.0001,
+      "max": 0.1,
       "scale": "log10"
     },
     {

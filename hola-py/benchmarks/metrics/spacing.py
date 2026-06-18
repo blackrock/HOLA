@@ -20,10 +20,12 @@ from scipy.spatial.distance import cdist
 def compute_spacing(front: np.ndarray) -> float:
     """Compute spacing metric (std of nearest-neighbor distances).
 
-    Lower is better (more uniform). Returns 0.0 for fewer than 2 points.
+    Lower is better (more uniform). Returns NaN for fewer than 2 points so
+    that degenerate fronts are excluded from median aggregation (matching the
+    NaN convention used by IGD).
     """
     if len(front) < 2:
-        return 0.0
+        return float("nan")
     dists = cdist(front, front)
     np.fill_diagonal(dists, np.inf)
     nn_dists = dists.min(axis=1)

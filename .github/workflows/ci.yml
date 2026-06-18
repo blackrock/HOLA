@@ -35,10 +35,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (all features)
-        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
 
       - name: Test (all features)
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
 
   # ── Python: build bindings + ruff + ty + pytest ───────
   python:
@@ -58,6 +58,18 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - uses: astral-sh/setup-uv@v8.1.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dashboard DOM-test dependencies (jsdom)
+        run: npm install
+        working-directory: dashboard/tests
+
+      - name: Dashboard DOM XSS test
+        run: node xss_dom.test.mjs
+        working-directory: dashboard/tests
 
       - name: Install dev + benchmark dependencies
         run: uv sync --locked --dev --group benchmarks

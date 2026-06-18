@@ -13,8 +13,8 @@
 //!
 //! These are the pure mathematical operations that map raw metric values to
 //! optimization scores. They have no knowledge of JSON, wire formats, or
-//! field names — that responsibility belongs to [`Transformer`](crate::traits::Transformer)
-//! implementations.
+//! field names; callers are responsible for parsing raw input into the values
+//! passed here.
 
 /// Flip sign for maximization.
 ///

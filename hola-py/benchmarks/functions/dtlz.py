@@ -26,7 +26,7 @@ import numpy as np
 
 
 def _extract_vec(p: dict[str, float]) -> list[float]:
-    keys = sorted(k for k in p if k.startswith("x"))
+    keys = sorted((k for k in p if k.startswith("x")), key=lambda k: int(k[1:]))
     return [p[k] for k in keys]
 
 

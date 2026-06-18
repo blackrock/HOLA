@@ -89,3 +89,56 @@ fn leaderboard_scalability_vector_ranking() {
         assert!(!front.is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Correctness tests (non-ignored): hand-built leaderboards with known answers.
+// ---------------------------------------------------------------------------
+
+/// `top_k` returns the best (lowest-scoring) trials first, in ascending order.
+#[test]
+fn leaderboard_top_k_orders_best_first() {
+    let mut lb: Leaderboard<usize, f64> = Leaderboard::default();
+    // Insert out of order so ordering can't be an artifact of insertion order.
+    lb.push(0, 0.5);
+    lb.push(1, 0.1);
+    lb.push(2, 0.9);
+    lb.push(3, 0.3);
+
+    let top = lb.top_k(4);
+    let scores: Vec<f64> = top.iter().map(|t| t.observation).collect();
+    assert_eq!(scores, vec![0.1, 0.3, 0.5, 0.9]);
+
+    // The single best item is at rank 0.
+    let best = lb.top_k(1);
+    assert_eq!(best.len(), 1);
+    assert_eq!(best[0].candidate, 1);
+    assert_eq!(best[0].observation, 0.1);
+}
+
+/// `pareto_front` keeps non-dominated points and excludes dominated ones.
+#[test]
+fn leaderboard_pareto_front_excludes_dominated() {
+    let mut lb: Leaderboard<usize, BTreeMap<String, f64>> = Leaderboard::default();
+    let obs = |loss: f64, latency: f64| {
+        let mut m = BTreeMap::new();
+        m.insert("loss".to_string(), loss);
+        m.insert("latency".to_string(), latency);
+        m
+    };
+
+    // Candidate 0 and 1 trade off (both on the front).
+    lb.push(0, obs(0.1, 0.9));
+    lb.push(1, obs(0.9, 0.1));
+    // Candidate 2 is dominated by candidate 0 (worse in both objectives).
+    lb.push(2, obs(0.5, 0.95));
+
+    let front = lb.pareto_front();
+    let mut on_front: Vec<usize> = front.iter().map(|t| t.candidate).collect();
+    on_front.sort_unstable();
+
+    assert_eq!(on_front, vec![0, 1]);
+    assert!(
+        !on_front.contains(&2),
+        "dominated candidate must be excluded from the pareto front"
+    );
+}

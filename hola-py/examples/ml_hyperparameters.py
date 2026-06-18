@@ -30,9 +30,12 @@ except ImportError:
     _HAS_SKLEARN = False
 
 
+# Dataset/model/search sizes are deliberately kept small so the example (and the
+# example smoke test in CI) runs in well under 20s while still exercising the
+# Real/Integer/Categorical parameter types and the same ask/tell API.
 def train_and_evaluate(params: dict) -> dict:
     """Train a GBM with the given hyperparameters and return CV loss."""
-    X, y = make_friedman1(n_samples=500, noise=1.0, random_state=42)
+    X, y = make_friedman1(n_samples=150, noise=1.0, random_state=42)
 
     model = GradientBoostingRegressor(
         n_estimators=params["n_estimators"],
@@ -62,7 +65,8 @@ def main():
     study = Study(
         space=Space(
             lr=Real(0.001, 0.3, scale="log10"),
-            n_estimators=Integer(50, 500),
+            # Upper bound kept low for fast example/CI execution.
+            n_estimators=Integer(20, 60),
             max_depth=Integer(2, 8),
             subsample=Real(0.5, 1.0),
             loss=Categorical(["squared_error", "absolute_error", "huber"]),
@@ -71,8 +75,9 @@ def main():
         strategy="sobol",
     )
 
-    n_trials = 30
-    print(f"\n  Running {n_trials} trials (this may take a minute)...")
+    # Few trials so the example finishes quickly; raise this for real tuning.
+    n_trials = 12
+    print(f"\n  Running {n_trials} trials...")
     for i in range(n_trials):
         trial = study.ask()
         result = train_and_evaluate(trial.params)

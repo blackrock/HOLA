@@ -87,8 +87,13 @@ impl<S, Obs> RandomStrategy<S, Obs> {
 }
 
 impl<S, Obs> Default for RandomStrategy<S, Obs> {
+    /// Deterministic default using a fixed seed of 0.
+    ///
+    /// `Default` must honor the reproducibility contract, so it delegates to
+    /// `Self::new(0)` rather than `auto_seed()` (which draws a nondeterministic
+    /// seed). Use `auto_seed()` explicitly when a random seed is wanted.
     fn default() -> Self {
-        Self::auto_seed()
+        Self::new(0)
     }
 }
 
@@ -113,11 +118,21 @@ where
             .map(|_| rand::Rng::random_range(&mut rng, 0.0..1.0))
             .collect();
 
-        space.from_unit_cube(&random_vec).expect("Mapping failed")
+        space.from_unit_cube(&random_vec).unwrap_or_else(|| {
+            // `from_unit_cube` only returns `None` on a length mismatch, which
+            // should not happen since the vector matches `dimensionality()`.
+            // Fall back to a deterministic in-cube midpoint rather than panic.
+            eprintln!(
+                "Warning: random unit-cube mapping failed; falling back to the cube midpoint"
+            );
+            space
+                .from_unit_cube(&vec![0.5; dim])
+                .expect("midpoint of the unit cube is always a valid mapping")
+        })
     }
 
     fn update(&mut self, _candidate: &S::Domain, _result: Obs) {
-        // Pure sampler — nothing to update.
+        // Pure sampler: nothing to update.
     }
 }
 
@@ -163,6 +178,21 @@ mod tests {
     }
 
     #[test]
+    fn test_default_is_deterministic() {
+        // `Default` must honor the reproducibility contract: two default-
+        // constructed strategies use the same fixed seed and so produce
+        // identical sequences.
+        let space = ContinuousSpace::new(0.0, 1.0);
+        let strat1 = RandomStrategy::<ContinuousSpace<LinearScale>, f64>::default();
+        let strat2 = RandomStrategy::<ContinuousSpace<LinearScale>, f64>::default();
+        for i in 0..20 {
+            let a = strat1.suggest(&space);
+            let b = strat2.suggest(&space);
+            assert_eq!(a, b, "Default strategies diverged at suggestion {i}");
+        }
+    }
+
+    #[test]
     fn test_different_seeds_differ() {
         let space = ContinuousSpace::new(0.0, 1.0);
         let strat1 = RandomStrategy::<ContinuousSpace<LinearScale>, f64>::new(42);
@@ -184,5 +214,45 @@ mod tests {
             let candidate = strat.suggest(&space);
             assert!(space.contains(&candidate));
         }
+    }
+
+    /// A space whose `from_unit_cube` rejects the strategy's raw sample (any
+    /// vector other than the exact midpoint) but accepts the `vec![0.5; n]`
+    /// fallback. This exercises the non-panicking fallback path.
+    struct MismatchSpace;
+
+    impl SampleSpace for MismatchSpace {
+        type Domain = f64;
+
+        fn contains(&self, _point: &Self::Domain) -> bool {
+            true
+        }
+    }
+
+    impl StandardizedSpace for MismatchSpace {
+        fn dimensionality(&self) -> usize {
+            1
+        }
+
+        fn to_unit_cube(&self, point: &Self::Domain) -> Vec<f64> {
+            vec![*point]
+        }
+
+        fn from_unit_cube(&self, vec: &[f64]) -> Option<Self::Domain> {
+            match vec.first() {
+                Some(&x) if x == 0.5 => Some(x),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn test_mapping_mismatch_does_not_panic() {
+        let space = MismatchSpace;
+        let strat = RandomStrategy::<MismatchSpace, f64>::new(42);
+        // The raw random sample is rejected; `suggest` must fall back to the
+        // midpoint instead of panicking on `expect`.
+        let point = strat.suggest(&space);
+        assert_eq!(point, 0.5, "expected the midpoint fallback value");
     }
 }

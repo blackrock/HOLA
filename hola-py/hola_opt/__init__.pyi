@@ -13,13 +13,22 @@ class Real:
         min: Lower bound (in actual values, not exponents).
         max: Upper bound (in actual values, not exponents).
         scale: Sampling scale -- ``"linear"`` (default), ``"log"`` (natural log),
-            or ``"log10"``.
+            ``"ln"`` (alias for ``"log"``), or ``"log10"``.
+
+    Raises:
+        ValueError: If ``scale`` is not one of ``"linear"``, ``"log"``,
+            ``"ln"``, or ``"log10"``.
     """
 
     min: float
     max: float
     scale: str
-    def __init__(self, min: float, max: float, scale: str = "linear") -> None: ...
+    def __init__(
+        self,
+        min: float,
+        max: float,
+        scale: str = "linear",
+    ) -> None: ...
 
 class Integer:
     """Integer parameter within an inclusive range.
@@ -109,6 +118,10 @@ class Gmm:
         exploration_budget: Number of Sobol exploration trials before GMM
             exploitation begins. When omitted, computed automatically from
             the number of dimensions.
+
+    Raises:
+        ValueError: If ``elite_fraction`` is non-finite or outside the range
+            ``(0.0, 1.0]``, or if ``refit_interval`` is ``0``.
     """
 
     refit_interval: int | None
@@ -144,25 +157,43 @@ class Space:
     Pass parameter definitions as keyword arguments::
 
         Space(lr=Real(1e-4, 0.1, scale="log10"), layers=Integer(1, 10))
+
+    Raises:
+        ValueError: If any keyword value is not a ``Real``, ``Integer``, or
+            ``Categorical`` instance.
     """
 
     def __init__(self, **kwargs: Real | Integer | Categorical) -> None: ...
 
 class Trial:
-    """A trial returned by ``Study.ask()``."""
+    """A trial returned by ``Study.ask()``.
+
+    ``params`` is normally a ``dict``. On the remote (``Study.connect``) path it
+    may be ``None`` if the server response omits the field.
+    """
 
     trial_id: int
     params: dict[str, Any]
     def __repr__(self) -> str: ...
 
 class CompletedTrial:
-    """A completed trial with scoring, ranking, and Pareto front information."""
+    """A completed trial with scoring, ranking, and Pareto front information.
+
+    ``params``, ``metrics``, and ``scores`` are normally ``dict`` objects. On the
+    remote (``Study.connect``) path any of them may be ``None`` if the server
+    response omits the corresponding field.
+
+    ``score_vector`` maps each priority group to its aggregated cost. A value is
+    ``None`` when the underlying cost is NaN (the engine serializes NaN as JSON
+    ``null``, which surfaces here as ``None``); infinities surface as
+    ``float('inf')``.
+    """
 
     trial_id: int
     params: dict[str, Any]
     metrics: dict[str, Any]
     scores: dict[str, Any]
-    score_vector: dict[str, float]
+    score_vector: dict[str, Any]
     rank: int
     pareto_front: int
     completed_at: int
@@ -180,6 +211,11 @@ class Study:
         trial = study.ask()
         ct = study.tell(trial.trial_id, {"loss": 0.42})
         top = study.top_k(3)
+
+    Raises:
+        ValueError: If ``objectives`` is empty, if ``strategy`` is an unknown
+            string, if ``max_leaderboard_size`` is ``0``, or if the resulting
+            configuration is otherwise invalid.
     """
 
     def __init__(
@@ -189,10 +225,20 @@ class Study:
         strategy: str | Gmm | Sobol | Random | None = None,
         seed: int | None = None,
         max_trials: int | None = None,
+        max_leaderboard_size: int | None = None,
     ) -> None: ...
     @staticmethod
     def connect(url: str, token: str | None = None) -> Study:
-        """Connect to an existing HOLA server."""
+        """Connect to an existing HOLA server.
+
+        The connection is established lazily on the first ``ask``/``tell``; this
+        call only validates and stores the URL (no network request is made
+        here).
+
+        Raises:
+            ValueError: If ``url`` is malformed or does not use the ``http`` or
+                ``https`` scheme.
+        """
         ...
     @staticmethod
     def load(path: str) -> Study:

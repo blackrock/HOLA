@@ -118,6 +118,7 @@ fn valid_config_for_validation() -> StudyConfig {
         }),
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     }
 }
 
@@ -265,6 +266,7 @@ async fn test_dyn_engine_ask_tell_flow() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -315,6 +317,7 @@ async fn test_dyn_engine_unknown_trial_error() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -345,6 +348,7 @@ async fn test_dyn_engine_double_tell_error() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -375,6 +379,7 @@ async fn test_dyn_engine_out_of_order_tell_preserves_public_trial_ids() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -450,6 +455,7 @@ async fn test_dyn_engine_all_param_types() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -481,6 +487,7 @@ async fn test_dyn_engine_categorical_params() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -520,6 +527,7 @@ async fn test_dyn_engine_ask_returns_valid_params() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -567,6 +575,7 @@ async fn test_dyn_engine_param_info() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -615,6 +624,7 @@ async fn test_dyn_engine_strategy_types() {
         }),
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
     let engine = HolaEngine::from_config(config).unwrap();
     assert!(engine.space().contains(&engine.ask().await.unwrap().params));
@@ -647,6 +657,7 @@ async fn test_dyn_engine_strategy_types() {
         }),
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
     let engine = HolaEngine::from_config(config).unwrap();
     assert!(engine.space().contains(&engine.ask().await.unwrap().params));
@@ -672,6 +683,7 @@ async fn test_dyn_engine_strategy_types() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
     let engine = HolaEngine::from_config(config).unwrap();
     assert!(engine.space().contains(&engine.ask().await.unwrap().params));
@@ -703,6 +715,7 @@ async fn test_dyn_engine_scalarize_missing_field_infinity() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -738,6 +751,7 @@ async fn test_dyn_engine_scalarize_maximize() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -788,6 +802,7 @@ async fn test_dyn_engine_tlp_objectives() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -834,6 +849,7 @@ async fn test_dyn_engine_update_objectives() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -911,6 +927,7 @@ async fn test_dyn_engine_objectives_accessor() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -942,6 +959,7 @@ async fn test_dyn_engine_update_objectives_rescalarizes() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -999,6 +1017,7 @@ async fn test_dyn_engine_update_objectives_migrates_scalar_to_vector() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -1086,6 +1105,7 @@ async fn test_dyn_engine_update_objectives_migrates_vector_to_scalar() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -1143,6 +1163,7 @@ async fn test_dyn_engine_rescalarize() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -1189,6 +1210,7 @@ async fn test_dyn_engine_gmm_with_refit() {
         }),
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -1233,6 +1255,7 @@ async fn test_refit_excludes_infeasible_scalar() {
         }),
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -1283,6 +1306,7 @@ async fn test_update_objectives_triggers_refit() {
         }),
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -1318,6 +1342,119 @@ async fn test_update_objectives_triggers_refit() {
 }
 
 // ==========================================================================
+// Concurrent refit serialization
+// ==========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_dyn_engine_concurrent_refit_serialization() {
+    // Guards against regressions in the refit_lock serialization in
+    // HolaEngine: concurrent tell()s crossing the refit threshold (which take
+    // refit_lock with try_lock-skip) must not deadlock or corrupt state when
+    // racing a concurrent update_objectives() (which takes refit_lock with
+    // lock().await so its model is built against the new objectives and is not
+    // clobbered by an in-flight periodic refit).
+    //
+    // Exact one-at-a-time serialization is asserted via final-state consistency
+    // rather than timing: the test completing at all is the deadlock guard, the
+    // recorded trial_count must match every tell() that ran, and after the
+    // concurrent update_objectives the engine.objectives() must reflect the new
+    // objectives (a clobber/skip would leave the stale objectives in place).
+    //
+    // If update_objectives used a try_lock-skip instead of lock().await, this
+    // test would either hang (no progress under contention) or surface stale
+    // objectives rather than the swapped-in ones.
+    let config = StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }],
+        // auto/gmm refit so tell()s past the threshold trigger real refits.
+        strategy: Some(StrategyConfig {
+            strategy_type: "auto".to_string(),
+            refit_interval: 5,
+            total_budget: None,
+            exploration_budget: Some(4),
+            seed: Some(7),
+            elite_fraction: None,
+        }),
+        checkpoint: None,
+        max_trials: None,
+        max_leaderboard_size: None,
+    };
+
+    let engine = HolaEngine::from_config(config).unwrap();
+
+    // Bounded, deterministic workload: a few writer tasks each driving a mix of
+    // ask()/tell() across the refit threshold, plus one update_objectives().
+    const WRITERS: usize = 4;
+    const TELLS_PER_WRITER: usize = 10;
+
+    let mut handles = Vec::new();
+    for w in 0..WRITERS {
+        let engine = engine.clone();
+        handles.push(tokio::spawn(async move {
+            for i in 0..TELLS_PER_WRITER {
+                let t = engine.ask().await.unwrap();
+                let v = ((w * TELLS_PER_WRITER + i) as f64) / 100.0;
+                engine
+                    .tell(t.trial_id, json!({"loss": v, "accuracy": 1.0 - v}))
+                    .await
+                    .unwrap();
+            }
+        }));
+    }
+
+    // Concurrent objectives swap racing the refit-triggering tell()s.
+    let updater = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .update_objectives(vec![ObjectiveConfig {
+                    field: "accuracy".to_string(),
+                    obj_type: "maximize".to_string(),
+                    target: None,
+                    limit: None,
+                    priority: 1.0,
+                    group: None,
+                }])
+                .await
+                .unwrap();
+        })
+    };
+
+    for h in handles {
+        h.await.unwrap();
+    }
+    updater.await.unwrap();
+
+    // Final-state consistency: every tell() was recorded exactly once.
+    assert_eq!(engine.trial_count().await, WRITERS * TELLS_PER_WRITER);
+
+    // The concurrent update_objectives must win the final state: a clobber or a
+    // skipped/serialization-lost update would leave the stale "loss" objective.
+    let objectives = engine.objectives().await;
+    assert_eq!(objectives.len(), 1);
+    assert_eq!(objectives[0].field, "accuracy");
+    assert_eq!(objectives[0].obj_type, "maximize");
+
+    // Engine remains usable after the concurrent storm.
+    let t = engine.ask().await.unwrap();
+    assert!(engine.space().contains(&t.params));
+}
+
+// ==========================================================================
 // Checkpoints
 // ==========================================================================
 
@@ -1342,6 +1479,7 @@ fn scalar_checkpoint_config(max_trials: Option<usize>) -> StudyConfig {
         strategy: None,
         checkpoint: None,
         max_trials,
+        max_leaderboard_size: None,
     }
 }
 
@@ -1376,6 +1514,7 @@ fn vector_checkpoint_config() -> StudyConfig {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     }
 }
 
@@ -1401,6 +1540,7 @@ async fn test_dyn_engine_leaderboard_checkpoint() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config.clone()).unwrap();
@@ -1502,6 +1642,7 @@ async fn test_dyn_engine_full_checkpoint() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config.clone()).unwrap();
@@ -1673,6 +1814,7 @@ fn auto_strategy_test_config(exploration_budget: usize, seed: u64) -> StudyConfi
         }),
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     }
 }
 
@@ -1712,6 +1854,7 @@ async fn test_auto_strategy_default() {
         strategy: None, // should default to "auto"
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -1761,6 +1904,7 @@ async fn test_auto_strategy_with_explicit_exploration_budget() {
         }),
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -1877,6 +2021,7 @@ async fn test_seed_determinism_sobol() {
             }),
             checkpoint: None,
             max_trials: None,
+            max_leaderboard_size: None,
         })
         .unwrap()
     };
@@ -1924,6 +2069,7 @@ async fn test_seed_determinism_random() {
             }),
             checkpoint: None,
             max_trials: None,
+            max_leaderboard_size: None,
         })
         .unwrap()
     };
@@ -1984,6 +2130,7 @@ async fn test_pareto_front_multi_objective() {
         }),
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -2028,6 +2175,7 @@ async fn test_pareto_front_scalar_study_errors() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
@@ -2067,9 +2215,248 @@ async fn test_pareto_front_empty() {
         strategy: None,
         checkpoint: None,
         max_trials: None,
+        max_leaderboard_size: None,
     };
 
     let engine = HolaEngine::from_config(config).unwrap();
     let front = engine.pareto_front(0, false).await;
     assert!(front.is_empty());
+}
+
+// ==========================================================================
+// Concurrency: interleaved ask/tell/cancel/update_objectives stress test
+// ==========================================================================
+
+/// Single-objective config with a deterministically seeded auto strategy, used
+/// by the concurrency stress tests so refit/exploration paths are exercised too.
+fn concurrency_test_config() -> StudyConfig {
+    StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }],
+        strategy: Some(StrategyConfig {
+            strategy_type: "auto".to_string(),
+            refit_interval: 5,
+            total_budget: None,
+            exploration_budget: Some(8),
+            seed: Some(7),
+            elite_fraction: None,
+        }),
+        checkpoint: None,
+        max_trials: None,
+        max_leaderboard_size: None,
+    }
+}
+
+/// Hammer one shared `Arc<HolaEngine>` with many concurrent tasks that interleave
+/// ask()/tell() plus a racing cancel() and update_objectives(). Asserts:
+///   * every trial id returned by ask() is UNIQUE (no duplicate id allocation),
+///   * the final trial_count() equals the number of completed (successful) tells,
+///   * the whole storm finishes without deadlock/timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_hola_engine_concurrent_ask_tell_unique_ids_no_deadlock() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    let engine = Arc::new(HolaEngine::from_config(concurrency_test_config()).unwrap());
+
+    const TASKS: usize = 16;
+    const OPS_PER_TASK: usize = 20;
+
+    let body = async {
+        // Each ask()->tell() task returns (asked_ids, completed_tells).
+        let mut handles = Vec::new();
+        for t in 0..TASKS {
+            let engine = Arc::clone(&engine);
+            handles.push(tokio::spawn(async move {
+                let mut asked_ids: Vec<u64> = Vec::new();
+                let mut completed: u64 = 0;
+                for i in 0..OPS_PER_TASK {
+                    let trial = engine.ask().await.unwrap();
+                    asked_ids.push(trial.trial_id);
+                    let v = ((t * OPS_PER_TASK + i) as f64) / 1000.0;
+                    // tell() can only fail here if a racing cancel() targeted this
+                    // exact id; this task does not cancel its own ids, so every
+                    // tell must succeed. A failure would surface as a panic.
+                    engine
+                        .tell(trial.trial_id, json!({"loss": v}))
+                        .await
+                        .unwrap();
+                    completed += 1;
+                }
+                (asked_ids, completed)
+            }));
+        }
+
+        // One task that races by asking and immediately cancelling its own ids,
+        // so it contributes ids (which must still be unique) but no completed
+        // tells. Its cancelled ids must never be reissued to another task.
+        let canceller = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move {
+                let mut asked_ids: Vec<u64> = Vec::new();
+                for _ in 0..OPS_PER_TASK {
+                    let trial = engine.ask().await.unwrap();
+                    asked_ids.push(trial.trial_id);
+                    engine.cancel(trial.trial_id).await.unwrap();
+                }
+                asked_ids
+            })
+        };
+
+        // One task that races update_objectives() against the storm.
+        let updater = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move {
+                engine
+                    .update_objectives(vec![ObjectiveConfig {
+                        field: "loss".to_string(),
+                        obj_type: "minimize".to_string(),
+                        target: None,
+                        limit: None,
+                        priority: 2.0,
+                        group: None,
+                    }])
+                    .await
+                    .unwrap();
+            })
+        };
+
+        let mut all_ids: Vec<u64> = Vec::new();
+        let mut total_completed: u64 = 0;
+        for h in handles {
+            let (ids, completed) = h.await.unwrap();
+            all_ids.extend(ids);
+            total_completed += completed;
+        }
+        all_ids.extend(canceller.await.unwrap());
+        updater.await.unwrap();
+
+        (all_ids, total_completed)
+    };
+
+    // Generous bound: assert the whole concurrent workload completes without
+    // deadlocking. A hang would otherwise surface as this timeout firing.
+    let (all_ids, total_completed) =
+        match tokio::time::timeout(std::time::Duration::from_secs(30), body).await {
+            Ok(result) => result,
+            Err(_) => panic!("concurrent ask/tell/cancel storm timed out (possible deadlock)"),
+        };
+
+    // Every id ever handed out by ask() must be unique across all tasks,
+    // including the cancelled ones.
+    let unique: HashSet<u64> = all_ids.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        all_ids.len(),
+        "ask() returned duplicate trial ids: {} total vs {} unique",
+        all_ids.len(),
+        unique.len()
+    );
+
+    // The leaderboard must hold exactly the trials that were successfully told.
+    assert_eq!(
+        engine.trial_count().await,
+        total_completed as usize,
+        "trial_count must equal the number of completed tells"
+    );
+
+    // Engine remains usable after the storm.
+    let trial = engine.ask().await.unwrap();
+    assert!(engine.space().contains(&trial.params));
+}
+
+// ==========================================================================
+// Concurrency: data integrity of stored observations
+// ==========================================================================
+
+/// Across a large number of concurrent ask()+tell() tasks where each task tells
+/// a DISTINCT, known loss value, read back ALL stored trials afterward and
+/// assert that:
+///   * the multiset of recorded loss values equals exactly the set sent
+///     (nothing dropped, duplicated, or corrupted),
+///   * the stored trial ids are unique,
+///   * the trial count matches N.
+/// A larger N amplifies races between concurrent tell()s pushing to the shared
+/// leaderboard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_hola_engine_concurrent_tell_preserves_all_observations() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    let engine = Arc::new(HolaEngine::from_config(concurrency_test_config()).unwrap());
+
+    const N: usize = 50;
+
+    let body = async {
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let engine = Arc::clone(&engine);
+            handles.push(tokio::spawn(async move {
+                let trial = engine.ask().await.unwrap();
+                // Distinct, known observation per task: loss = i.
+                engine
+                    .tell(trial.trial_id, json!({"loss": i as f64}))
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+    };
+
+    match tokio::time::timeout(std::time::Duration::from_secs(30), body).await {
+        Ok(()) => {}
+        Err(_) => panic!("concurrent tell storm timed out (possible deadlock)"),
+    }
+
+    assert_eq!(
+        engine.trial_count().await,
+        N,
+        "all N tells must be recorded"
+    );
+
+    // Read back every stored trial and collect their loss metrics and ids.
+    let trials = engine.trials("index", true).await;
+    assert_eq!(trials.len(), N, "every told trial must be retrievable");
+
+    let mut recorded_losses: Vec<u64> = Vec::with_capacity(N);
+    let mut ids: Vec<u64> = Vec::with_capacity(N);
+    for t in &trials {
+        ids.push(t.trial_id);
+        let loss = t
+            .metrics
+            .get("loss")
+            .and_then(|v| v.as_f64())
+            .expect("each stored trial must retain its loss metric");
+        // Values were exact integers cast to f64; recover them losslessly.
+        recorded_losses.push(loss as u64);
+    }
+
+    // Trial ids must be unique.
+    let unique_ids: HashSet<u64> = ids.iter().copied().collect();
+    assert_eq!(unique_ids.len(), N, "stored trial ids must be unique");
+
+    // The multiset of recorded losses must equal exactly {0, 1, ..., N-1}: no
+    // value dropped, duplicated, or corrupted under concurrency.
+    recorded_losses.sort_unstable();
+    let expected: Vec<u64> = (0..N as u64).collect();
+    assert_eq!(
+        recorded_losses, expected,
+        "recorded observation multiset must equal the set of sent values"
+    );
 }

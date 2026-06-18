@@ -10,11 +10,7 @@
 // limitations under the License.
 
 //! Integration tests for the opt_engine public API.
-//!
-//! Engine cycles and end-to-end optimization with generic spaces.
 
-mod end_to_end;
-mod engine;
 mod leaderboard_scalability;
 
 #[test]
@@ -22,12 +18,7 @@ fn integration_test_files_are_referenced_by_harness() {
     let integration_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("integration");
-    let allowed = [
-        "end_to_end.rs",
-        "engine.rs",
-        "leaderboard_scalability.rs",
-        "main.rs",
-    ];
+    let allowed = ["leaderboard_scalability.rs", "main.rs"];
 
     let mut unreferenced = Vec::new();
     for entry in std::fs::read_dir(&integration_dir).unwrap() {
