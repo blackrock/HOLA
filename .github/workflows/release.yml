@@ -167,7 +167,10 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: sdist
-          args: --locked --out dist
+          # `maturin sdist` packages sources and does not build, so it rejects
+          # the cargo `--locked` flag (unlike the wheel build below). The sdist
+          # bundles Cargo.lock for reproducibility regardless.
+          args: --out dist
           working-directory: hola-py
 
       - name: Attest sdist provenance
