@@ -17,6 +17,12 @@ updates:
       cargo:
         patterns:
           - "*"
+    # Major bumps of runtime crates (e.g. rand, rand_distr, tower-http) require
+    # deliberate source migration, so don't auto-propose them; ship only
+    # minor/patch updates and handle majors by hand when there's a reason to.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "pip"
     directory: "/hola-py"
@@ -26,3 +32,7 @@ updates:
       pip:
         patterns:
           - "*"
+    # `ty` is a pre-1.0 (0.0.x) type checker whose diagnostics shift between
+    # releases; pin it and upgrade deliberately rather than on every bump.
+    ignore:
+      - dependency-name: "ty"
