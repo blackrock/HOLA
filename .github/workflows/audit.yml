@@ -60,6 +60,9 @@ jobs:
         run: |
           # Export hola-py's locked dependency set and audit THAT. A bare
           # `uvx pip-audit` with no arguments audits pip-audit's own ephemeral
-          # environment, not this project's dependencies.
-          uv export --format requirements-txt --no-emit-project --no-hashes -o /tmp/hola-py-requirements.txt
+          # environment, not this project's dependencies. `--all-groups` covers
+          # the dev/docs/benchmarks groups too, so lockfile-only vulnerabilities
+          # in transitive deps (e.g. docs tooling) are caught, matching what
+          # GitHub's native Dependabot scan sees.
+          uv export --all-groups --format requirements-txt --no-emit-project --no-hashes -o /tmp/hola-py-requirements.txt
           uvx pip-audit --requirement /tmp/hola-py-requirements.txt
