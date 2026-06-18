@@ -15,12 +15,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Core engine needs async locks and blocking refit tasks; server adds net support.
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "sync"] }
-rand = "0.9.3"
+rand = "0.10.1"
 # Constant-time comparison for the server's bearer-token check (avoids timing side-channels).
 constant_time_eq = "0.4"
 axum = { version = "0.8", default-features = false, optional = true }
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"], optional = true }
-tower-http = { version = "0.6.8", default-features = false, features = ["cors", "fs"], optional = true }
+tower-http = { version = "0.7.0", default-features = false, features = ["cors", "fs"], optional = true }
 
 [dev-dependencies]
 opt_engine = { version = "1.0.1-rc7", path = "../opt_engine" }
