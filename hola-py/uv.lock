@@ -653,7 +653,7 @@ wheels = [
 
 [[package]]
 name = "hola-opt"
-version = "1.0.1rc7"
+version = "1.0.1rc8"
 source = { editable = "." }
 
 [package.dev-dependencies]

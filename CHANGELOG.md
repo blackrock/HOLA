@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.1-rc8
+
 - API tokens now protect read endpoints and SSE by default. The explicit
   `--allow-unauthenticated-reads` flag restores the prior open-read behavior
   for trusted deployments.
