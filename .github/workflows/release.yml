@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.workflow }}
   cancel-in-progress: false
 
 env:
