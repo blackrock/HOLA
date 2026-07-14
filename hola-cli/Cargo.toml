@@ -2,21 +2,32 @@
 name = "hola-cli"
 version = "1.0.1-rc7"
 edition = "2024"
-license = "Apache-2.0"
+description = "Command-line server and distributed worker for HOLA"
+documentation = "https://github.com/blackrock/HOLA/blob/main/docs/cli-guide.md"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 rust-version.workspace = true
 
 [[bin]]
 name = "hola"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 hola = { path = "../hola", features = ["server"], version = "1.0.1-rc7" }
 clap = { version = "4", features = ["derive"] }
-# NOTE: serde_yaml is deprecated (0.9.34+deprecated) and unmaintained. Migration
-# to a maintained fork (serde_yaml_ng or serde_yml) is a tracked follow-up.
-serde_yaml = "0.9"
+# Keep the established module name while using the maintained, API-compatible fork.
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 # CLI needs the Tokio main macro, multi-threaded runtime for reqwest, and retry sleeps.
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "fmt"] }
+command-group = "5.0.1"
+uuid = { version = "1", features = ["v4"] }

@@ -12,10 +12,18 @@
 //! HOLA CLI — serve optimization studies and run workers.
 
 use clap::{Parser, Subcommand, ValueEnum};
+use command_group::{CommandGroup, GroupChild};
 use hola::hola_engine::{HolaEngine, StudyConfig};
 use hola::server::ServerOptions;
+use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::process::{Command, ExitStatus};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(
@@ -46,17 +54,23 @@ enum Commands {
         /// Bearer token required for write-capable API endpoints.
         #[arg(long)]
         auth_token: Option<String>,
+        /// Optional read-only bearer token for dashboards and monitoring.
+        #[arg(long)]
+        read_token: Option<String>,
         /// Directory where dashboard/API checkpoint saves are allowed.
         #[arg(long)]
         checkpoint_dir: Option<PathBuf>,
         /// Allowed CORS origin. May be provided multiple times.
         #[arg(long = "cors-origin")]
         cors_origins: Vec<String>,
-        /// Also require the bearer token for read-only endpoints and the SSE
-        /// stream. Only has an effect together with --auth-token; off by
-        /// default, so reads stay open while writes remain protected.
+        /// Leave read-only endpoints and the SSE stream open when an API token
+        /// is configured. By default the token protects both reads and writes.
         #[arg(long)]
-        require_read_auth: bool,
+        allow_unauthenticated_reads: bool,
+        /// Trial lease duration in seconds. Workers must complete, cancel, or
+        /// heartbeat a trial before this deadline.
+        #[arg(long, default_value_t = 7200, value_parser = clap::value_parser!(u64).range(1..))]
+        lease_seconds: u64,
     },
     /// Run a worker that polls the server for trials.
     ///
@@ -82,6 +96,16 @@ enum Commands {
         /// Bearer token for servers started with --auth-token.
         #[arg(long)]
         token: Option<String>,
+        /// Maximum duration of one HTTP request, in seconds.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        request_timeout: u64,
+        /// Maximum duration of one executed command, in seconds.
+        #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
+        command_timeout: u64,
+        /// Durable exec-mode result queue. A server-specific subdirectory is
+        /// created here and retried before the worker asks for more work.
+        #[arg(long, default_value = ".hola-worker-outbox")]
+        outbox_dir: PathBuf,
     },
 }
 
@@ -114,7 +138,7 @@ fn is_local_host(host: &str) -> bool {
 /// scheme-less or otherwise malformed value is rejected with a clear error so
 /// the worker fails fast instead of retrying forever against a bad address.
 fn normalize_server_url(server: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let url =
+    let mut url =
         reqwest::Url::parse(server).map_err(|e| format!("invalid --server URL '{server}': {e}"))?;
     match url.scheme() {
         "http" | "https" => {}
@@ -128,7 +152,31 @@ fn normalize_server_url(server: &str) -> Result<String, Box<dyn std::error::Erro
     if url.host_str().is_none() {
         return Err(format!("invalid --server URL '{server}': missing host").into());
     }
-    Ok(server.trim_end_matches('/').to_string())
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!(
+            "invalid --server URL '{server}': embedded userinfo is not supported; use --token for authentication"
+        )
+        .into());
+    }
+    if url.query().is_some() {
+        return Err(format!(
+            "invalid --server URL '{server}': query parameters are not allowed in a server base URL"
+        )
+        .into());
+    }
+    if url.fragment().is_some() {
+        return Err(format!(
+            "invalid --server URL '{server}': fragments are not allowed in a server base URL"
+        )
+        .into());
+    }
+
+    // Preserve reverse-proxy path prefixes, but canonicalize them to exactly
+    // one endpoint join boundary. Returning the parsed URL (rather than the raw
+    // input) prevents a query/fragment from swallowing a later `/api/...` suffix.
+    let normalized_path = url.path().trim_end_matches('/').to_string();
+    url.set_path(&normalized_path);
+    Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
 fn configured_token(cli_token: Option<String>) -> Option<String> {
@@ -144,6 +192,713 @@ fn with_bearer_auth(
     match token {
         Some(token) => request.bearer_auth(token),
         None => request,
+    }
+}
+
+const RETRY_DELAY: Duration = Duration::from_secs(5);
+const COMMAND_FAILURE_DELAY: Duration = Duration::from_secs(1);
+const HTTP_ERROR_SNIPPET_CHARS: usize = 4096;
+const MAX_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+fn build_http_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(timeout.min(Duration::from_secs(10)))
+        .timeout(timeout)
+        .build()
+}
+
+async fn http_error(operation: &str, response: reqwest::Response) -> String {
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|error| format!("unable to read error response: {error}"));
+    let detail: String = body.trim().chars().take(HTTP_ERROR_SNIPPET_CHARS).collect();
+    let detail = if detail.is_empty() {
+        "empty response body"
+    } else {
+        &detail
+    };
+    format!("{operation} returned HTTP {status}: {detail}")
+}
+
+fn request_error(operation: &str, error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        format!("{operation} request timed out: {error}")
+    } else if error.is_connect() {
+        format!("{operation} connection failed: {error}")
+    } else {
+        format!("{operation} request failed: {error}")
+    }
+}
+
+async fn send_checked(
+    operation: &str,
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, String> {
+    let response = request
+        .send()
+        .await
+        .map_err(|error| request_error(operation, error))?;
+    if response.status().is_success() {
+        Ok(response)
+    } else {
+        Err(http_error(operation, response).await)
+    }
+}
+
+fn retryable_http_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+const OUTBOX_FORMAT_VERSION: u32 = 1;
+const MAX_OUTBOX_RECORD_BYTES: u64 = (MAX_CAPTURE_BYTES as u64) + (64 << 10);
+static OUTBOX_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct PendingTell {
+    format_version: u32,
+    server: String,
+    trial_id: u64,
+    metrics: serde_json::Value,
+}
+
+impl PendingTell {
+    fn new(server: &str, trial_id: u64, metrics: serde_json::Value) -> Self {
+        Self {
+            format_version: OUTBOX_FORMAT_VERSION,
+            server: server.to_string(),
+            trial_id,
+            metrics,
+        }
+    }
+}
+
+/// Server-scoped, crash-safe queue for exec-mode tells.
+struct TellOutbox {
+    directory: PathBuf,
+    server: String,
+}
+
+impl TellOutbox {
+    fn open(root: &std::path::Path, server: &str) -> std::io::Result<Self> {
+        let directory = root.join(format!("{:016x}", stable_server_hash(server)));
+        create_private_directory(&directory)?;
+        Ok(Self {
+            directory,
+            server: server.to_string(),
+        })
+    }
+
+    fn record_path(&self, trial_id: u64) -> PathBuf {
+        self.directory.join(format!("tell-{trial_id}.json"))
+    }
+
+    fn read_record(&self, path: &std::path::Path) -> std::io::Result<PendingTell> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("outbox entry '{}' is not a regular file", path.display()),
+            ));
+        }
+        if metadata.len() > MAX_OUTBOX_RECORD_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("outbox entry '{}' exceeds the size limit", path.display()),
+            ));
+        }
+        let bytes = std::fs::read(path)?;
+        let record: PendingTell = serde_json::from_slice(&bytes).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid outbox entry '{}': {error}", path.display()),
+            )
+        })?;
+        self.validate_record(path, &record)?;
+        Ok(record)
+    }
+
+    fn validate_record(&self, path: &std::path::Path, record: &PendingTell) -> std::io::Result<()> {
+        if record.format_version != OUTBOX_FORMAT_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported outbox format {} in '{}'",
+                    record.format_version,
+                    path.display()
+                ),
+            ));
+        }
+        if record.server != self.server {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "outbox entry '{}' belongs to another server",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Persist a tell before any network attempt. Re-persisting an identical
+    /// trial is harmless; different metrics for the same id are rejected.
+    fn persist(&self, record: &PendingTell) -> std::io::Result<PathBuf> {
+        self.validate_record(&self.record_path(record.trial_id), record)?;
+        let path = self.record_path(record.trial_id);
+        if path.exists() {
+            let existing = self.read_record(&path)?;
+            if existing == *record {
+                return Ok(path);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "outbox already contains different metrics for trial {}",
+                    record.trial_id
+                ),
+            ));
+        }
+
+        let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+        if bytes.len() as u64 > MAX_OUTBOX_RECORD_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "tell result exceeds the outbox record size limit",
+            ));
+        }
+        let sequence = OUTBOX_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp_path = self.directory.join(format!(
+            ".tell-{}-{}-{sequence}.tmp",
+            record.trial_id,
+            std::process::id()
+        ));
+
+        let write_result = (|| -> std::io::Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp_path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            // Publish without replacing an existing same-trial record. A hard
+            // link is atomic and, because temp and destination share a directory,
+            // cannot cross filesystems.
+            std::fs::hard_link(&temp_path, &path)?;
+            std::fs::remove_file(&temp_path)?;
+            sync_directory(&self.directory)?;
+            Ok(())
+        })();
+
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&temp_path);
+            // A second worker may have won the same-id race. Accept it only if
+            // its durable record is byte-for-byte equivalent after parsing.
+            if path.exists() && self.read_record(&path).is_ok_and(|saved| saved == *record) {
+                return Ok(path);
+            }
+            return Err(error);
+        }
+        Ok(path)
+    }
+
+    fn pending(&self) -> std::io::Result<Vec<(PathBuf, PendingTell)>> {
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("tell-") && name.ends_with(".json") {
+                paths.push(entry.path());
+            }
+        }
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| self.read_record(&path).map(|record| (path, record)))
+            .collect()
+    }
+
+    fn remove(&self, path: &std::path::Path) -> std::io::Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => sync_directory(&self.directory),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn stable_server_hash(server: &str) -> u64 {
+    // FNV-1a is sufficient here: the full server URL is also stored and checked
+    // inside every record, so a hash collision cannot misdeliver a result.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in server.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn create_private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::File::open(path)?.sync_all() {
+        Ok(()) => Ok(()),
+        // Some Unix filesystems do not support fsync on directory handles. The
+        // record file itself was already synced, so retain the strongest
+        // durability the platform exposes instead of making the outbox unusable.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[derive(Debug)]
+enum OutboxFlushError {
+    /// The record remains durable and a later attempt may succeed.
+    Retryable(String),
+    /// The server/protocol definitively rejected the record. Retrying the same
+    /// bytes forever cannot make progress, so the worker exits and leaves the
+    /// record for operator reconciliation.
+    Permanent(String),
+}
+
+impl OutboxFlushError {
+    fn is_permanent(&self) -> bool {
+        matches!(self, Self::Permanent(_))
+    }
+}
+
+impl std::fmt::Display for OutboxFlushError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(message) | Self::Permanent(message) => formatter.write_str(message),
+        }
+    }
+}
+
+async fn deliver_tell(
+    client: &reqwest::Client,
+    token: Option<&str>,
+    record: &PendingTell,
+) -> Result<Vec<String>, OutboxFlushError> {
+    let operation = format!("tell for trial {}", record.trial_id);
+    let response = with_bearer_auth(client.post(format!("{}/api/tell", record.server)), token)
+        .json(&serde_json::json!({
+            "trial_id": record.trial_id,
+            "metrics": &record.metrics,
+        }))
+        .send()
+        .await
+        .map_err(|error| OutboxFlushError::Retryable(request_error(&operation, error)))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let message = http_error(&operation, response).await;
+        return Err(if retryable_http_status(status) {
+            OutboxFlushError::Retryable(message)
+        } else {
+            OutboxFlushError::Permanent(message)
+        });
+    }
+
+    // A 2xx status alone is not enough to delete an expensive durable result:
+    // validate the canonical acknowledgement and ensure it names this trial.
+    let acknowledgement: serde_json::Value = response.json().await.map_err(|error| {
+        OutboxFlushError::Permanent(format!(
+            "{operation} returned invalid acknowledgement JSON: {error}"
+        ))
+    })?;
+    if acknowledgement
+        .get("status")
+        .and_then(|value| value.as_str())
+        != Some("ok")
+    {
+        return Err(OutboxFlushError::Permanent(format!(
+            "{operation} acknowledgement is missing status 'ok'"
+        )));
+    }
+    let acknowledged_trial_id = acknowledgement
+        .get("trial")
+        .and_then(|trial| trial.get("trial_id"))
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            OutboxFlushError::Permanent(format!(
+                "{operation} acknowledgement is missing trial.trial_id"
+            ))
+        })?;
+    if acknowledged_trial_id != record.trial_id {
+        return Err(OutboxFlushError::Permanent(format!(
+            "{operation} acknowledged trial_id {acknowledged_trial_id} instead"
+        )));
+    }
+
+    let post_commit_warnings = match acknowledgement.get("post_commit_warnings") {
+        None => Vec::new(),
+        Some(serde_json::Value::Array(warnings)) => warnings
+            .iter()
+            .map(|warning| {
+                warning.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    OutboxFlushError::Permanent(format!(
+                        "{operation} acknowledgement has a non-string post_commit_warnings entry"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(OutboxFlushError::Permanent(format!(
+                "{operation} acknowledgement has non-array post_commit_warnings"
+            )));
+        }
+    };
+    Ok(post_commit_warnings)
+}
+
+async fn flush_outbox(
+    outbox: &TellOutbox,
+    client: &reqwest::Client,
+    token: Option<&str>,
+) -> Result<Vec<u64>, OutboxFlushError> {
+    flush_outbox_with_warning_sink(outbox, client, token, |trial_id, warning| {
+        eprintln!("warning: tell for trial {trial_id} committed: {warning}");
+    })
+    .await
+}
+
+async fn flush_outbox_with_warning_sink<F>(
+    outbox: &TellOutbox,
+    client: &reqwest::Client,
+    token: Option<&str>,
+    mut emit_warning: F,
+) -> Result<Vec<u64>, OutboxFlushError>
+where
+    F: FnMut(u64, &str),
+{
+    let pending = outbox.pending().map_err(|error| {
+        OutboxFlushError::Permanent(format!("failed to read tell outbox: {error}"))
+    })?;
+    let mut delivered = Vec::with_capacity(pending.len());
+    for (path, record) in pending {
+        let warnings = deliver_tell(client, token, &record).await?;
+        for warning in warnings {
+            emit_warning(record.trial_id, &warning);
+        }
+        outbox.remove(&path).map_err(|error| {
+            OutboxFlushError::Retryable(format!(
+                "tell was accepted but outbox cleanup failed: {error}"
+            ))
+        })?;
+        delivered.push(record.trial_id);
+    }
+    Ok(delivered)
+}
+
+fn ask_request(
+    client: &reqwest::Client,
+    server: &str,
+    token: Option<&str>,
+    idempotency_key: &str,
+) -> reqwest::RequestBuilder {
+    with_bearer_auth(client.post(format!("{server}/api/ask")), token)
+        .header("Idempotency-Key", idempotency_key)
+}
+
+async fn cancel_trial(
+    client: &reqwest::Client,
+    server: &str,
+    token: Option<&str>,
+    trial_id: u64,
+) -> Result<(), String> {
+    let operation = format!("cancel for trial {trial_id}");
+    let response = send_checked(
+        &operation,
+        with_bearer_auth(client.post(format!("{server}/api/cancel")), token)
+            .json(&serde_json::json!({"trial_id": trial_id})),
+    )
+    .await?;
+    let acknowledgement: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("{operation} returned invalid acknowledgement JSON: {error}"))?;
+    if acknowledgement
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("ok")
+    {
+        return Err(format!(
+            "{operation} acknowledgement is missing canonical status 'ok'"
+        ));
+    }
+    if let Some(value) = acknowledgement.get("trial_id") {
+        let acknowledged_id = value
+            .as_u64()
+            .ok_or_else(|| format!("{operation} acknowledgement has a non-integer trial_id"))?;
+        if acknowledged_id != trial_id {
+            return Err(format!(
+                "{operation} acknowledged trial_id {acknowledged_id} instead"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum HeartbeatError {
+    Retryable(String),
+    Rejected(String),
+}
+
+impl std::fmt::Display for HeartbeatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(message) | Self::Rejected(message) => formatter.write_str(message),
+        }
+    }
+}
+
+async fn heartbeat_trial(
+    client: &reqwest::Client,
+    server: &str,
+    token: Option<&str>,
+    trial_id: u64,
+) -> Result<u64, HeartbeatError> {
+    let operation = format!("heartbeat for trial {trial_id}");
+    let response = with_bearer_auth(client.post(format!("{server}/api/heartbeat")), token)
+        .json(&serde_json::json!({"trial_id": trial_id}))
+        .send()
+        .await
+        .map_err(|error| HeartbeatError::Retryable(request_error(&operation, error)))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let message = http_error(&operation, response).await;
+        return Err(if retryable_http_status(status) {
+            HeartbeatError::Retryable(message)
+        } else {
+            HeartbeatError::Rejected(message)
+        });
+    }
+    let body: serde_json::Value = response.json().await.map_err(|error| {
+        HeartbeatError::Rejected(format!(
+            "{operation} returned invalid acknowledgement JSON: {error}"
+        ))
+    })?;
+    if body.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        return Err(HeartbeatError::Rejected(format!(
+            "{operation} acknowledgement is missing status 'ok'"
+        )));
+    }
+    let acknowledged_id = body
+        .get("trial_id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            HeartbeatError::Rejected(format!("{operation} acknowledgement is missing trial_id"))
+        })?;
+    if acknowledged_id != trial_id {
+        return Err(HeartbeatError::Rejected(format!(
+            "{operation} acknowledged trial_id {acknowledged_id} instead"
+        )));
+    }
+    body.get("lease_expires_at_ms")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            HeartbeatError::Rejected(format!(
+                "{operation} acknowledgement is missing lease_expires_at_ms"
+            ))
+        })
+}
+
+fn unix_time_millis() -> Result<u64, String> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| "system clock exceeds u64 milliseconds".to_string())
+}
+
+fn heartbeat_renewal_delay(deadline_ms: u64) -> Result<Duration, String> {
+    let remaining_ms = deadline_ms.saturating_sub(unix_time_millis()?);
+    if remaining_ms == 0 {
+        return Err("server-reported trial lease has already expired".to_string());
+    }
+    // Renew halfway through short leases and at least every 30 seconds for long
+    // leases. The latter leaves multiple retry opportunities during a transient
+    // outage instead of waiting until a two-hour default lease is nearly over.
+    let delay_ms = (remaining_ms / 2)
+        .max(1)
+        .min(MAX_HEARTBEAT_INTERVAL.as_millis() as u64);
+    Ok(Duration::from_millis(delay_ms))
+}
+
+async fn maintain_trial_lease(
+    client: &reqwest::Client,
+    server: &str,
+    token: Option<&str>,
+    trial_id: u64,
+    mut deadline_ms: u64,
+) -> Result<(), String> {
+    loop {
+        tokio::time::sleep(heartbeat_renewal_delay(deadline_ms)?).await;
+        loop {
+            let remaining_ms = deadline_ms.saturating_sub(unix_time_millis()?);
+            if remaining_ms == 0 {
+                return Err(format!(
+                    "trial {trial_id} lease expired before a heartbeat was confirmed"
+                ));
+            }
+            let attempt = tokio::time::timeout(
+                Duration::from_millis(remaining_ms),
+                heartbeat_trial(client, server, token, trial_id),
+            )
+            .await;
+            match attempt {
+                Ok(Ok(new_deadline_ms)) => {
+                    // Validate now, rather than sleeping zero and spinning if a
+                    // malformed/proxied response reports an elapsed deadline.
+                    heartbeat_renewal_delay(new_deadline_ms)?;
+                    deadline_ms = new_deadline_ms;
+                    break;
+                }
+                Ok(Err(HeartbeatError::Rejected(error))) => return Err(error),
+                Ok(Err(HeartbeatError::Retryable(error))) => {
+                    let remaining_ms = deadline_ms.saturating_sub(unix_time_millis()?);
+                    if remaining_ms == 0 {
+                        return Err(format!(
+                            "{error}; trial {trial_id} lease expired while retrying heartbeat"
+                        ));
+                    }
+                    eprintln!("{error}. Retrying heartbeat before the lease deadline...");
+                    let retry_ms = (remaining_ms / 4)
+                        .max(1)
+                        .min(HEARTBEAT_RETRY_INTERVAL.as_millis() as u64);
+                    tokio::time::sleep(Duration::from_millis(retry_ms)).await;
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "trial {trial_id} lease expired while its heartbeat request was pending"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+async fn run_command_with_heartbeat<T, Run>(
+    client: &reqwest::Client,
+    server: &str,
+    token: Option<&str>,
+    trial_id: u64,
+    run: Run,
+) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    Run: FnOnce(Arc<AtomicBool>) -> std::io::Result<T> + Send + 'static,
+{
+    // Confirm renewal before starting expensive work. This both verifies that
+    // the endpoint/token are usable and obtains the configured server deadline
+    // without hard-coding the server's lease duration in the worker.
+    let initial_deadline = heartbeat_trial(client, server, token, trial_id)
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("initial lease heartbeat failed: {error}"))
+        })?;
+    heartbeat_renewal_delay(initial_deadline).map_err(std::io::Error::other)?;
+
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let command_cancellation = Arc::clone(&cancellation);
+    let mut command_task = tokio::task::spawn_blocking(move || run(command_cancellation));
+    let lease_task = maintain_trial_lease(client, server, token, trial_id, initial_deadline);
+    tokio::pin!(lease_task);
+
+    tokio::select! {
+        biased;
+        lease_result = &mut lease_task => {
+            let error = lease_result
+                .err()
+                .unwrap_or_else(|| "lease heartbeat task stopped unexpectedly".to_string());
+            cancellation.store(true, Ordering::Release);
+            // The blocking runner observes cancellation within its 20 ms poll,
+            // kills the entire process tree, drains capture pipes, and reaps it.
+            let cleanup = command_task.await;
+            let cleanup_detail = match cleanup {
+                Ok(Ok(_)) => String::new(),
+                Ok(Err(cleanup_error)) => format!("; command cleanup: {cleanup_error}"),
+                Err(join_error) => format!("; command cleanup task failed: {join_error}"),
+            };
+            Err(std::io::Error::other(format!(
+                "lease heartbeat failed: {error}{cleanup_detail}"
+            )))
+        }
+        command_result = &mut command_task => {
+            command_result.map_err(|error| {
+                std::io::Error::other(format!("command runner task failed: {error}"))
+            })?
+        }
+    }
+}
+
+async fn callback_completed_trial(
+    client: &reqwest::Client,
+    server: &str,
+    token: Option<&str>,
+    trial_id: u64,
+) -> Result<bool, String> {
+    let operation = format!("callback verification for trial {trial_id}");
+    let response = with_bearer_auth(
+        client.get(format!(
+            "{server}/api/trial/{trial_id}?include_infeasible=true"
+        )),
+        token,
+    )
+    .send()
+    .await
+    .map_err(|error| request_error(&operation, error))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !response.status().is_success() {
+        return Err(http_error(&operation, response).await);
+    }
+    let completed: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("{operation} returned invalid JSON: {error}"))?;
+    match completed
+        .get("trial_id")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(completed_id) if completed_id == trial_id => Ok(true),
+        Some(completed_id) => Err(format!(
+            "{operation} returned trial_id {completed_id} instead"
+        )),
+        None => Err(format!("{operation} response is missing trial_id")),
     }
 }
 
@@ -163,6 +918,8 @@ struct CappedOutput {
     stderr: String,
     /// True when stdout exceeded MAX_CAPTURE_BYTES and was truncated.
     stdout_truncated: bool,
+    /// True when the command exceeded its deadline and its process tree was killed.
+    timed_out: bool,
 }
 
 /// Output of a single capped stream read: the captured (lossy UTF-8) text and
@@ -220,6 +977,9 @@ enum ExecOutcome {
 /// JSON, or stdout truncated by the capture cap all yield `Cancel` with a
 /// distinct reason.
 fn decide_exec_outcome(output: &CappedOutput) -> ExecOutcome {
+    if output.timed_out {
+        return ExecOutcome::Cancel("command timed out".to_string());
+    }
     if !output.status.success() {
         return ExecOutcome::Cancel(format!(
             "command failed (exit {})",
@@ -232,62 +992,211 @@ fn decide_exec_outcome(output: &CappedOutput) -> ExecOutcome {
         ));
     }
     match serde_json::from_str::<serde_json::Value>(output.stdout.trim()) {
-        Ok(metrics) => ExecOutcome::Tell(metrics),
+        Ok(metrics @ serde_json::Value::Object(_)) => ExecOutcome::Tell(metrics),
+        Ok(_) => ExecOutcome::Cancel("command metrics must be a JSON object".to_string()),
         Err(_) => ExecOutcome::Cancel("command produced invalid JSON".to_string()),
     }
 }
 
-/// Run a child command, capturing stdout/stderr with a per-stream byte cap.
-fn run_capped(mut command: std::process::Command) -> std::io::Result<CappedOutput> {
+#[cfg(unix)]
+fn shell_command(script: &str) -> Command {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(script);
+    command
+}
+
+#[cfg(windows)]
+fn shell_command(script: &str) -> Command {
+    let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+    let mut command = Command::new(shell);
+    command.arg("/D").arg("/S").arg("/C").arg(script);
+    command
+}
+
+#[cfg(not(any(unix, windows)))]
+fn shell_command(script: &str) -> Command {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(script);
+    command
+}
+
+#[cfg(windows)]
+fn spawn_process_group(command: &mut Command) -> std::io::Result<GroupChild> {
+    command.group().kill_on_drop(true).spawn()
+}
+
+#[cfg(not(windows))]
+fn spawn_process_group(command: &mut Command) -> std::io::Result<GroupChild> {
+    command.group_spawn()
+}
+
+fn terminate_process_tree(child: &mut GroupChild) -> std::io::Result<()> {
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::InvalidInput && child.try_wait()?.is_some() =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+struct TimedStatus {
+    status: ExitStatus,
+    timed_out: bool,
+}
+
+#[cfg(test)]
+fn run_timed(mut command: Command, timeout: Duration) -> std::io::Result<TimedStatus> {
+    run_timed_cancellable(&mut command, timeout, None)
+}
+
+fn run_timed_cancellable(
+    command: &mut Command,
+    timeout: Duration,
+    cancellation: Option<&AtomicBool>,
+) -> std::io::Result<TimedStatus> {
+    let mut child = spawn_process_group(command)?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            terminate_process_tree(&mut child)?;
+            let _ = child.wait()?;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "command terminated because its trial lease could not be renewed",
+            ));
+        }
+        if let Some(status) = child.try_wait()? {
+            return Ok(TimedStatus {
+                status,
+                timed_out: false,
+            });
+        }
+        if Instant::now() >= deadline {
+            terminate_process_tree(&mut child)?;
+            let status = child.wait()?;
+            return Ok(TimedStatus {
+                status,
+                timed_out: true,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Run a child command with a deadline, capturing stdout/stderr with a
+/// per-stream byte cap. Both pipes are drained concurrently so a noisy command
+/// cannot deadlock, and the isolated process group is killed on timeout.
+#[cfg(test)]
+fn run_capped(mut command: Command, timeout: Duration) -> std::io::Result<CappedOutput> {
+    run_capped_cancellable(&mut command, timeout, None)
+}
+
+fn run_capped_cancellable(
+    command: &mut Command,
+    timeout: Duration,
+    cancellation: Option<&AtomicBool>,
+) -> std::io::Result<CappedOutput> {
     use std::process::Stdio;
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = spawn_process_group(command)?;
 
-    let stdout_handle = child.stdout.take();
-    let stderr_handle = child.stderr.take();
+    let stdout_handle = child
+        .inner()
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("failed to capture child stdout"))?;
+    let stderr_handle = child
+        .inner()
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("failed to capture child stderr"))?;
 
-    // Read stderr on a separate thread so a child filling both pipes does
-    // not deadlock against us draining stdout.
-    let stderr_thread = std::thread::spawn(move || stderr_handle.map(read_capped).transpose());
+    let (stdout_done_tx, stdout_done_rx) = std::sync::mpsc::sync_channel(1);
+    let stdout_thread = std::thread::spawn(move || {
+        let result = read_capped(stdout_handle);
+        let _ = stdout_done_tx.send(());
+        result
+    });
+    let (stderr_done_tx, stderr_done_rx) = std::sync::mpsc::sync_channel(1);
+    let stderr_thread = std::thread::spawn(move || {
+        let result = read_capped(stderr_handle);
+        let _ = stderr_done_tx.send(());
+        result
+    });
 
-    // Capture the stdout read result without `?` so that, even on an I/O
-    // error, we still join the stderr thread and reap the child below rather
-    // than orphaning the thread and leaking a zombie.
-    let stdout_result = stdout_handle.map(read_capped).transpose();
+    let deadline = Instant::now() + timeout;
+    let mut status = None;
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut lease_cancelled = false;
+    let timed_out = loop {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            terminate_process_tree(&mut child)?;
+            status = Some(child.wait()?);
+            lease_cancelled = true;
+            break false;
+        }
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if !stdout_done {
+            stdout_done = stdout_done_rx.try_recv().is_ok();
+        }
+        if !stderr_done {
+            stderr_done = stderr_done_rx.try_recv().is_ok();
+        }
+        if status.is_some() && stdout_done && stderr_done {
+            break false;
+        }
+        if Instant::now() >= deadline {
+            terminate_process_tree(&mut child)?;
+            status = Some(child.wait()?);
+            break true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
 
+    // A timeout closes pipes for every descendant in the process group. Joining
+    // here guarantees capture threads are reclaimed before returning.
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| std::io::Error::other("stdout capture thread panicked"))??;
     let stderr_result = stderr_thread
         .join()
         .map_err(|_| std::io::Error::other("stderr capture thread panicked"));
-
-    // Always wait on the child so it does not become a zombie. On the stdout
-    // error path the child may still be running, so kill it first to avoid
-    // blocking on a child that is itself blocked writing to our drained pipe.
-    let status_result = if stdout_result.is_err() {
-        let _ = child.kill();
-        child.wait()
-    } else {
-        child.wait()
-    };
-
-    let stdout = stdout_result?;
     let stderr = stderr_result??;
-    let status = status_result?;
+    let status = status.ok_or_else(|| std::io::Error::other("child status was not collected"))?;
 
-    let (stdout_text, stdout_truncated) = stdout.map(|r| (r.text, r.truncated)).unwrap_or_default();
-    let stderr_text = stderr.map(|r| r.text).unwrap_or_default();
+    if lease_cancelled {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "command terminated because its trial lease could not be renewed",
+        ));
+    }
+
+    let stdout_text = stdout.text;
+    let stdout_truncated = stdout.truncated;
+    let stderr_text = stderr.text;
 
     Ok(CappedOutput {
         status,
         stdout: stdout_text,
         stderr: stderr_text,
         stdout_truncated,
+        timed_out,
     })
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Install a lightweight subscriber so the server's request spans are
+    // visible in CLI deployments. Embedders can install their own subscriber
+    // before calling the library API; try_init leaves an existing one intact.
+    let _ = tracing_subscriber::fmt().try_init();
     let cli = Cli::parse();
 
     match cli.command {
@@ -297,9 +1206,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             port,
             dashboard,
             auth_token,
+            read_token,
             checkpoint_dir,
             cors_origins,
-            require_read_auth,
+            allow_unauthenticated_reads,
+            lease_seconds,
         } => {
             let study_config = load_config(&config)?;
             let load_from = study_config
@@ -333,12 +1244,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             options.host = host;
             options.dashboard_dir = dashboard;
             options.auth_token = auth_token;
+            options.read_auth_token = read_token.filter(|token| !token.is_empty());
             options.checkpoint_dir = checkpoint_dir
                 .or(config_checkpoint_dir)
                 .or_else(|| config.parent().map(|path| path.to_path_buf()))
                 .unwrap_or_else(|| PathBuf::from("."));
             options.cors_allowed_origins = cors_origins;
-            options.require_read_auth = require_read_auth;
+            options.require_read_auth = !allow_unauthenticated_reads;
+            options.lease_duration = Duration::from_secs(lease_seconds);
 
             hola::server::serve_with_options(engine, options).await?;
         }
@@ -347,6 +1260,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             exec,
             mode,
             token,
+            request_timeout,
+            command_timeout,
+            outbox_dir,
         } => {
             let exec_mode = matches!(mode, WorkerMode::Exec);
             let token = configured_token(token);
@@ -361,157 +1277,241 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Worker connecting to {server} ({mode_label} mode)...");
             eprintln!("Will execute: {exec}");
 
-            let client = reqwest::Client::new();
+            let request_timeout = Duration::from_secs(request_timeout);
+            let command_timeout = Duration::from_secs(command_timeout);
+            let client = build_http_client(request_timeout)?;
+            let outbox = exec_mode
+                .then(|| TellOutbox::open(&outbox_dir, &server))
+                .transpose()
+                .map_err(|error| format!("failed to initialize tell outbox: {error}"))?;
+            // Reuse this key until a trial is unambiguously received. If an ask
+            // response is lost after the server creates a trial, the retry gets
+            // that same trial instead of allocating and orphaning another one.
+            let mut ask_idempotency_key = Uuid::new_v4().to_string();
 
             loop {
-                let resp =
-                    with_bearer_auth(client.post(format!("{server}/api/ask")), token.as_deref())
-                        .send()
-                        .await;
-
-                match resp {
-                    Ok(r) => {
-                        if !r.status().is_success() {
-                            let status = r.status();
-                            let body = r
-                                .text()
-                                .await
-                                .unwrap_or_else(|_| "unknown error".to_string());
-                            eprintln!("Server returned {status}: {body}. Retrying in 5s...");
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                // Never ask for more work while a prior expensive result is
+                // uncertain. Exact duplicate tells are idempotent server-side,
+                // so retrying a record after a lost response is safe.
+                if let Some(outbox) = &outbox {
+                    match flush_outbox(outbox, &client, token.as_deref()).await {
+                        Ok(delivered) => {
+                            for trial_id in delivered {
+                                eprintln!("Completed trial {trial_id} (durable tell confirmed)");
+                            }
+                        }
+                        Err(error) if error.is_permanent() => {
+                            return Err(format!(
+                                "{error}. Tell remains in outbox; permanent rejection requires operator reconciliation"
+                            )
+                            .into());
+                        }
+                        Err(error) => {
+                            eprintln!("{error}. Tell remains in outbox; retrying in 5s...");
+                            tokio::time::sleep(RETRY_DELAY).await;
                             continue;
                         }
+                    }
+                }
 
-                        let trial: serde_json::Value = match r.json().await {
-                            Ok(trial) => trial,
-                            Err(e) => {
-                                eprintln!("Failed to parse trial response: {e}. Retrying in 5s...");
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                continue;
-                            }
-                        };
-                        let params = trial.get("params").cloned().unwrap_or_default();
-                        let trial_id = match trial.get("trial_id").and_then(|v| v.as_u64()) {
-                            Some(trial_id) => trial_id,
-                            None => {
-                                eprintln!(
-                                    "Trial response missing a valid trial_id, skipping. Retrying in 5s..."
-                                );
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                continue;
-                            }
-                        };
+                let response = match send_checked(
+                    "ask",
+                    ask_request(&client, &server, token.as_deref(), &ask_idempotency_key),
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        eprintln!("{error}. Retrying in 5s...");
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                };
+                let trial: serde_json::Value = match response.json().await {
+                    Ok(trial) => trial,
+                    Err(error) => {
+                        eprintln!("Ask returned invalid JSON: {error}. Retrying in 5s...");
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                };
+                let trial_id = match trial.get("trial_id").and_then(serde_json::Value::as_u64) {
+                    Some(trial_id) => trial_id,
+                    None => {
+                        eprintln!(
+                            "Ask response missing a valid trial_id; retrying in 5s without executing"
+                        );
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                };
+                let params = match trial.get("params").filter(|params| params.is_object()) {
+                    Some(params) => params.clone(),
+                    None => {
+                        eprintln!(
+                            "Trial {trial_id}: ask response is missing an object-valued params field; canceling"
+                        );
+                        if let Err(error) =
+                            cancel_trial(&client, &server, token.as_deref(), trial_id).await
+                        {
+                            eprintln!("Failed to cancel malformed trial {trial_id}: {error}");
+                        }
+                        ask_idempotency_key = Uuid::new_v4().to_string();
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                };
+                ask_idempotency_key = Uuid::new_v4().to_string();
 
-                        if exec_mode {
-                            // Exec mode: run command, parse stdout as
-                            // JSON metrics, report on the script's behalf.
-                            let mut command = std::process::Command::new("sh");
-                            command
-                                .arg("-c")
-                                .arg(&exec)
-                                .env("HOLA_PARAMS", params.to_string());
-
-                            match run_capped(command) {
-                                Ok(output) => match decide_exec_outcome(&output) {
-                                    ExecOutcome::Tell(metrics) => {
-                                        let tell_resp = client.post(format!("{server}/api/tell"));
-                                        let tell_resp =
-                                            with_bearer_auth(tell_resp, token.as_deref())
-                                                .json(&serde_json::json!({
-                                                    "trial_id": trial_id,
-                                                    "metrics": metrics,
-                                                }))
-                                                .send()
-                                                .await;
-
-                                        match tell_resp {
-                                            Ok(_) => {
-                                                eprintln!("Completed trial {trial_id}: {metrics}")
-                                            }
-                                            Err(e) => {
-                                                eprintln!("Failed to report trial {trial_id}: {e}")
-                                            }
+                if exec_mode {
+                    let mut command = shell_command(&exec);
+                    command.env("HOLA_PARAMS", params.to_string());
+                    let command_result = run_command_with_heartbeat(
+                        &client,
+                        &server,
+                        token.as_deref(),
+                        trial_id,
+                        move |cancellation| {
+                            run_capped_cancellable(
+                                &mut command,
+                                command_timeout,
+                                Some(cancellation.as_ref()),
+                            )
+                        },
+                    )
+                    .await;
+                    match command_result {
+                        Ok(output) => match decide_exec_outcome(&output) {
+                            ExecOutcome::Tell(metrics) => {
+                                let record = PendingTell::new(&server, trial_id, metrics);
+                                let outbox = outbox.as_ref().expect("exec mode has an outbox");
+                                outbox.persist(&record).map_err(|error| {
+                                    format!(
+                                        "failed to durably queue result for trial {trial_id}: {error}"
+                                    )
+                                })?;
+                                match flush_outbox(outbox, &client, token.as_deref()).await {
+                                    Ok(delivered) => {
+                                        for delivered_id in delivered {
+                                            eprintln!(
+                                                "Completed trial {delivered_id} (durable tell confirmed)"
+                                            );
                                         }
                                     }
-                                    ExecOutcome::Cancel(reason) => {
-                                        // Cancel rather than reporting a fake result,
-                                        // mirroring callback mode's failure path.
-                                        eprintln!(
-                                            "Trial {trial_id}: {reason}, canceling. stderr: {}",
-                                            log_snippet(&output.stderr)
-                                        );
-                                        let _ = with_bearer_auth(
-                                            client.post(format!("{server}/api/cancel")),
-                                            token.as_deref(),
+                                    Err(error) if error.is_permanent() => {
+                                        return Err(format!(
+                                            "{error}. Trial {trial_id} remains durable; permanent rejection requires operator reconciliation"
                                         )
-                                        .json(&serde_json::json!({"trial_id": trial_id}))
-                                        .send()
-                                        .await;
+                                        .into());
                                     }
-                                },
-                                Err(e) => {
-                                    eprintln!(
-                                        "Trial {trial_id}: failed to run command ({e}), canceling"
-                                    );
-                                    let _ = with_bearer_auth(
-                                        client.post(format!("{server}/api/cancel")),
-                                        token.as_deref(),
-                                    )
-                                    .json(&serde_json::json!({"trial_id": trial_id}))
-                                    .send()
-                                    .await;
+                                    Err(error) => {
+                                        eprintln!(
+                                            "{error}. Trial {trial_id} remains durable and will be retried before asking again"
+                                        );
+                                    }
                                 }
                             }
-                        } else {
-                            // Callback mode (default): script calls
-                            // POST /api/tell itself via HOLA_SERVER.
-                            let mut command = std::process::Command::new("sh");
-                            command
-                                .arg("-c")
-                                .arg(&exec)
-                                .env("HOLA_SERVER", &server)
-                                .env("HOLA_TRIAL_ID", trial_id.to_string())
-                                .env("HOLA_PARAMS", params.to_string());
-                            if let Some(token) = &token {
-                                command.env("HOLA_API_TOKEN", token);
-                            }
-                            let status = match command.status() {
-                                Ok(status) => status,
-                                Err(e) => {
-                                    eprintln!(
-                                        "Trial {trial_id}: failed to run command ({e}), canceling"
-                                    );
-                                    let _ = with_bearer_auth(
-                                        client.post(format!("{server}/api/cancel")),
-                                        token.as_deref(),
-                                    )
-                                    .json(&serde_json::json!({"trial_id": trial_id}))
-                                    .send()
-                                    .await;
-                                    continue;
-                                }
-                            };
-
-                            if status.success() {
-                                eprintln!("Trial {trial_id}: script exited successfully");
-                            } else {
+                            ExecOutcome::Cancel(reason) => {
                                 eprintln!(
-                                    "Trial {trial_id}: script failed (exit {}), canceling",
-                                    status.code().unwrap_or(-1)
+                                    "Trial {trial_id}: {reason}, canceling. stderr: {}",
+                                    log_snippet(&output.stderr)
                                 );
-                                let _ = with_bearer_auth(
-                                    client.post(format!("{server}/api/cancel")),
-                                    token.as_deref(),
-                                )
-                                .json(&serde_json::json!({"trial_id": trial_id}))
-                                .send()
-                                .await;
+                                if let Err(error) =
+                                    cancel_trial(&client, &server, token.as_deref(), trial_id).await
+                                {
+                                    eprintln!("Failed to cancel trial {trial_id}: {error}");
+                                }
+                                tokio::time::sleep(COMMAND_FAILURE_DELAY).await;
                             }
+                        },
+                        Err(error) => {
+                            eprintln!(
+                                "Trial {trial_id}: failed to run command ({error}), canceling"
+                            );
+                            if let Err(error) =
+                                cancel_trial(&client, &server, token.as_deref(), trial_id).await
+                            {
+                                eprintln!("Failed to cancel trial {trial_id}: {error}");
+                            }
+                            tokio::time::sleep(COMMAND_FAILURE_DELAY).await;
                         }
                     }
-                    Err(e) => {
-                        eprintln!("Failed to connect to server: {e}. Retrying in 5s...");
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                } else {
+                    // Callback mode: the script owns tell(), but a zero exit is
+                    // not sufficient evidence that it actually completed this id.
+                    let mut command = shell_command(&exec);
+                    command
+                        .env("HOLA_SERVER", &server)
+                        .env("HOLA_TRIAL_ID", trial_id.to_string())
+                        .env("HOLA_PARAMS", params.to_string());
+                    if let Some(token) = &token {
+                        command.env("HOLA_API_TOKEN", token);
+                    }
+                    let command_result = run_command_with_heartbeat(
+                        &client,
+                        &server,
+                        token.as_deref(),
+                        trial_id,
+                        move |cancellation| {
+                            run_timed_cancellable(
+                                &mut command,
+                                command_timeout,
+                                Some(cancellation.as_ref()),
+                            )
+                        },
+                    )
+                    .await;
+                    let failure = match command_result {
+                        Ok(result) if result.timed_out => Some("command timed out".to_string()),
+                        Ok(result) if !result.status.success() => Some(format!(
+                            "script failed (exit {})",
+                            result.status.code().unwrap_or(-1)
+                        )),
+                        Ok(_) => None,
+                        Err(error) => Some(format!("failed to run command ({error})")),
+                    };
+
+                    if let Some(reason) = failure {
+                        eprintln!("Trial {trial_id}: {reason}, canceling");
+                        if let Err(error) =
+                            cancel_trial(&client, &server, token.as_deref(), trial_id).await
+                        {
+                            eprintln!("Failed to cancel trial {trial_id}: {error}");
+                        }
+                        tokio::time::sleep(COMMAND_FAILURE_DELAY).await;
+                        continue;
+                    }
+
+                    loop {
+                        match callback_completed_trial(&client, &server, token.as_deref(), trial_id)
+                            .await
+                        {
+                            Ok(true) => {
+                                eprintln!(
+                                    "Trial {trial_id}: callback completion confirmed by server"
+                                );
+                                break;
+                            }
+                            Ok(false) => {
+                                eprintln!(
+                                    "Trial {trial_id}: script exited successfully without completing its trial; canceling"
+                                );
+                                if let Err(error) =
+                                    cancel_trial(&client, &server, token.as_deref(), trial_id).await
+                                {
+                                    eprintln!("Failed to cancel trial {trial_id}: {error}");
+                                }
+                                tokio::time::sleep(COMMAND_FAILURE_DELAY).await;
+                                break;
+                            }
+                            Err(error) => {
+                                // Completion is uncertain: never cancel based on
+                                // a failed verification request, because the
+                                // callback's tell may already have succeeded.
+                                eprintln!("{error}. Retrying verification in 5s...");
+                                tokio::time::sleep(RETRY_DELAY).await;
+                            }
+                        }
                     }
                 }
             }
@@ -525,6 +1525,122 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    fn test_directory(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("hola-cli-{label}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("test directory should be created");
+        path
+    }
+
+    struct MockReply {
+        status: Option<u16>,
+        body: &'static str,
+        delay: Duration,
+    }
+
+    impl MockReply {
+        fn close_connection() -> Self {
+            Self {
+                status: None,
+                body: "",
+                delay: Duration::ZERO,
+            }
+        }
+
+        fn response(status: u16, body: &'static str) -> Self {
+            Self {
+                status: Some(status),
+                body,
+                delay: Duration::ZERO,
+            }
+        }
+
+        fn delayed(status: u16, body: &'static str, delay: Duration) -> Self {
+            Self {
+                status: Some(status),
+                body,
+                delay,
+            }
+        }
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<String> {
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 2048];
+        let mut expected_len = None;
+        loop {
+            let count = stream.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            if expected_len.is_none() {
+                if let Some(headers_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers_end = headers_end + 4;
+                    let headers = String::from_utf8_lossy(&bytes[..headers_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    expected_len = Some(headers_end + content_length);
+                }
+            }
+            if expected_len.is_some_and(|expected| bytes.len() >= expected) {
+                break;
+            }
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    fn mock_http_server(replies: Vec<MockReply>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("mock server should bind a local port");
+        let address = listener.local_addr().expect("mock server has an address");
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::with_capacity(replies.len());
+            for reply in replies {
+                let (mut stream, _) = listener
+                    .accept()
+                    .expect("mock server should accept request");
+                requests.push(
+                    read_http_request(&mut stream).expect("mock server should read HTTP request"),
+                );
+                if !reply.delay.is_zero() {
+                    std::thread::sleep(reply.delay);
+                }
+                let Some(status) = reply.status else {
+                    continue;
+                };
+                let reason = match status {
+                    200 => "OK",
+                    404 => "Not Found",
+                    409 => "Conflict",
+                    503 => "Service Unavailable",
+                    _ => "Test Status",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    reply.body.len(),
+                    reply.body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+            requests
+        });
+        (format!("http://{address}"), handle)
+    }
 
     /// A reader that yields `total` bytes of 'a' without ever blocking, used to
     /// exercise the capture cap. Tracks how many bytes were actually consumed
@@ -580,6 +1696,7 @@ mod tests {
         assert_eq!(result.text, "hello");
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_capped_floods_both_pipes_without_deadlock() {
         // Emit far more than the cap on both stdout and stderr. Without the
@@ -590,22 +1707,34 @@ mod tests {
             "head -c {bytes} /dev/zero | tr '\\0' a; \
              head -c {bytes} /dev/zero | tr '\\0' b 1>&2"
         );
-        let mut command = std::process::Command::new("sh");
-        command.arg("-c").arg(&script);
-
-        let output = run_capped(command).expect("run_capped should not deadlock");
+        let output = run_capped(shell_command(&script), Duration::from_secs(10))
+            .expect("run_capped should not deadlock");
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), MAX_CAPTURE_BYTES);
         assert_eq!(output.stderr.len(), MAX_CAPTURE_BYTES);
         assert!(output.stdout_truncated);
     }
 
-    /// Run a tiny shell command through run_capped to obtain a real
-    /// CappedOutput with a process-supplied ExitStatus for decision testing.
-    fn capped_from_sh(script: &str) -> CappedOutput {
-        let mut command = std::process::Command::new("sh");
-        command.arg("-c").arg(script);
-        run_capped(command).expect("command should run")
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(code as u32)
+    }
+
+    fn capped_output(code: i32, stdout: &str) -> CappedOutput {
+        CappedOutput {
+            status: exit_status(code),
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            timed_out: false,
+        }
     }
 
     #[test]
@@ -620,6 +1749,30 @@ mod tests {
         let normalized = normalize_server_url("https://example.com:8000")
             .expect("valid https URL should normalize");
         assert_eq!(normalized, "https://example.com:8000");
+    }
+
+    #[test]
+    fn normalize_server_url_preserves_and_canonicalizes_path_prefix() {
+        let normalized = normalize_server_url("https://example.com/hola/proxy///")
+            .expect("a path-prefixed server URL should normalize");
+        assert_eq!(normalized, "https://example.com/hola/proxy");
+        assert_eq!(
+            format!("{normalized}/api/ask"),
+            "https://example.com/hola/proxy/api/ask"
+        );
+    }
+
+    #[test]
+    fn normalize_server_url_rejects_query_fragment_and_userinfo() {
+        for invalid in [
+            "https://example.com?tenant=one",
+            "https://example.com/#dashboard",
+            "https://user:password@example.com",
+        ] {
+            let error = normalize_server_url(invalid)
+                .expect_err("ambiguous base URL components must be rejected");
+            assert!(error.to_string().contains("invalid --server URL"));
+        }
     }
 
     #[test]
@@ -644,8 +1797,383 @@ mod tests {
     }
 
     #[test]
+    fn ask_request_carries_auth_and_idempotency_key() {
+        let client = build_http_client(Duration::from_secs(1)).expect("client should build");
+        let request = ask_request(
+            &client,
+            "http://127.0.0.1:8000",
+            Some("secret"),
+            "stable-ask-key",
+        )
+        .build()
+        .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("Idempotency-Key")
+                .expect("idempotency header")
+                .to_str()
+                .expect("ASCII header"),
+            "stable-ask-key"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .expect("authorization header")
+                .to_str()
+                .expect("ASCII header"),
+            "Bearer secret"
+        );
+    }
+
+    #[test]
+    fn worker_timeout_flags_are_positive_and_have_bounded_defaults() {
+        let cli = Cli::try_parse_from([
+            "hola",
+            "worker",
+            "--server",
+            "http://127.0.0.1:8000",
+            "--exec",
+            "worker-command",
+        ])
+        .expect("worker defaults should parse");
+        match cli.command {
+            Commands::Worker {
+                request_timeout,
+                command_timeout,
+                ..
+            } => {
+                assert_eq!(request_timeout, 30);
+                assert_eq!(command_timeout, 3600);
+            }
+            Commands::Serve { .. } => panic!("expected worker command"),
+        }
+
+        let invalid = Cli::try_parse_from([
+            "hola",
+            "worker",
+            "--server",
+            "http://127.0.0.1:8000",
+            "--exec",
+            "worker-command",
+            "--command-timeout",
+            "0",
+        ]);
+        assert!(invalid.is_err(), "zero command timeout must be rejected");
+    }
+
+    #[test]
+    fn outbox_round_trips_atomically_and_rejects_changed_metrics() {
+        let root = test_directory("outbox-roundtrip");
+        let server = "http://127.0.0.1:8000";
+        let outbox = TellOutbox::open(&root, server).expect("outbox should open");
+        let record = PendingTell::new(server, 42, serde_json::json!({"loss": 0.25}));
+
+        let path = outbox.persist(&record).expect("record should persist");
+        assert!(path.exists());
+        drop(outbox);
+        let outbox = TellOutbox::open(&root, server).expect("outbox should reopen after restart");
+        assert_eq!(outbox.pending().expect("outbox should load")[0].1, record);
+        assert_eq!(
+            outbox.persist(&record).expect("exact re-persist is safe"),
+            path
+        );
+
+        let changed = PendingTell::new(server, 42, serde_json::json!({"loss": 9.0}));
+        let error = outbox
+            .persist(&changed)
+            .expect_err("different metrics for one id must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+
+        outbox.remove(&path).expect("record should be removed");
+        assert!(outbox.pending().expect("outbox should be empty").is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn outbox_retries_the_same_tell_after_a_lost_response() {
+        let (server, server_thread) = mock_http_server(vec![
+            MockReply::close_connection(),
+            MockReply::response(200, r#"{"status":"ok","trial":{"trial_id":7}}"#),
+        ]);
+        let root = test_directory("outbox-lost-response");
+        let outbox = TellOutbox::open(&root, &server).expect("outbox should open");
+        let record = PendingTell::new(&server, 7, serde_json::json!({"loss": 0.5}));
+        outbox
+            .persist(&record)
+            .expect("tell must be durable before send");
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+
+        let first = flush_outbox(&outbox, &client, Some("secret")).await;
+        let first = first.expect_err("a dropped response is an uncertain tell");
+        assert!(!first.is_permanent());
+        assert_eq!(outbox.pending().expect("record remains").len(), 1);
+
+        let delivered = flush_outbox(&outbox, &client, Some("secret"))
+            .await
+            .expect("idempotent retry should be confirmed");
+        assert_eq!(delivered, vec![7]);
+        assert!(outbox.pending().expect("record is removed").is_empty());
+
+        let requests = server_thread.join().expect("mock server should finish");
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert!(request.contains(r#""trial_id":7"#));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer secret")
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn outbox_emits_post_commit_warnings_before_removing_the_record() {
+        let (server, server_thread) = mock_http_server(vec![MockReply::response(
+            200,
+            r#"{"status":"ok","trial":{"trial_id":7},"post_commit_warnings":["auto-checkpoint failed","strategy refit failed"]}"#,
+        )]);
+        let root = test_directory("outbox-post-commit-warnings");
+        let outbox = TellOutbox::open(&root, &server).expect("outbox should open");
+        let record = PendingTell::new(&server, 7, serde_json::json!({"loss": 0.5}));
+        let path = outbox.persist(&record).expect("tell must be durable");
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+        let mut emitted = Vec::new();
+
+        let delivered =
+            flush_outbox_with_warning_sink(&outbox, &client, None, |trial_id, warning| {
+                assert!(path.exists(), "warning must be emitted before cleanup");
+                emitted.push((trial_id, warning.to_string()));
+            })
+            .await
+            .expect("valid acknowledgement should confirm the tell");
+
+        assert_eq!(delivered, vec![7]);
+        assert_eq!(
+            emitted,
+            vec![
+                (7, "auto-checkpoint failed".to_string()),
+                (7, "strategy refit failed".to_string()),
+            ]
+        );
+        assert!(!path.exists(), "confirmed record should be removed");
+        server_thread.join().expect("mock server should finish");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tell_and_cancel_reject_non_success_http_statuses() {
+        let (server, server_thread) = mock_http_server(vec![
+            MockReply::response(503, r#"{"error":"tell unavailable"}"#),
+            MockReply::response(409, r#"{"error":"cancel conflict"}"#),
+        ]);
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+        let record = PendingTell::new(&server, 3, serde_json::json!({"loss": 1.0}));
+
+        let tell_error = deliver_tell(&client, None, &record)
+            .await
+            .expect_err("503 tell must fail");
+        assert!(!tell_error.is_permanent());
+        let tell_error = tell_error.to_string();
+        assert!(tell_error.contains("HTTP 503 Service Unavailable"));
+        assert!(tell_error.contains("tell unavailable"));
+
+        let cancel_error = cancel_trial(&client, &server, None, 3)
+            .await
+            .expect_err("409 cancel must fail");
+        assert!(cancel_error.contains("HTTP 409 Conflict"));
+        assert!(cancel_error.contains("cancel conflict"));
+        server_thread.join().expect("mock server should finish");
+    }
+
+    #[tokio::test]
+    async fn cancel_requires_canonical_2xx_acknowledgement() {
+        let (server, server_thread) = mock_http_server(vec![
+            MockReply::response(200, "not-json"),
+            MockReply::response(200, r#"{"status":"error"}"#),
+            MockReply::response(200, r#"{"status":"ok","trial_id":99}"#),
+            MockReply::response(200, r#"{"status":"ok","trial_id":7}"#),
+        ]);
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+
+        let invalid_json = cancel_trial(&client, &server, None, 7)
+            .await
+            .expect_err("invalid JSON must not confirm cancellation");
+        assert!(invalid_json.contains("invalid acknowledgement JSON"));
+
+        let bad_status = cancel_trial(&client, &server, None, 7)
+            .await
+            .expect_err("status:error must not confirm cancellation");
+        assert!(bad_status.contains("canonical status 'ok'"));
+
+        let wrong_id = cancel_trial(&client, &server, None, 7)
+            .await
+            .expect_err("wrong optional identity must not confirm cancellation");
+        assert!(wrong_id.contains("trial_id 99 instead"));
+
+        cancel_trial(&client, &server, None, 7)
+            .await
+            .expect("canonical acknowledgement should confirm cancellation");
+        server_thread.join().expect("mock server should finish");
+    }
+
+    #[tokio::test]
+    async fn outbox_keeps_records_for_invalid_or_mismatched_2xx_acknowledgements() {
+        for (label, body, expected) in [
+            ("invalid-json", "not-json", "invalid acknowledgement JSON"),
+            (
+                "missing-trial",
+                r#"{"status":"ok"}"#,
+                "missing trial.trial_id",
+            ),
+            (
+                "wrong-trial",
+                r#"{"status":"ok","trial":{"trial_id":99}}"#,
+                "acknowledged trial_id 99 instead",
+            ),
+            (
+                "non-array-warnings",
+                r#"{"status":"ok","trial":{"trial_id":7},"post_commit_warnings":"failed"}"#,
+                "non-array post_commit_warnings",
+            ),
+            (
+                "non-string-warning",
+                r#"{"status":"ok","trial":{"trial_id":7},"post_commit_warnings":[42]}"#,
+                "non-string post_commit_warnings entry",
+            ),
+        ] {
+            let (server, server_thread) = mock_http_server(vec![MockReply::response(200, body)]);
+            let root = test_directory(label);
+            let outbox = TellOutbox::open(&root, &server).expect("outbox should open");
+            let record = PendingTell::new(&server, 7, serde_json::json!({"loss": 0.5}));
+            outbox.persist(&record).expect("tell must be durable");
+            let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+
+            let error = flush_outbox(&outbox, &client, None)
+                .await
+                .expect_err("invalid acknowledgement must not delete the record");
+            assert!(error.is_permanent());
+            assert!(error.to_string().contains(expected));
+            assert_eq!(outbox.pending().expect("record remains").len(), 1);
+
+            server_thread.join().expect("mock server should finish");
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_tell_rejection_keeps_outbox_record_and_is_classified() {
+        let (server, server_thread) = mock_http_server(vec![MockReply::response(
+            400,
+            r#"{"error":"Trial 7 lease expired"}"#,
+        )]);
+        let root = test_directory("outbox-permanent-rejection");
+        let outbox = TellOutbox::open(&root, &server).expect("outbox should open");
+        let record = PendingTell::new(&server, 7, serde_json::json!({"loss": 0.5}));
+        outbox.persist(&record).expect("tell must be durable");
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+
+        let error = flush_outbox(&outbox, &client, None)
+            .await
+            .expect_err("400 is a permanent rejection");
+        assert!(error.is_permanent());
+        assert!(error.to_string().contains("lease expired"));
+        assert_eq!(outbox.pending().expect("record remains").len(), 1);
+
+        server_thread.join().expect("mock server should finish");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_validates_acknowledgement_and_sends_auth() {
+        let (server, server_thread) = mock_http_server(vec![MockReply::response(
+            200,
+            r#"{"status":"ok","trial_id":7,"lease_expires_at_ms":4000000000000}"#,
+        )]);
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+
+        let deadline = heartbeat_trial(&client, &server, Some("secret"), 7)
+            .await
+            .expect("heartbeat should be acknowledged");
+        assert_eq!(deadline, 4_000_000_000_000);
+
+        let requests = server_thread.join().expect("mock server should finish");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /api/heartbeat "));
+        assert!(requests[0].contains(r#""trial_id":7"#));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_wrong_trial_acknowledgement() {
+        let (server, server_thread) = mock_http_server(vec![MockReply::response(
+            200,
+            r#"{"status":"ok","trial_id":8,"lease_expires_at_ms":4000000000000}"#,
+        )]);
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+
+        let error = heartbeat_trial(&client, &server, None, 7)
+            .await
+            .expect_err("wrong trial acknowledgement must fail");
+        assert!(matches!(error, HeartbeatError::Rejected(_)));
+        assert!(error.to_string().contains("trial_id 8 instead"));
+        server_thread.join().expect("mock server should finish");
+    }
+
+    #[tokio::test]
+    async fn callback_success_requires_the_server_to_confirm_the_same_trial() {
+        let (server, server_thread) = mock_http_server(vec![
+            MockReply::response(200, r#"{"trial_id":11}"#),
+            MockReply::response(404, r#"{"error":"not found"}"#),
+            MockReply::response(200, r#"{"trial_id":99}"#),
+        ]);
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+
+        assert!(
+            callback_completed_trial(&client, &server, None, 11)
+                .await
+                .expect("matching completion should verify")
+        );
+        assert!(
+            !callback_completed_trial(&client, &server, None, 12)
+                .await
+                .expect("404 means callback did not tell")
+        );
+        let error = callback_completed_trial(&client, &server, None, 13)
+            .await
+            .expect_err("wrong completed id must fail verification");
+        assert!(error.contains("trial_id 99 instead"));
+        server_thread.join().expect("mock server should finish");
+    }
+
+    #[tokio::test]
+    async fn configured_request_timeout_bounds_worker_http_calls() {
+        let (server, server_thread) = mock_http_server(vec![MockReply::delayed(
+            200,
+            r#"{"status":"ok"}"#,
+            Duration::from_millis(300),
+        )]);
+        let client = build_http_client(Duration::from_millis(50)).expect("client should build");
+        let started = Instant::now();
+
+        let error = cancel_trial(&client, &server, None, 1)
+            .await
+            .expect_err("slow request should time out");
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server_thread.join().expect("mock server should finish");
+    }
+
+    #[test]
     fn decide_exec_outcome_zero_exit_valid_json_tells() {
-        let output = capped_from_sh("printf '{\"loss\": 1.5}'");
+        let output = capped_output(0, r#"{"loss": 1.5}"#);
         match decide_exec_outcome(&output) {
             ExecOutcome::Tell(metrics) => {
                 assert_eq!(metrics["loss"], serde_json::json!(1.5));
@@ -656,7 +2184,7 @@ mod tests {
 
     #[test]
     fn decide_exec_outcome_nonzero_exit_cancels() {
-        let output = capped_from_sh("printf '{\"loss\": 1.5}'; exit 3");
+        let output = capped_output(3, r#"{"loss": 1.5}"#);
         match decide_exec_outcome(&output) {
             ExecOutcome::Cancel(reason) => assert!(reason.contains("exit 3")),
             ExecOutcome::Tell(_) => panic!("expected Cancel on non-zero exit"),
@@ -665,7 +2193,7 @@ mod tests {
 
     #[test]
     fn decide_exec_outcome_invalid_json_cancels() {
-        let output = capped_from_sh("printf 'not json'");
+        let output = capped_output(0, "not json");
         match decide_exec_outcome(&output) {
             ExecOutcome::Cancel(reason) => assert!(reason.contains("invalid JSON")),
             ExecOutcome::Tell(_) => panic!("expected Cancel on invalid JSON"),
@@ -673,11 +2201,20 @@ mod tests {
     }
 
     #[test]
+    fn decide_exec_outcome_requires_metrics_object() {
+        let output = capped_output(0, "[1, 2, 3]");
+        match decide_exec_outcome(&output) {
+            ExecOutcome::Cancel(reason) => assert!(reason.contains("JSON object")),
+            ExecOutcome::Tell(_) => panic!("expected Cancel for non-object metrics"),
+        }
+    }
+
+    #[test]
     fn decide_exec_outcome_truncated_stdout_cancels_distinctly() {
         // A successful command whose stdout exceeds the cap must cancel with a
         // truncation-specific reason rather than the generic parse-failed path.
-        let bytes = MAX_CAPTURE_BYTES + 4096;
-        let output = capped_from_sh(&format!("head -c {bytes} /dev/zero | tr '\\0' a"));
+        let mut output = capped_output(0, "truncated");
+        output.stdout_truncated = true;
         assert!(output.status.success());
         assert!(output.stdout_truncated);
         match decide_exec_outcome(&output) {
@@ -689,5 +2226,57 @@ mod tests {
             }
             ExecOutcome::Tell(_) => panic!("expected Cancel on truncated stdout"),
         }
+    }
+
+    #[test]
+    fn decide_exec_outcome_timeout_cancels_distinctly() {
+        let mut output = capped_output(0, r#"{"loss": 1.5}"#);
+        output.timed_out = true;
+        match decide_exec_outcome(&output) {
+            ExecOutcome::Cancel(reason) => assert!(reason.contains("timed out")),
+            ExecOutcome::Tell(_) => panic!("expected Cancel on command timeout"),
+        }
+    }
+
+    #[test]
+    fn platform_shell_preserves_nonzero_exit_status() {
+        #[cfg(unix)]
+        let script = "exit 7";
+        #[cfg(windows)]
+        let script = "exit /b 7";
+
+        let result = run_timed(shell_command(script), Duration::from_secs(5))
+            .expect("platform shell should execute");
+        assert!(!result.timed_out);
+        assert_eq!(result.status.code(), Some(7));
+    }
+
+    #[test]
+    fn run_capped_times_out_and_reaps_command() {
+        #[cfg(unix)]
+        let script = "sleep 5";
+        #[cfg(windows)]
+        let script = "ping 127.0.0.1 -n 6 >NUL";
+
+        let started = Instant::now();
+        let output = run_capped(shell_command(script), Duration::from_millis(100))
+            .expect("timed command should be killed and reaped");
+        assert!(output.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_timed_kills_descendants_before_they_write_a_sentinel() {
+        let directory = test_directory("process-tree");
+        let sentinel = directory.join("descendant-finished");
+        let script = format!("(sleep 0.5; printf done > '{}') & wait", sentinel.display());
+
+        let result = run_timed(shell_command(&script), Duration::from_millis(100))
+            .expect("timed process tree should be terminated");
+        assert!(result.timed_out);
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!sentinel.exists(), "a timed-out descendant survived");
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

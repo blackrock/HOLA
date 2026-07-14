@@ -5,16 +5,34 @@ build-backend = "maturin"
 [project]
 name = "hola-opt"
 version = "1.0.1-rc7"
+description = "Lightweight asynchronous hyperparameter optimization backed by Rust"
+readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE-APACHE"]
+authors = [{ name = "BlackRock, Inc." }]
+keywords = ["optimization", "hyperparameter-optimization", "machine-learning"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
     "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
 ]
+
+[project.urls]
+Homepage = "https://github.com/blackrock/HOLA"
+Documentation = "https://github.com/blackrock/HOLA/blob/main/docs/python-guide.md"
+Repository = "https://github.com/blackrock/HOLA"
+Issues = "https://github.com/blackrock/HOLA/issues"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "."
+exclude = ["hola_opt/__pycache__", "hola_opt/**/*.pyc"]
 
 [tool.ruff]
 target-version = "py310"

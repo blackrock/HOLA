@@ -22,19 +22,20 @@
 //! directly when you have concrete Rust types and want full compile-time
 //! verification.
 
-use opt_engine::leaderboard::{Leaderboard, Trial};
+use opt_engine::leaderboard::{Leaderboard, Trial, is_feasible_multi};
 use opt_engine::persistence::{
-    AutoCheckpointConfig, LeaderboardCheckpoint, ObservationKind, check_format_version_bytes,
-    read_checkpoint_capped, sync_parent_dir, unique_temp_path,
+    AutoCheckpointConfig, Checkpoint, LeaderboardCheckpoint, ObservationKind, atomic_write_json,
+    check_format_version_bytes, read_checkpoint_capped,
 };
 use opt_engine::scales::{LinearScale, Log10Scale, LogScale, Scale};
 use opt_engine::spaces::{CategoricalSpace, ContinuousSpace, DiscreteSpace};
 use opt_engine::strategies::{GmmStrategy, RandomStrategy, SobolStrategy};
 use opt_engine::traits::{RefitConfig, SampleSpace, StandardizedSpace, Strategy};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 
 /// Maximum space dimensionality the Sobol backend supports. It ships 256
@@ -53,6 +54,57 @@ const MAX_SOBOL_DIMS: usize = 256;
 /// cancelled ids is sufficient; the set is pruned to this many entries (keeping
 /// the largest/newest ids) so it cannot grow without bound over a long run.
 const MAX_CANCELLED_RETAINED: usize = 4096;
+
+/// Hard safety bound for in-flight work when no smaller `max_trials` budget is
+/// configured. This prevents crashed or malicious workers from growing pending
+/// state without limit.
+const MAX_PENDING_TRIALS: usize = 10_000;
+
+/// Every ask retry key refers to one live pending trial, so its capacity must
+/// cover the entire pending-work bound. Evicting a key while its trial is still
+/// pending would let a retry allocate duplicate work.
+const MAX_ASK_IDEMPOTENCY_KEYS: usize = MAX_PENDING_TRIALS;
+
+/// Recent completion receipts retained after leaderboard eviction. They make a
+/// tell retry safe when the original success response was lost, without turning
+/// the idempotency ledger into unbounded study history.
+const MAX_COMPLETION_RECEIPTS: usize = 4096;
+
+/// Continue drawing a low-discrepancy global-exploration point at this cadence
+/// after the initial warm-up. This prevents a fitted GMM from permanently
+/// collapsing around sparse early elites.
+const AUTO_EXPLORATION_PERIOD: usize = 5;
+/// Bound repeated EM work and clone volume on long studies. Elite selection
+/// still scans the leaderboard, but model fitting never grows beyond this
+/// representative top-ranked window.
+const MAX_REFIT_SAMPLES: usize = 4096;
+/// Bound the leaderboard window scanned to choose those samples, making
+/// periodic refit cost independent of total study history after warm-up.
+const MAX_REFIT_CANDIDATES: usize = 16_384;
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn fresh_legacy_trial_id_floor() -> u64 {
+    // Legacy leaderboard-only files cannot encode IDs of work that was pending
+    // when they were written. Start the resumed allocator in a fresh high-bit
+    // epoch so a late pre-restart worker cannot collide with a newly issued ID.
+    const EPOCH_BIT: u64 = 1 << 62;
+    EPOCH_BIT | (rand::random::<u64>() & (EPOCH_BIT - 1))
+}
+
+fn lease_deadline(duration: Duration) -> Result<u64, String> {
+    if duration.is_zero() {
+        return Err("trial lease duration must be greater than zero".to_string());
+    }
+    let millis = duration.as_millis().min(u128::from(u64::MAX)) as u64;
+    Ok(unix_time_millis().saturating_add(millis.max(1)))
+}
 
 // =============================================================================
 // Parameter metadata for dashboard API
@@ -159,26 +211,26 @@ impl DynDimension {
     fn to_param_config(&self) -> ParamConfig {
         match self {
             Self::RealLinear(s) => ParamConfig::Real {
-                min: s.min,
-                max: s.max,
+                min: s.min(),
+                max: s.max(),
                 scale: "linear".to_string(),
             },
             Self::RealLog(s) => ParamConfig::Real {
-                min: s.min,
-                max: s.max,
+                min: s.min(),
+                max: s.max(),
                 scale: "log".to_string(),
             },
             Self::RealLog10(s) => ParamConfig::Real {
-                min: s.min,
-                max: s.max,
+                min: s.min(),
+                max: s.max(),
                 scale: "log10".to_string(),
             },
             Self::Integer(s) => ParamConfig::Integer {
-                min: s.min,
-                max: s.max,
+                min: s.min(),
+                max: s.max(),
             },
             Self::Categorical(s) => ParamConfig::Categorical {
-                choices: s.choices.clone(),
+                choices: s.choices().to_vec(),
             },
         }
     }
@@ -187,29 +239,29 @@ impl DynDimension {
         match self {
             Self::RealLinear(s) => ParamInfo {
                 param_type: "real".into(),
-                min: s.min,
-                max: s.max,
+                min: s.min(),
+                max: s.max(),
                 scale: LinearScale::name().to_string(),
                 choices: None,
             },
             Self::RealLog(s) => ParamInfo {
                 param_type: "real".into(),
-                min: s.min,
-                max: s.max,
+                min: s.min(),
+                max: s.max(),
                 scale: LogScale::name().to_string(),
                 choices: None,
             },
             Self::RealLog10(s) => ParamInfo {
                 param_type: "real".into(),
-                min: s.min,
-                max: s.max,
+                min: s.min(),
+                max: s.max(),
                 scale: Log10Scale::name().to_string(),
                 choices: None,
             },
             Self::Integer(s) => ParamInfo {
                 param_type: "integer".into(),
-                min: s.min as f64,
-                max: s.max as f64,
+                min: s.min() as f64,
+                max: s.max() as f64,
                 scale: "linear".into(),
                 choices: None,
             },
@@ -218,7 +270,7 @@ impl DynDimension {
                 min: 0.0,
                 max: (s.cardinality() - 1) as f64,
                 scale: "linear".into(),
-                choices: Some(s.choices.clone()),
+                choices: Some(s.choices().to_vec()),
             },
         }
     }
@@ -228,7 +280,7 @@ impl DynDimension {
 // DynSpace: named parameter space built from DynDimension variants
 // =============================================================================
 
-/// A flat, named parameter space built from [`DynDimension`] variants.
+/// A flat, named parameter space built from `DynDimension` variants.
 ///
 /// Candidates are serialized as JSON objects (e.g., `{"lr": 0.01, "batch": 32}`).
 /// Internally, each named dimension is stored behind an `Arc`, so cloning a
@@ -326,9 +378,11 @@ impl SampleSpace for DynSpace {
             Some(o) => o,
             None => return false,
         };
-        self.dims
-            .iter()
-            .all(|(name, dim)| obj.get(name).is_some_and(|v| dim.contains(v)))
+        obj.len() == self.dims.len()
+            && self
+                .dims
+                .iter()
+                .all(|(name, dim)| obj.get(name).is_some_and(|v| dim.contains(v)))
     }
 
     fn clamp(&self, point: &serde_json::Value) -> serde_json::Value {
@@ -468,7 +522,8 @@ impl AutoStrategy {
         };
         Self {
             sobol: SobolStrategy::new(sobol_seed),
-            gmm: GmmStrategy::uniform_prior(gmm_seed, dim, 0.1),
+            gmm: GmmStrategy::uniform_prior(gmm_seed, dim, 0.1)
+                .expect("AutoStrategy dimensions and prior variance are validated"),
             exploration_budget,
             trial_count: 0,
             issued_count: AtomicUsize::new(0),
@@ -522,12 +577,18 @@ impl<'de> Deserialize<'de> for AutoStrategy {
 
         let state = AutoStrategySerde::deserialize(deserializer)?;
         let issued_count = state.issued_count.unwrap_or(state.trial_count);
+        if issued_count < state.trial_count {
+            return Err(serde::de::Error::custom(format!(
+                "auto strategy issued_count {issued_count} is smaller than trial_count {}",
+                state.trial_count
+            )));
+        }
         Ok(Self {
             sobol: state.sobol,
             gmm: state.gmm,
             exploration_budget: state.exploration_budget,
             trial_count: state.trial_count,
-            issued_count: AtomicUsize::new(issued_count.max(state.trial_count)),
+            issued_count: AtomicUsize::new(issued_count),
         })
     }
 }
@@ -548,7 +609,9 @@ impl Strategy for DynStrategy {
             DynStrategyInner::Gmm(s) => s.suggest(space),
             DynStrategyInner::Auto(s) => {
                 let issued = s.issued_count.fetch_add(1, Ordering::Relaxed);
-                if issued < s.exploration_budget {
+                let periodic_exploration = issued >= s.exploration_budget
+                    && (issued - s.exploration_budget + 1).is_multiple_of(AUTO_EXPLORATION_PERIOD);
+                if issued < s.exploration_budget || periodic_exploration {
                     s.sobol.suggest(space)
                 } else {
                     s.gmm.suggest(space)
@@ -583,6 +646,226 @@ impl DynStrategy {
             _ => None,
         }
     }
+
+    fn validate_for_study(
+        &self,
+        config: &StrategyConfig,
+        space: &DynSpace,
+        completed_count: usize,
+        minimum_issued_count: usize,
+    ) -> Result<(), String> {
+        let expected_kind = match config.strategy_type.as_str() {
+            "random" => "random",
+            "sobol" => "sobol",
+            "gmm" | "auto" => "auto",
+            other => return Err(format!("unsupported checkpoint strategy kind '{other}'")),
+        };
+        let actual_kind = match &self.inner {
+            DynStrategyInner::Random(_) => "random",
+            DynStrategyInner::Sobol(_) => "sobol",
+            DynStrategyInner::Gmm(_) => "gmm",
+            DynStrategyInner::Auto(_) => "auto",
+        };
+        if actual_kind != expected_kind {
+            return Err(format!(
+                "checkpoint strategy state is '{actual_kind}' but study configuration requires '{expected_kind}'"
+            ));
+        }
+
+        let expected_dim = space.dimensionality();
+        let minimum_issued_u64 =
+            u64::try_from(minimum_issued_count).map_err(|_| "issued count exceeds u64")?;
+        match &self.inner {
+            DynStrategyInner::Gmm(strategy) => {
+                let params = strategy
+                    .params()
+                    .map_err(|error| format!("invalid checkpoint GMM state: {error}"))?;
+                if params.dim() != expected_dim {
+                    return Err(format!(
+                        "checkpoint GMM dimension {} does not match search-space dimension {expected_dim}",
+                        params.dim()
+                    ));
+                }
+                if let Some(seed) = config.seed {
+                    if strategy.seed() != seed {
+                        return Err(format!(
+                            "checkpoint GMM seed {} does not match configured seed {seed}",
+                            strategy.seed()
+                        ));
+                    }
+                }
+                if strategy.counter() < minimum_issued_u64 || strategy.counter() == u64::MAX {
+                    return Err(format!(
+                        "checkpoint GMM cursor {} is smaller than minimum issued count {minimum_issued_count}",
+                        strategy.counter()
+                    ));
+                }
+            }
+            DynStrategyInner::Auto(strategy) => {
+                let params = strategy
+                    .gmm
+                    .params()
+                    .map_err(|error| format!("invalid checkpoint GMM state: {error}"))?;
+                if params.dim() != expected_dim {
+                    return Err(format!(
+                        "checkpoint GMM dimension {} does not match search-space dimension {expected_dim}",
+                        params.dim()
+                    ));
+                }
+                if strategy.trial_count != completed_count {
+                    return Err(format!(
+                        "checkpoint strategy trial_count {} does not match completed count {completed_count}",
+                        strategy.trial_count
+                    ));
+                }
+                let issued_count = strategy.issued_count.load(Ordering::Relaxed);
+                if issued_count < minimum_issued_count || issued_count == usize::MAX {
+                    return Err(format!(
+                        "checkpoint auto issued_count {issued_count} is outside the valid range {minimum_issued_count}..{}",
+                        usize::MAX - 1
+                    ));
+                }
+                if let Some(seed) = config.seed {
+                    let expected_sobol_seed = (seed ^ (seed >> 32)) as u32;
+                    if strategy.gmm.seed() != seed || strategy.sobol.seed() != expected_sobol_seed {
+                        return Err(format!(
+                            "checkpoint auto strategy seeds do not match configured seed {seed}"
+                        ));
+                    }
+                }
+                let initial_sobol = issued_count.min(strategy.exploration_budget);
+                let post_exploration = issued_count.saturating_sub(strategy.exploration_budget);
+                let periodic_sobol = post_exploration / AUTO_EXPLORATION_PERIOD;
+                let expected_sobol = initial_sobol.saturating_add(periodic_sobol);
+                let expected_gmm = issued_count.saturating_sub(expected_sobol);
+                let expected_sobol_u32 = u32::try_from(expected_sobol).map_err(|_| {
+                    "checkpoint auto Sobol cursor exceeds the supported u32 range".to_string()
+                })?;
+                if strategy.sobol.index() < expected_sobol_u32 || strategy.sobol.index() == u32::MAX
+                {
+                    return Err(format!(
+                        "checkpoint auto Sobol cursor {} is smaller than expected {expected_sobol}",
+                        strategy.sobol.index()
+                    ));
+                }
+                let expected_gmm_u64 = u64::try_from(expected_gmm).unwrap_or(u64::MAX);
+                if strategy.gmm.counter() < expected_gmm_u64 || strategy.gmm.counter() == u64::MAX {
+                    return Err(format!(
+                        "checkpoint auto GMM cursor {} is smaller than expected {expected_gmm}",
+                        strategy.gmm.counter()
+                    ));
+                }
+                if let Some(expected_budget) = config.exploration_budget {
+                    if strategy.exploration_budget != expected_budget {
+                        return Err(format!(
+                            "checkpoint exploration budget {} does not match configured budget {expected_budget}",
+                            strategy.exploration_budget
+                        ));
+                    }
+                }
+            }
+            DynStrategyInner::Random(strategy) => {
+                if let Some(seed) = config.seed {
+                    if strategy.seed() != seed {
+                        return Err(format!(
+                            "checkpoint random seed {} does not match configured seed {seed}",
+                            strategy.seed()
+                        ));
+                    }
+                }
+                if strategy.counter() < minimum_issued_u64 || strategy.counter() == u64::MAX {
+                    return Err(format!(
+                        "checkpoint random cursor {} is smaller than minimum issued count {minimum_issued_count}",
+                        strategy.counter()
+                    ));
+                }
+            }
+            DynStrategyInner::Sobol(strategy) => {
+                if let Some(seed) = config.seed {
+                    let expected_seed = (seed ^ (seed >> 32)) as u32;
+                    if strategy.seed() != expected_seed {
+                        return Err(format!(
+                            "checkpoint Sobol seed {} does not match configured folded seed {expected_seed}",
+                            strategy.seed()
+                        ));
+                    }
+                }
+                let minimum_index = u32::try_from(minimum_issued_count).map_err(|_| {
+                    "checkpoint Sobol issued count exceeds the supported u32 range".to_string()
+                })?;
+                if strategy.index() < minimum_index || strategy.index() == u32::MAX {
+                    return Err(format!(
+                        "checkpoint Sobol cursor {} is outside the valid range {minimum_index}..{}",
+                        strategy.index(),
+                        u32::MAX - 1
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn resolved_seed(&self) -> u64 {
+        match &self.inner {
+            DynStrategyInner::Random(strategy) => strategy.seed(),
+            DynStrategyInner::Sobol(strategy) => u64::from(strategy.seed()),
+            DynStrategyInner::Gmm(strategy) => strategy.seed(),
+            DynStrategyInner::Auto(strategy) => strategy.gmm.seed(),
+        }
+    }
+
+    fn try_refit(
+        &mut self,
+        space: &DynSpace,
+        trials: &[(serde_json::Value, f64)],
+    ) -> Result<(), String> {
+        match &mut self.inner {
+            DynStrategyInner::Gmm(strategy) => strategy
+                .try_refit(space, trials)
+                .map_err(|error| error.to_string()),
+            DynStrategyInner::Auto(strategy) => strategy
+                .gmm
+                .try_refit(space, trials)
+                .map_err(|error| error.to_string()),
+            DynStrategyInner::Random(_) | DynStrategyInner::Sobol(_) => Ok(()),
+        }
+    }
+
+    fn reconcile_imported_history(
+        &mut self,
+        space: &DynSpace,
+        completed_count: usize,
+        trials: &[(serde_json::Value, f64)],
+    ) -> Result<(), String> {
+        // Trial IDs can come from a deliberately sparse, high restart epoch and
+        // are not sampler cursors. A leaderboard-only checkpoint has no pending
+        // jobs, so the monotonic completion count is the faithful cursor.
+        let sample_count = u64::try_from(completed_count).unwrap_or(u64::MAX);
+        let sobol_index = u32::try_from(completed_count).unwrap_or(u32::MAX);
+        match &mut self.inner {
+            DynStrategyInner::Random(strategy) => strategy.advance_to(sample_count),
+            DynStrategyInner::Sobol(strategy) => strategy.advance_to(sobol_index),
+            DynStrategyInner::Gmm(strategy) => {
+                strategy.advance_to(sample_count);
+                strategy
+                    .try_refit(space, trials)
+                    .map_err(|error| error.to_string())?;
+            }
+            DynStrategyInner::Auto(strategy) => {
+                strategy.sobol.advance_to(sobol_index);
+                strategy.gmm.advance_to(sample_count);
+                strategy.trial_count = completed_count;
+                strategy
+                    .issued_count
+                    .fetch_max(completed_count, Ordering::Relaxed);
+                strategy
+                    .gmm
+                    .try_refit(space, trials)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl opt_engine::traits::RefittableStrategy for DynStrategy {
@@ -600,6 +883,7 @@ impl opt_engine::traits::RefittableStrategy for DynStrategy {
                 // refit rebuilt only the GMM model; everything else is live
                 // sampling state that advanced while the refit ran off-lock.
                 s.sobol = l.sobol.clone();
+                opt_engine::traits::RefittableStrategy::reconcile_after_refit(&mut s.gmm, &l.gmm);
                 s.trial_count = l.trial_count;
                 s.issued_count
                     .store(l.issued_count.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -619,7 +903,7 @@ impl opt_engine::traits::RefittableStrategy for DynStrategy {
 // =============================================================================
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ParamConfig {
     Real {
         min: f64,
@@ -640,7 +924,8 @@ fn default_scale() -> String {
     "linear".to_string()
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectiveConfig {
     pub field: String,
     #[serde(alias = "type")]
@@ -664,6 +949,7 @@ fn default_priority() -> f64 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StrategyConfig {
     #[serde(alias = "type")]
     pub strategy_type: String,
@@ -690,6 +976,7 @@ fn default_refit_interval() -> usize {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StudyConfig {
     pub space: BTreeMap<String, ParamConfig>,
     pub objectives: Vec<ObjectiveConfig>,
@@ -713,6 +1000,7 @@ pub struct StudyConfig {
 
 /// Configuration for automatic checkpointing.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointConfig {
     /// Directory to save checkpoints.
     pub directory: String,
@@ -737,10 +1025,13 @@ fn validate_study_config(config: &StudyConfig) -> Result<(), String> {
     if let Some(strategy) = &config.strategy {
         validate_strategy_config(strategy)?;
     }
-    if let Some(checkpoint) = &config.checkpoint
-        && checkpoint.interval == 0
-    {
-        return Err("checkpoint.interval must be at least 1".to_string());
+    if let Some(checkpoint) = &config.checkpoint {
+        if checkpoint.interval == 0 {
+            return Err("checkpoint.interval must be at least 1".to_string());
+        }
+        if checkpoint.max_checkpoints == Some(0) {
+            return Err("checkpoint.max_checkpoints must be at least 1 when set".to_string());
+        }
     }
     if config.max_leaderboard_size == Some(0) {
         return Err("max_leaderboard_size must be at least 1".to_string());
@@ -759,57 +1050,27 @@ fn validate_space_config(space: &BTreeMap<String, ParamConfig>) -> Result<(), St
         }
         match param {
             ParamConfig::Real { min, max, scale } => {
-                if !min.is_finite() || !max.is_finite() {
-                    return Err(format!(
-                        "Parameter '{name}': real bounds must be finite, got min={min}, max={max}",
-                    ));
-                }
-                if min >= max {
-                    return Err(format!(
-                        "Parameter '{name}': min must be less than max, got min={min}, max={max}",
-                    ));
-                }
-                match scale.as_str() {
-                    "linear" => {
-                        // The linear internal span is (max - min). If that
-                        // subtraction overflows to a non-finite value the space
-                        // would silently collapse every point to a fixed value
-                        // (the to_unit_cube/from_unit_cube degenerate guards), so
-                        // reject it here. Log/ln/log10 spans are ln(max)-ln(min),
-                        // which stay finite for any finite positive min < max.
-                        if !(max - min).is_finite() {
-                            return Err(format!(
-                                "Parameter '{name}': range too large; max - min overflows to a non-finite value",
-                            ));
-                        }
+                let validation = match scale.as_str() {
+                    "linear" => ContinuousSpace::try_new(*min, *max).map(|_| ()),
+                    "log" | "ln" => {
+                        ContinuousSpace::try_with_scale(*min, *max, LogScale).map(|_| ())
                     }
-                    "log" | "ln" | "log10" => {
-                        if *min <= 0.0 || *max <= 0.0 {
-                            return Err(format!(
-                                "Parameter '{name}': {scale} scale requires min > 0 and max > 0, got min={min}, max={max}",
-                            ));
-                        }
-                    }
+                    "log10" => ContinuousSpace::try_with_scale(*min, *max, Log10Scale).map(|_| ()),
                     other => {
                         return Err(format!(
                             "Parameter '{name}': unknown real scale '{other}'. Expected one of: linear, log, ln, log10",
                         ));
                     }
-                }
+                };
+                validation.map_err(|error| format!("Parameter '{name}': {error}"))?;
             }
             ParamConfig::Integer { min, max } => {
-                if min > max {
-                    return Err(format!(
-                        "Parameter '{name}': integer min must be <= max, got min={min}, max={max}",
-                    ));
-                }
+                DiscreteSpace::try_new(*min, *max)
+                    .map_err(|error| format!("Parameter '{name}': {error}"))?;
             }
             ParamConfig::Categorical { choices } => {
-                if choices.is_empty() {
-                    return Err(format!(
-                        "Parameter '{name}': categorical choices must not be empty",
-                    ));
-                }
+                CategoricalSpace::try_new(choices.clone())
+                    .map_err(|error| format!("Parameter '{name}': {error}"))?;
             }
         }
     }
@@ -824,9 +1085,16 @@ fn validate_objectives(objectives: &[ObjectiveConfig]) -> Result<(), String> {
             .to_string());
     }
 
+    let mut fields = HashSet::with_capacity(objectives.len());
     for obj in objectives {
         if obj.field.trim().is_empty() {
             return Err("Objective field names must not be empty".to_string());
+        }
+        if !fields.insert(obj.field.as_str()) {
+            return Err(format!(
+                "Objective field '{}' is configured more than once",
+                obj.field
+            ));
         }
         match obj.obj_type.as_str() {
             "minimize" | "maximize" => {}
@@ -843,20 +1111,27 @@ fn validate_objectives(objectives: &[ObjectiveConfig]) -> Result<(), String> {
                 obj.field, obj.priority
             ));
         }
-        if let Some(target) = obj.target
-            && !target.is_finite()
-        {
-            return Err(format!(
-                "Objective '{}': target must be finite, got {}",
-                obj.field, target
-            ));
+        if let Some(target) = obj.target {
+            if !target.is_finite() {
+                return Err(format!(
+                    "Objective '{}': target must be finite, got {}",
+                    obj.field, target
+                ));
+            }
         }
-        if let Some(limit) = obj.limit
-            && !limit.is_finite()
-        {
+        if let Some(limit) = obj.limit {
+            if !limit.is_finite() {
+                return Err(format!(
+                    "Objective '{}': limit must be finite, got {}",
+                    obj.field, limit
+                ));
+            }
+        }
+
+        if obj.target.is_some() != obj.limit.is_some() {
             return Err(format!(
-                "Objective '{}': limit must be finite, got {}",
-                obj.field, limit
+                "Objective '{}': target and limit must either both be set or both be omitted",
+                obj.field
             ));
         }
 
@@ -904,12 +1179,12 @@ fn validate_strategy_config(strategy: &StrategyConfig) -> Result<(), String> {
     if strategy.refit_interval == 0 {
         return Err("strategy.refit_interval must be at least 1".to_string());
     }
-    if let Some(elite_fraction) = strategy.elite_fraction
-        && (!elite_fraction.is_finite() || elite_fraction <= 0.0 || elite_fraction > 1.0)
-    {
-        return Err(format!(
-            "strategy.elite_fraction must be finite and in (0, 1], got {elite_fraction}",
-        ));
+    if let Some(elite_fraction) = strategy.elite_fraction {
+        if !elite_fraction.is_finite() || elite_fraction <= 0.0 || elite_fraction > 1.0 {
+            return Err(format!(
+                "strategy.elite_fraction must be finite and in (0, 1], got {elite_fraction}",
+            ));
+        }
     }
 
     Ok(())
@@ -920,7 +1195,7 @@ fn validate_strategy_config(strategy: &StrategyConfig) -> Result<(), String> {
 // =============================================================================
 
 /// A trial returned by `ask()`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DynTrial {
     pub trial_id: u64,
     pub params: serde_json::Value,
@@ -954,6 +1229,18 @@ pub struct CompletedTrial {
     pub pareto_front: usize,
     /// When `tell()` was called (unix seconds).
     pub completed_at: u64,
+}
+
+/// Result metadata for callers that must distinguish a newly committed tell
+/// from an idempotent replay of an earlier success.
+#[derive(Clone, Debug)]
+pub struct TellOutcome {
+    pub completed: CompletedTrial,
+    pub trial_count: usize,
+    pub newly_committed: bool,
+    /// Failures in post-commit maintenance. The trial is durable even when this
+    /// is non-empty, so callers must not retry it as an ingestion failure.
+    pub post_commit_warnings: Vec<String>,
 }
 
 /// Kind of checkpoint loaded by [`HolaEngine::load_checkpoint_with_fallback`].
@@ -1053,6 +1340,106 @@ impl DynLeaderboard {
         }
     }
 
+    fn raw_metrics(&self, trial_id: u64) -> Option<&serde_json::Value> {
+        match self {
+            DynLeaderboard::Scalar(lb) => lb.get(trial_id)?.raw_metrics.as_ref(),
+            DynLeaderboard::Vector(lb) => lb.get(trial_id)?.raw_metrics.as_ref(),
+        }
+    }
+
+    fn candidate_and_timestamp(&self, trial_id: u64) -> Option<(&serde_json::Value, u64)> {
+        match self {
+            DynLeaderboard::Scalar(lb) => {
+                let trial = lb.get(trial_id)?;
+                Some((&trial.candidate, trial.timestamp))
+            }
+            DynLeaderboard::Vector(lb) => {
+                let trial = lb.get(trial_id)?;
+                Some((&trial.candidate, trial.timestamp))
+            }
+        }
+    }
+
+    /// Validate completed state before a parsed checkpoint can replace live
+    /// state. Serde checks the leaderboard's structural counters; this layer
+    /// checks the study-specific candidate and observation contracts that the
+    /// generic leaderboard cannot know about.
+    fn validate_for_study(
+        &self,
+        space: &DynSpace,
+        objectives: &[ObjectiveConfig],
+    ) -> Result<(), String> {
+        // IEEE-754 permits multiple NaN payload/sign encodings. Persistence
+        // canonicalizes NaN, so invariant validation compares all NaNs as the
+        // same semantic invalid observation while retaining bit equality for
+        // every finite value and infinity sign.
+        let same_float = |left: f64, right: f64| {
+            (left.is_nan() && right.is_nan()) || left.to_bits() == right.to_bits()
+        };
+        match self {
+            DynLeaderboard::Scalar(leaderboard) => {
+                for trial in leaderboard.iter() {
+                    if !space.contains(&trial.candidate) {
+                        return Err(format!(
+                            "completed trial {} has a candidate outside the configured space",
+                            trial.trial_id
+                        ));
+                    }
+                    if let Some(raw) = &trial.raw_metrics {
+                        let expected = scalarize_raw(raw, objectives);
+                        if !same_float(trial.observation, expected) {
+                            return Err(format!(
+                                "completed trial {} observation conflicts with its raw metrics",
+                                trial.trial_id
+                            ));
+                        }
+                    }
+                }
+            }
+            DynLeaderboard::Vector(leaderboard) => {
+                let expected_keys: Vec<String> =
+                    vectorize_raw(&serde_json::Value::Null, objectives)
+                        .into_keys()
+                        .collect();
+                for trial in leaderboard.iter() {
+                    if !space.contains(&trial.candidate) {
+                        return Err(format!(
+                            "completed trial {} has a candidate outside the configured space",
+                            trial.trial_id
+                        ));
+                    }
+                    if trial.observation.len() != expected_keys.len()
+                        || !expected_keys
+                            .iter()
+                            .all(|key| trial.observation.contains_key(key))
+                    {
+                        return Err(format!(
+                            "completed trial {} observation has the wrong objective-group schema",
+                            trial.trial_id
+                        ));
+                    }
+                    if let Some(raw) = &trial.raw_metrics {
+                        let expected = vectorize_raw(raw, objectives);
+                        let matches = expected.len() == trial.observation.len()
+                            && expected.iter().all(|(key, expected_value)| {
+                                trial
+                                    .observation
+                                    .get(key)
+                                    .is_some_and(|actual| same_float(*actual, *expected_value))
+                            });
+                        if !matches {
+                            return Err(format!(
+                                "completed trial {} observation conflicts with its raw metrics",
+                                trial.trial_id
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn next_trial_id(&self) -> u64 {
         match self {
             DynLeaderboard::Scalar(lb) => lb.next_trial_id(),
@@ -1070,6 +1457,16 @@ impl DynLeaderboard {
             DynLeaderboard::Scalar(lb) => lb.total_completed(),
             DynLeaderboard::Vector(lb) => lb.total_completed(),
         }
+    }
+
+    /// Monotonic completion count in the engine's native count type.
+    ///
+    /// Cadence decisions must use this rather than [`Self::len`]: a bounded
+    /// leaderboard's retained length stops growing at its cap, while refits,
+    /// checkpoints, and study budgets must continue advancing with every
+    /// committed result.
+    fn completed_count(&self) -> usize {
+        usize::try_from(self.total_completed()).unwrap_or(usize::MAX)
     }
 
     fn normalize_next_trial_id(&mut self) -> u64 {
@@ -1094,12 +1491,14 @@ impl DynLeaderboard {
     ) -> Vec<(serde_json::Value, f64)> {
         match self {
             DynLeaderboard::Scalar(lb) => lb
-                .top_k(k)
+                .top_k_recent(k, MAX_REFIT_CANDIDATES)
                 .into_iter()
                 .map(|t| (t.candidate, t.observation))
                 .collect(),
             DynLeaderboard::Vector(lb) => lb
-                .top_k_scalarized(k, |obs| scalarize_observation(obs, objectives))
+                .top_k_scalarized_recent(k, MAX_REFIT_CANDIDATES, |obs| {
+                    scalarize_observation(obs, objectives)
+                })
                 .into_iter()
                 .map(|t| {
                     (
@@ -1198,21 +1597,12 @@ impl DynLeaderboard {
                     return None;
                 }
 
-                let rank = lb
-                    .iter()
-                    .filter(|other| {
-                        include_infeasible
-                            || Leaderboard::<serde_json::Value, f64>::trial_is_feasible(other)
-                    })
-                    .filter(|other| {
-                        other
-                            .observation
-                            .partial_cmp(&trial.observation)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| other.trial_id.cmp(&trial.trial_id))
-                            == std::cmp::Ordering::Less
-                    })
-                    .count();
+                // Delegate to the leaderboard's canonical total-order policy.
+                // In particular, finite values sort before infinities and NaN
+                // sorts last. Reimplementing this with `partial_cmp` makes NaN
+                // compare equal to every value and can therefore disagree with
+                // `completed_trials()` for a lossless non-finite checkpoint.
+                let rank = lb.rank_of(trial_id, include_infeasible)?;
 
                 Some(build_completed_scalar(trial, rank, objectives))
             }
@@ -1223,16 +1613,15 @@ impl DynLeaderboard {
         }
     }
 
-    /// Build the just-told trial's view cheaply, keeping any expensive global
-    /// ranking out from under the caller's write lock.
+    /// Build the just-told trial's view and the owned inputs needed to finish
+    /// vector ranking without borrowing the leaderboard.
     ///
     /// The scalar path computes its O(n) `rank_of` directly and returns a fully
     /// populated `CompletedTrial`. The vector path fills `pareto_front` via the
     /// front-peeling `pareto_rank_of` (no trial clones) and returns a cheap
     /// `(trial_id, observation)` snapshot of the participating trials plus the
-    /// target id, so the caller can finish the NSGA-II global rank off-lock with
-    /// [`vector_global_rank`] instead of running the full ranking (and cloning
-    /// every trial) while the write lock is held.
+    /// target id. The caller finalizes the response before exposing the
+    /// idempotency receipt, without cloning every candidate or raw-metrics DTO.
     #[allow(clippy::type_complexity)]
     fn completed_for_tell(
         &self,
@@ -1250,8 +1639,6 @@ impl DynLeaderboard {
             }
             DynLeaderboard::Vector(lb) => {
                 let trial = lb.get(trial_id)?.clone();
-                let pareto_front = lb.pareto_rank_of(trial_id, include_infeasible)?;
-                let completed = build_completed_vector(trial, pareto_front, objectives);
                 let snapshot: Vec<(u64, BTreeMap<String, f64>)> = lb
                     .iter()
                     .filter(|t| {
@@ -1262,6 +1649,11 @@ impl DynLeaderboard {
                     })
                     .map(|t| (t.trial_id, t.observation.clone()))
                     .collect();
+                if !snapshot.iter().any(|(id, _)| *id == trial_id) {
+                    return None;
+                }
+                // Ranking is filled from `snapshot` by vector_rank.
+                let completed = build_completed_vector(trial, 0, objectives);
                 Some((completed, Some((snapshot, trial_id))))
             }
         }
@@ -1291,12 +1683,16 @@ impl DynLeaderboard {
                 results
             }
             DynLeaderboard::Vector(lb) => {
-                // Use NSGA-II ranking for vector studies
-                let ranked = if include_infeasible {
-                    lb.ranked_trials_all()
-                } else {
-                    lb.ranked_trials()
-                };
+                // Rank only feasible trials into Pareto fronts. Infeasible
+                // observations are still returned when requested, but they are
+                // placed after every feasible front and can never masquerade as
+                // Pareto-front zero when all observations violate a constraint.
+                let ranked = lb.ranked_trials();
+                let infeasible_front = ranked
+                    .iter()
+                    .map(|ranked_trial| ranked_trial.rank)
+                    .max()
+                    .unwrap_or(1);
                 let mut results: Vec<CompletedTrial> = ranked
                     .into_iter()
                     .map(|rt| {
@@ -1304,6 +1700,21 @@ impl DynLeaderboard {
                         build_completed_vector(rt.trial, pareto_front, objectives)
                     })
                     .collect();
+                if include_infeasible {
+                    results.extend(
+                        lb.iter()
+                            .filter(|trial| {
+                                !Leaderboard::<
+                                    serde_json::Value,
+                                    BTreeMap<String, f64>,
+                                >::trial_is_feasible(trial)
+                            })
+                            .cloned()
+                            .map(|trial| {
+                                build_completed_vector(trial, infeasible_front, objectives)
+                            }),
+                    );
+                }
                 // Assign overall rank based on NSGA-II ordering (already sorted by crowded_compare)
                 for (i, ct) in results.iter_mut().enumerate() {
                     ct.rank = i;
@@ -1353,6 +1764,7 @@ fn build_completed_scalar(
     rank: usize,
     objectives: &[ObjectiveConfig],
 ) -> CompletedTrial {
+    let feasible = t.observation.is_finite();
     let metrics = t.raw_metrics.clone().unwrap_or(serde_json::Value::Null);
     let scores = compute_scores(&metrics, objectives);
     let score_vector = compute_score_vector(&metrics, objectives);
@@ -1363,7 +1775,9 @@ fn build_completed_scalar(
         scores,
         score_vector,
         rank,
-        pareto_front: rank, // scalar: pareto_front == rank
+        // Pareto fronts do not apply to scalar studies, but the dashboard uses
+        // this field defensively. Reserve zero for a feasible best trial.
+        pareto_front: if feasible { rank } else { rank.max(1) },
         completed_at: t.timestamp,
     }
 }
@@ -1374,6 +1788,7 @@ fn build_completed_vector(
     pareto_front: usize,
     objectives: &[ObjectiveConfig],
 ) -> CompletedTrial {
+    let feasible = is_feasible_multi(&t.observation);
     let metrics = t.raw_metrics.clone().unwrap_or(serde_json::Value::Null);
     let scores = compute_scores(&metrics, objectives);
     let score_vector = f64_map_to_json(&t.observation);
@@ -1384,7 +1799,11 @@ fn build_completed_vector(
         scores,
         score_vector,
         rank: 0, // assigned later by caller
-        pareto_front,
+        pareto_front: if feasible {
+            pareto_front
+        } else {
+            pareto_front.max(1)
+        },
         completed_at: t.timestamp,
     }
 }
@@ -1411,19 +1830,88 @@ fn observation_dominates(a: &BTreeMap<String, f64>, b: &BTreeMap<String, f64>) -
     dominated_some
 }
 
-/// Compute a single trial's 0-indexed NSGA-II global rank from a cheap snapshot
-/// of `(trial_id, observation)` pairs, without cloning trials or building the
-/// full ranked view.
-///
-/// `participants` must already be filtered to the same set the leaderboard's
-/// ranked view would use (feasible-only or all). The returned rank reproduces
-/// the ordering of `Leaderboard::ranked_trials`/`ranked_trials_all`: fronts are
-/// concatenated in non-domination order and, because that view selects whole
-/// fronts when ranking every trial, members keep their snapshot (iteration)
-/// order within a front. The global rank is therefore the number of trials in
-/// earlier fronts plus the target's position within its own front. Returns
-/// `None` if the target is not present in `participants`.
-fn vector_global_rank(participants: &[(u64, BTreeMap<String, f64>)], target: u64) -> Option<usize> {
+/// Compute every front rank in O(N log N) when a snapshot has exactly two
+/// consistent, finite objectives. A Fenwick tree stores the best chain depth
+/// among compressed y coordinates while points are swept by x. Exact duplicate
+/// points are queried as a group before updating so they do not dominate one
+/// another.
+fn two_objective_front_ranks(participants: &[(u64, BTreeMap<String, f64>)]) -> Option<Vec<usize>> {
+    let first = participants.first()?;
+    let keys: Vec<&String> = first.1.keys().collect();
+    if keys.len() != 2 {
+        return None;
+    }
+    let (x_key, y_key) = (keys[0], keys[1]);
+    let normalize_zero = |value: f64| if value == 0.0 { 0.0 } else { value };
+    let mut points = Vec::with_capacity(participants.len());
+    for (index, (_, observation)) in participants.iter().enumerate() {
+        if observation.len() != 2 {
+            return None;
+        }
+        let x = normalize_zero(*observation.get(x_key)?);
+        let y = normalize_zero(*observation.get(y_key)?);
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        points.push((index, x, y));
+    }
+    points.sort_by(|a, b| {
+        a.1.total_cmp(&b.1)
+            .then_with(|| a.2.total_cmp(&b.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut y_values: Vec<f64> = points.iter().map(|point| point.2).collect();
+    y_values.sort_by(f64::total_cmp);
+    y_values.dedup_by(|a, b| *a == *b);
+
+    let mut tree = vec![0usize; y_values.len() + 1];
+    let query = |tree: &[usize], mut index: usize| {
+        let mut best = 0;
+        while index > 0 {
+            best = best.max(tree[index]);
+            index &= index - 1;
+        }
+        best
+    };
+    let update = |tree: &mut [usize], mut index: usize, value: usize| {
+        while index < tree.len() {
+            tree[index] = tree[index].max(value);
+            index += index & index.wrapping_neg();
+        }
+    };
+
+    let mut fronts = vec![0usize; participants.len()];
+    let mut start = 0;
+    while start < points.len() {
+        let mut end = start + 1;
+        while end < points.len()
+            && points[end].1 == points[start].1
+            && points[end].2 == points[start].2
+        {
+            end += 1;
+        }
+        let y_index = y_values
+            .binary_search_by(|value| value.total_cmp(&points[start].2))
+            .expect("compressed coordinate came from the same finite values")
+            + 1;
+        let front = query(&tree, y_index);
+        for point in &points[start..end] {
+            fronts[point.0] = front;
+        }
+        update(&mut tree, y_index, front + 1);
+        start = end;
+    }
+    Some(fronts)
+}
+
+/// Compute every trial's 0-indexed Pareto front from a cheap observation
+/// snapshot, preserving iteration order within each front.
+fn vector_front_ranks(participants: &[(u64, BTreeMap<String, f64>)]) -> Vec<usize> {
+    if let Some(fronts) = two_objective_front_ranks(participants) {
+        return fronts;
+    }
+
     let n = participants.len();
     let mut domination_count = vec![0usize; n];
     let mut dominated_by: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -1441,12 +1929,12 @@ fn vector_global_rank(participants: &[(u64, BTreeMap<String, f64>)], target: u64
     }
 
     let mut current: Vec<usize> = (0..n).filter(|&i| domination_count[i] == 0).collect();
-    let mut rank_base = 0usize;
+    let mut fronts = vec![0usize; n];
+    let mut front = 0usize;
     while !current.is_empty() {
-        if let Some(pos) = current.iter().position(|&i| participants[i].0 == target) {
-            return Some(rank_base + pos);
+        for &index in &current {
+            fronts[index] = front;
         }
-        rank_base += current.len();
         let mut next = Vec::new();
         for &i in &current {
             for &j in &dominated_by[i] {
@@ -1457,24 +1945,123 @@ fn vector_global_rank(participants: &[(u64, BTreeMap<String, f64>)], target: u64
             }
         }
         current = next;
+        front += 1;
     }
-    None
+    fronts
 }
 
-/// Convert a `BTreeMap<String, f64>` to a JSON object, representing infinity as `"inf"`.
+/// Compute a single trial's 0-indexed NSGA-II global rank and front from a cheap
+/// snapshot.
+fn vector_rank(
+    participants: &[(u64, BTreeMap<String, f64>)],
+    target: u64,
+) -> Option<(usize, usize)> {
+    let target_index = participants.iter().position(|(id, _)| *id == target)?;
+    let fronts = vector_front_ranks(participants);
+    let target_front = fronts[target_index];
+    let rank_base = fronts.iter().filter(|&&front| front < target_front).count();
+    let front_trials: Vec<Trial<u64, BTreeMap<String, f64>>> = participants
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| fronts[*index] == target_front)
+        .map(|(index, (trial_id, observation))| Trial {
+            candidate: *trial_id,
+            observation: observation.clone(),
+            raw_metrics: None,
+            trial_id: *trial_id,
+            timestamp: index as u64,
+        })
+        .collect();
+    let mut crowded = Leaderboard::<u64, BTreeMap<String, f64>>::crowding_distance(&front_trials);
+    // Stable sorting preserves snapshot order for equal crowding distances,
+    // matching Leaderboard::select_nsga2's canonical full-front ordering.
+    crowded.sort_by(|left, right| right.1.total_cmp(&left.1));
+    let position = crowded
+        .iter()
+        .position(|(trial, _)| trial.trial_id == target)?;
+    Some((rank_base + position, target_front))
+}
+
+/// Dashboard/API ranking keeps infeasible observations after every feasible
+/// front. This differs deliberately from the generic leaderboard's `*_all`
+/// ranking, where an all-infinite population is mutually non-dominating and
+/// would therefore be labelled front zero.
+fn vector_dashboard_rank(
+    participants: &[(u64, BTreeMap<String, f64>)],
+    target: u64,
+) -> Option<(usize, usize)> {
+    let target_index = participants.iter().position(|(id, _)| *id == target)?;
+    let feasible: Vec<(u64, BTreeMap<String, f64>)> = participants
+        .iter()
+        .filter(|(_, observation)| is_feasible_multi(observation))
+        .cloned()
+        .collect();
+    if is_feasible_multi(&participants[target_index].1) {
+        return vector_rank(&feasible, target);
+    }
+
+    let next_front = vector_front_ranks(&feasible)
+        .into_iter()
+        .max()
+        .map_or(1, |front| front + 1);
+    let position = participants[..target_index]
+        .iter()
+        .filter(|(_, observation)| !is_feasible_multi(observation))
+        .count();
+    Some((feasible.len() + position, next_front))
+}
+
+/// Compute a single trial's 0-indexed NSGA-II global rank from a cheap snapshot
+/// of `(trial_id, observation)` pairs, without cloning trials or building the
+/// full ranked view.
+///
+/// `participants` must already be filtered to the same set the leaderboard's
+/// ranked view would use (feasible-only or all). The returned rank reproduces
+/// `Leaderboard::ranked_trials`/`ranked_trials_all`: fronts are concatenated in
+/// non-domination order and each front is ordered by descending crowding
+/// distance. Returns `None` if the target is not present in `participants`.
+#[cfg(test)]
+fn vector_global_rank(participants: &[(u64, BTreeMap<String, f64>)], target: u64) -> Option<usize> {
+    vector_rank(participants, target).map(|(rank, _)| rank)
+}
+
+/// Convert one floating-point value to its lossless public JSON representation.
+///
+/// JSON numbers cannot represent IEEE-754 non-finite values, so use the same
+/// stable string sentinels as checkpoint persistence and the Python bindings.
+fn f64_to_json(value: f64) -> serde_json::Value {
+    if value.is_nan() {
+        serde_json::Value::from("nan")
+    } else if value == f64::INFINITY {
+        serde_json::Value::from("inf")
+    } else if value == f64::NEG_INFINITY {
+        serde_json::Value::from("-inf")
+    } else {
+        serde_json::Value::from(value)
+    }
+}
+
+/// Decode a worker metric from JSON without collapsing IEEE-754 values that
+/// JSON numbers cannot represent. Python and other strict JSON clients encode
+/// these values with the same sentinels used by public score responses.
+fn metric_f64(value: &serde_json::Value) -> Option<f64> {
+    value.as_f64().or_else(|| match value.as_str() {
+        Some("inf") => Some(f64::INFINITY),
+        Some("-inf") => Some(f64::NEG_INFINITY),
+        Some("nan") => Some(f64::NAN),
+        _ => None,
+    })
+}
+
+fn raw_metric_f64(raw: &serde_json::Value, field: &str) -> Option<f64> {
+    raw.get(field).and_then(metric_f64)
+}
+
+/// Convert a `BTreeMap<String, f64>` to a lossless JSON object.
 fn f64_map_to_json(map: &BTreeMap<String, f64>) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     for (k, v) in map {
-        obj.insert(
-            k.clone(),
-            if v.is_infinite() {
-                serde_json::Value::from("inf")
-            } else if v.is_nan() {
-                serde_json::Value::Null
-            } else {
-                serde_json::Value::from(*v)
-            },
-        );
+        obj.insert(k.clone(), f64_to_json(*v));
     }
     serde_json::Value::Object(obj)
 }
@@ -1485,7 +2072,7 @@ fn f64_map_to_json(map: &BTreeMap<String, f64>) -> serde_json::Value {
 fn compute_scores(raw: &serde_json::Value, objectives: &[ObjectiveConfig]) -> serde_json::Value {
     let mut scores = serde_json::Map::new();
     for obj in objectives {
-        let val = raw.get(&obj.field).and_then(|v| v.as_f64());
+        let val = raw_metric_f64(raw, &obj.field);
         let score = match val {
             Some(v) => {
                 // An infinite objective score means infeasible and must stay
@@ -1498,14 +2085,7 @@ fn compute_scores(raw: &serde_json::Value, objectives: &[ObjectiveConfig]) -> se
             }
             None => f64::INFINITY,
         };
-        scores.insert(
-            obj.field.clone(),
-            if score.is_infinite() {
-                serde_json::Value::from("inf")
-            } else {
-                serde_json::Value::from(score)
-            },
-        );
+        scores.insert(obj.field.clone(), f64_to_json(score));
     }
     serde_json::Value::Object(scores)
 }
@@ -1523,14 +2103,10 @@ fn compute_score_vector(
         let score = scalarize_raw(raw, objectives);
         let key = objectives
             .first()
-            .map(|o| o.field.clone())
+            .map(group_key)
             .unwrap_or_else(|| "score".to_string());
         let mut map = serde_json::Map::new();
-        if score.is_infinite() {
-            map.insert(key, serde_json::Value::from("inf"));
-        } else {
-            map.insert(key, serde_json::Value::from(score));
-        }
+        map.insert(key, f64_to_json(score));
         serde_json::Value::Object(map)
     }
 }
@@ -1589,13 +2165,16 @@ pub struct HolaEngine {
     /// Cheap to clone (Arc); shared across engine clones like `state`.
     refit_lock: Arc<Mutex<()>>,
     refit_config: Option<RefitConfig>,
-    /// The effective strategy settings this engine was built with (strategy
-    /// type, refit interval, elite fraction, seed, exploration budget). Emitted
-    /// by `study_config()` so a checkpoint records the real values; on resume
-    /// `from_config` then rebuilds an identical `refit_config` instead of one
-    /// anchored to a default exploration budget.
-    strategy_template: Option<StrategyConfig>,
     auto_checkpoint: Option<AutoCheckpointConfig>,
+    /// Failures from unattended auto-checkpoint writes and rotation. Shared by
+    /// clones and exposed to the server metrics endpoint.
+    checkpoint_failures: Arc<AtomicU64>,
+    /// Failed periodic or objective-change strategy refits. The committed trial
+    /// or objective transition remains valid; operators can alert on this
+    /// counter and inspect the accompanying warning log.
+    refit_failures: Arc<AtomicU64>,
+    #[cfg(test)]
+    force_refit_failure: Arc<std::sync::atomic::AtomicBool>,
     max_trials: Option<usize>,
     /// Opt-in leaderboard retention cap (`None` = unbounded). Recorded here so
     /// `study_config()` can emit it into checkpoints and a resumed study rebuilds
@@ -1605,6 +2184,11 @@ pub struct HolaEngine {
 
 struct HolaEngineState {
     strategy: DynStrategy,
+    /// Effective strategy settings, including the resolved seed. This lives
+    /// beside the replaceable sampler state so loading a checkpoint updates
+    /// both atomically and subsequent saves describe the sampler actually in
+    /// use.
+    strategy_template: Option<StrategyConfig>,
     leaderboard: DynLeaderboard,
     /// Objectives live here, behind the same lock as the leaderboard, so a
     /// `tell()` reads objectives + scalarizes + pushes atomically, and
@@ -1616,6 +2200,72 @@ struct HolaEngineState {
     next_pending_id: u64,
     pending: BTreeMap<u64, serde_json::Value>,
     cancelled: HashSet<u64>,
+    ask_idempotency: BTreeMap<String, DynTrial>,
+    lease_deadlines: BTreeMap<u64, u64>,
+    /// Keyed by trial id for bounded logarithmic retry lookup.
+    completion_receipts: BTreeMap<u64, CompletionReceipt>,
+    /// Trial ids in commit order, used to prune the oldest receipt in O(1).
+    completion_receipt_order: VecDeque<u64>,
+}
+
+/// Retry receipt for a committed tell. The exact response view and count are
+/// retained so an uncertain client can replay the operation even if a bounded
+/// leaderboard has already evicted the underlying trial.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CompletionReceipt {
+    commit_sequence: u64,
+    completed: CompletedTrial,
+    committed_count: usize,
+    #[serde(default)]
+    post_commit_warnings: Vec<String>,
+}
+
+/// Transient job state persisted alongside a full checkpoint.
+///
+/// Older full checkpoints do not contain this object; those loads retain the
+/// legacy behavior of invalidating all pending work. New checkpoints preserve
+/// issued candidates and the monotonic ID cursor so a worker response arriving
+/// after a restart is still correlated with the candidate it evaluated.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RuntimeCheckpointState {
+    next_pending_id: u64,
+    pending: BTreeMap<u64, serde_json::Value>,
+    cancelled: Vec<u64>,
+    #[serde(default)]
+    ask_idempotency: BTreeMap<String, DynTrial>,
+    #[serde(default)]
+    lease_deadlines: BTreeMap<u64, u64>,
+    #[serde(default)]
+    completion_receipts: BTreeMap<u64, CompletionReceipt>,
+}
+
+enum LeaderboardSnapshot {
+    Scalar(Leaderboard<serde_json::Value, f64>),
+    Vector(Leaderboard<serde_json::Value, BTreeMap<String, f64>>),
+}
+
+struct FullCheckpointSnapshot {
+    config: StudyConfig,
+    leaderboard: LeaderboardSnapshot,
+    strategy: DynStrategy,
+    runtime_state: RuntimeCheckpointState,
+    description: Option<String>,
+    /// Number of records retained in the serialized leaderboard.
+    n_trials: usize,
+    /// Monotonic number of results committed over the study lifetime.
+    total_completed: usize,
+}
+
+enum LoadedFullCheckpoint {
+    Scalar(Checkpoint<serde_json::Value, f64, DynStrategy>),
+    Vector(Checkpoint<serde_json::Value, BTreeMap<String, f64>, DynStrategy>),
+}
+
+/// Metadata captured from the exact state snapshot written to a checkpoint.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct SavedCheckpoint {
+    pub n_trials: usize,
+    pub created_at: u64,
 }
 
 impl HolaEngineState {
@@ -1623,6 +2273,305 @@ impl HolaEngineState {
         self.next_pending_id = self.leaderboard.normalize_next_trial_id();
         self.pending.clear();
         self.cancelled.clear();
+        self.ask_idempotency.clear();
+        self.lease_deadlines.clear();
+        self.completion_receipts.clear();
+        self.completion_receipt_order.clear();
+    }
+
+    fn runtime_checkpoint_state(&self) -> RuntimeCheckpointState {
+        let mut cancelled: Vec<u64> = self.cancelled.iter().copied().collect();
+        cancelled.sort_unstable();
+        RuntimeCheckpointState {
+            next_pending_id: self.next_pending_id,
+            pending: self.pending.clone(),
+            cancelled,
+            ask_idempotency: self.ask_idempotency.clone(),
+            lease_deadlines: self.lease_deadlines.clone(),
+            completion_receipts: self.completion_receipts.clone(),
+        }
+    }
+
+    fn restore_runtime_checkpoint_state(
+        &mut self,
+        runtime: Option<RuntimeCheckpointState>,
+        space: &DynSpace,
+    ) -> Result<(), String> {
+        let Some(runtime) = runtime else {
+            self.reset_transient_trial_state_after_load();
+            return Ok(());
+        };
+
+        let mut minimum_next = self.leaderboard.next_trial_id();
+        if runtime.pending.len() > MAX_PENDING_TRIALS {
+            return Err(format!(
+                "checkpoint contains {} pending trials (maximum {MAX_PENDING_TRIALS})",
+                runtime.pending.len()
+            ));
+        }
+        for (&trial_id, candidate) in &runtime.pending {
+            if self.leaderboard.contains_trial_id(trial_id) {
+                return Err(format!(
+                    "checkpoint pending trial_id {trial_id} is already completed"
+                ));
+            }
+            if !space.contains(candidate) {
+                return Err(format!(
+                    "checkpoint pending trial_id {trial_id} contains a candidate outside the configured space"
+                ));
+            }
+            minimum_next = minimum_next.max(trial_id.checked_add(1).ok_or_else(|| {
+                "checkpoint pending trial_id u64::MAX leaves no assignable ID".to_string()
+            })?);
+        }
+
+        if runtime.cancelled.len() > MAX_CANCELLED_RETAINED {
+            return Err(format!(
+                "checkpoint contains {} cancelled trial ids (maximum {MAX_CANCELLED_RETAINED})",
+                runtime.cancelled.len()
+            ));
+        }
+        let mut cancelled = HashSet::with_capacity(runtime.cancelled.len());
+        for trial_id in runtime.cancelled {
+            if self.leaderboard.contains_trial_id(trial_id)
+                || runtime.pending.contains_key(&trial_id)
+                || !cancelled.insert(trial_id)
+            {
+                return Err(format!(
+                    "checkpoint cancelled trial_id {trial_id} overlaps another job state"
+                ));
+            }
+            minimum_next = minimum_next.max(trial_id.checked_add(1).ok_or_else(|| {
+                "checkpoint cancelled trial_id u64::MAX leaves no assignable ID".to_string()
+            })?);
+        }
+
+        if runtime.ask_idempotency.len() > MAX_ASK_IDEMPOTENCY_KEYS {
+            return Err(format!(
+                "checkpoint contains {} ask idempotency keys (maximum {MAX_ASK_IDEMPOTENCY_KEYS})",
+                runtime.ask_idempotency.len()
+            ));
+        }
+        let mut keyed_trial_ids = HashSet::with_capacity(runtime.ask_idempotency.len());
+        for (key, trial) in &runtime.ask_idempotency {
+            if key.is_empty() || key.len() > 128 || !key.is_ascii() {
+                return Err("checkpoint contains an invalid ask idempotency key".to_string());
+            }
+            if runtime.pending.get(&trial.trial_id) != Some(&trial.params) {
+                return Err(format!(
+                    "checkpoint ask idempotency key '{key}' does not match pending trial {}",
+                    trial.trial_id
+                ));
+            }
+            if !keyed_trial_ids.insert(trial.trial_id) {
+                return Err(format!(
+                    "checkpoint contains multiple ask idempotency keys for trial {}",
+                    trial.trial_id
+                ));
+            }
+        }
+        for (&trial_id, &deadline) in &runtime.lease_deadlines {
+            if deadline == 0 || !runtime.pending.contains_key(&trial_id) {
+                return Err(format!(
+                    "checkpoint lease for trial {trial_id} does not match a pending trial"
+                ));
+            }
+        }
+        if runtime.completion_receipts.len() > MAX_COMPLETION_RECEIPTS {
+            return Err(format!(
+                "checkpoint contains {} completion receipts (maximum {MAX_COMPLETION_RECEIPTS})",
+                runtime.completion_receipts.len()
+            ));
+        }
+        let total_completed = self.leaderboard.total_completed();
+        let mut receipt_sequences = HashSet::with_capacity(runtime.completion_receipts.len());
+        let mut receipt_order = Vec::with_capacity(runtime.completion_receipts.len());
+        for (&trial_id, receipt) in &runtime.completion_receipts {
+            let sequence = receipt.commit_sequence;
+            if sequence == 0 || sequence > total_completed {
+                return Err(format!(
+                    "checkpoint completion receipt {sequence} is outside completed sequence 1..={total_completed}"
+                ));
+            }
+            if receipt.completed.trial_id != trial_id || !receipt_sequences.insert(sequence) {
+                return Err(format!(
+                    "checkpoint completion receipt for trial_id {trial_id} has inconsistent identity or sequence"
+                ));
+            }
+            let receipt_count = u64::try_from(receipt.committed_count).unwrap_or(u64::MAX);
+            if receipt_count < sequence || receipt_count > total_completed {
+                return Err(format!(
+                    "checkpoint completion receipt {sequence} has mismatched committed_count {} (expected {sequence}..={total_completed})",
+                    receipt.committed_count
+                ));
+            }
+            if runtime.pending.contains_key(&trial_id) || cancelled.contains(&trial_id) {
+                return Err(format!(
+                    "checkpoint completion receipt for trial_id {trial_id} overlaps another job state"
+                ));
+            }
+            if !space.contains(&receipt.completed.params) {
+                return Err(format!(
+                    "checkpoint completion receipt for trial_id {trial_id} contains a candidate outside the configured space"
+                ));
+            }
+            let expected_scores = compute_scores(&receipt.completed.metrics, &self.objectives);
+            let expected_score_vector =
+                compute_score_vector(&receipt.completed.metrics, &self.objectives);
+            if receipt.completed.scores != expected_scores
+                || receipt.completed.score_vector != expected_score_vector
+            {
+                return Err(format!(
+                    "checkpoint completion receipt for trial_id {trial_id} conflicts with its raw metrics"
+                ));
+            }
+            if receipt.completed.rank >= receipt.committed_count
+                // Front zero is reserved for feasible best trials. With no
+                // feasible observations, an infeasible trial legitimately uses
+                // the sentinel front immediately after all possible fronts,
+                // which can equal committed_count.
+                || receipt.completed.pareto_front > receipt.committed_count
+            {
+                return Err(format!(
+                    "checkpoint completion receipt for trial_id {trial_id} has an out-of-range rank/front"
+                ));
+            }
+            if let Some(stored_metrics) = self.leaderboard.raw_metrics(trial_id) {
+                if stored_metrics != &receipt.completed.metrics {
+                    return Err(format!(
+                        "checkpoint completion receipt for trial_id {trial_id} conflicts with leaderboard metrics"
+                    ));
+                }
+            }
+            if let Some((stored_candidate, stored_timestamp)) =
+                self.leaderboard.candidate_and_timestamp(trial_id)
+            {
+                if stored_candidate != &receipt.completed.params
+                    || stored_timestamp != receipt.completed.completed_at
+                {
+                    return Err(format!(
+                        "checkpoint completion receipt for trial_id {trial_id} conflicts with leaderboard identity"
+                    ));
+                }
+            }
+            minimum_next = minimum_next.max(trial_id.checked_add(1).ok_or_else(|| {
+                "checkpoint completion receipt trial_id u64::MAX leaves no assignable ID"
+                    .to_string()
+            })?);
+            receipt_order.push((sequence, trial_id));
+        }
+        receipt_order.sort_unstable();
+        if runtime.next_pending_id < minimum_next {
+            return Err(format!(
+                "checkpoint next_pending_id {} is stale (minimum {minimum_next})",
+                runtime.next_pending_id
+            ));
+        }
+
+        self.next_pending_id = runtime.next_pending_id;
+        self.pending = runtime.pending;
+        self.cancelled = cancelled;
+        self.ask_idempotency = runtime.ask_idempotency;
+        self.lease_deadlines = runtime.lease_deadlines;
+        self.completion_receipts = runtime.completion_receipts;
+        self.completion_receipt_order = receipt_order
+            .into_iter()
+            .map(|(_, trial_id)| trial_id)
+            .collect();
+        self.expire_leases(unix_time_millis());
+        Ok(())
+    }
+
+    fn record_ask_idempotency(&mut self, key: String, trial: DynTrial) {
+        self.ask_idempotency.insert(key, trial);
+        debug_assert!(self.ask_idempotency.len() <= MAX_ASK_IDEMPOTENCY_KEYS);
+        debug_assert!(self.ask_idempotency.len() <= self.pending.len());
+    }
+
+    fn remove_ask_idempotency_for_trial(&mut self, trial_id: u64) {
+        self.ask_idempotency
+            .retain(|_, trial| trial.trial_id != trial_id);
+    }
+
+    fn completion_receipt(&self, trial_id: u64) -> Option<&CompletionReceipt> {
+        self.completion_receipts.get(&trial_id)
+    }
+
+    fn record_completion_receipt(
+        &mut self,
+        sequence: u64,
+        completed: CompletedTrial,
+        committed_count: usize,
+    ) {
+        let trial_id = completed.trial_id;
+        let replaced = self.completion_receipts.insert(
+            trial_id,
+            CompletionReceipt {
+                commit_sequence: sequence,
+                completed,
+                committed_count,
+                post_commit_warnings: Vec::new(),
+            },
+        );
+        debug_assert!(replaced.is_none());
+        self.completion_receipt_order.push_back(trial_id);
+        while self.completion_receipts.len() > MAX_COMPLETION_RECEIPTS {
+            if let Some(oldest_trial_id) = self.completion_receipt_order.pop_front() {
+                self.completion_receipts.remove(&oldest_trial_id);
+            }
+        }
+    }
+
+    fn record_post_commit_warnings(&mut self, sequence: u64, trial_id: u64, warnings: &[String]) {
+        if let Some(receipt) = self.completion_receipts.get_mut(&trial_id) {
+            if receipt.commit_sequence == sequence {
+                receipt.post_commit_warnings = warnings.to_vec();
+            }
+        }
+    }
+
+    fn rescore_completion_receipts(&mut self, objectives: &[ObjectiveConfig]) {
+        let view_count = self.leaderboard.completed_count();
+        let current: BTreeMap<u64, CompletedTrial> = self
+            .leaderboard
+            .completed_trials("rank", true, objectives)
+            .into_iter()
+            .map(|trial| (trial.trial_id, trial))
+            .collect();
+        // An objective change starts a new ranking epoch. Retained receipts can
+        // be rebuilt exactly from the canonical leaderboard. An evicted trial's
+        // new global rank is unknowable, so invalidate that receipt instead of
+        // returning a stale or fabricated rank/front after the epoch change.
+        self.completion_receipts.retain(|trial_id, receipt| {
+            if let Some(completed) = current.get(trial_id) {
+                receipt.completed = completed.clone();
+                // This view now belongs to the current objective/ranking epoch,
+                // not the original commit prefix. Carry the epoch's count so
+                // every rebuilt rank/front remains internally consistent.
+                receipt.committed_count = view_count;
+                true
+            } else {
+                false
+            }
+        });
+        self.completion_receipt_order
+            .retain(|trial_id| self.completion_receipts.contains_key(trial_id));
+    }
+
+    fn expire_leases(&mut self, now: u64) -> usize {
+        let expired: Vec<u64> = self
+            .lease_deadlines
+            .iter()
+            .filter_map(|(&trial_id, &deadline)| (deadline <= now).then_some(trial_id))
+            .collect();
+        for trial_id in &expired {
+            self.lease_deadlines.remove(trial_id);
+            if self.pending.remove(trial_id).is_some() {
+                self.remove_ask_idempotency_for_trial(*trial_id);
+                self.record_cancelled(*trial_id);
+            }
+        }
+        expired.len()
     }
 
     /// Record a cancelled trial id and bound the retained set.
@@ -1657,33 +2606,10 @@ impl HolaEngine {
         for (name, param) in &config.space {
             space = match param {
                 ParamConfig::Real { min, max, scale } => match scale.as_str() {
-                    "log" | "ln" => {
-                        if *min <= 0.0 || *max <= 0.0 {
-                            return Err(format!(
-                                "Parameter '{name}': log scale requires min > 0 and max > 0, got min={min}, max={max}",
-                            ));
-                        }
-                        if *min >= *max {
-                            return Err(format!(
-                                "Parameter '{name}': min must be less than max, got min={min}, max={max}",
-                            ));
-                        }
-                        space.add_real_log(name, *min, *max)
-                    }
-                    "log10" => {
-                        if *min <= 0.0 || *max <= 0.0 {
-                            return Err(format!(
-                                "Parameter '{name}': log10 scale requires min > 0 and max > 0, got min={min}, max={max}",
-                            ));
-                        }
-                        if *min >= *max {
-                            return Err(format!(
-                                "Parameter '{name}': min must be less than max, got min={min}, max={max}",
-                            ));
-                        }
-                        space.add_real_log10(name, *min, *max)
-                    }
-                    _ => space.add_real(name, *min, *max),
+                    "log" | "ln" => space.add_real_log(name, *min, *max),
+                    "log10" => space.add_real_log10(name, *min, *max),
+                    "linear" => space.add_real(name, *min, *max),
+                    _ => unreachable!("real scale was validated before construction"),
                 },
                 ParamConfig::Integer { min, max } => space.add_integer(name, *min, *max),
                 ParamConfig::Categorical { choices } => {
@@ -1727,7 +2653,12 @@ impl HolaEngine {
         }
 
         let refit_interval = strategy_cfg.map(|s| s.refit_interval).unwrap_or(20);
-        let seed = strategy_cfg.and_then(|s| s.seed);
+        // Resolve an omitted seed exactly once. The concrete value is used by
+        // every strategy and persisted in study_config/checkpoints so an
+        // auto-seeded run can be reproduced rather than recording `None`.
+        let seed = strategy_cfg
+            .and_then(|s| s.seed)
+            .unwrap_or_else(rand::random);
         let max_trials = config
             .max_trials
             .or_else(|| strategy_cfg.and_then(|s| s.total_budget));
@@ -1740,10 +2671,7 @@ impl HolaEngine {
         let (strategy, refit_config) = match strategy_type {
             "random" => (
                 DynStrategy {
-                    inner: DynStrategyInner::Random(match seed {
-                        Some(s) => RandomStrategy::new(s),
-                        None => RandomStrategy::auto_seed(),
-                    }),
+                    inner: DynStrategyInner::Random(RandomStrategy::new(seed)),
                 },
                 None,
             ),
@@ -1752,7 +2680,7 @@ impl HolaEngine {
                     inner: DynStrategyInner::Sobol(SobolStrategy::new(
                         // Fold high bits into low instead of truncating so seeds
                         // differing only in bits >= 32 produce distinct sequences.
-                        seed.map(|s| (s ^ (s >> 32)) as u32).unwrap_or(42),
+                        (seed ^ (seed >> 32)) as u32,
                     )),
                 },
                 None,
@@ -1773,14 +2701,19 @@ impl HolaEngine {
                         inner: DynStrategyInner::Auto(AutoStrategy::new(
                             dim,
                             exploration_budget,
-                            seed,
+                            Some(seed),
                         )),
                     },
-                    Some(RefitConfig::with_quantile(
-                        exploration_budget,
-                        refit_interval,
-                        elite_fraction,
-                    )),
+                    Some(
+                        RefitConfig::try_with_quantile(
+                            exploration_budget,
+                            refit_interval,
+                            elite_fraction,
+                        )
+                        .map_err(|error| {
+                            format!("Invalid strategy refit configuration: {error}")
+                        })?,
+                    ),
                 )
             }
             _ => unreachable!("strategy type was validated before construction"),
@@ -1795,15 +2728,23 @@ impl HolaEngine {
             refit_interval,
             total_budget: max_trials,
             exploration_budget: effective_exploration_budget,
-            seed,
+            seed: Some(seed),
             elite_fraction: effective_elite_fraction,
         });
 
-        let auto_checkpoint = config.checkpoint.as_ref().map(|c| {
-            let mut ac = AutoCheckpointConfig::new(&c.directory, c.interval);
+        let auto_checkpoint = if let Some(c) = config.checkpoint.as_ref() {
+            std::fs::create_dir_all(&c.directory).map_err(|error| {
+                format!(
+                    "failed to create checkpoint directory '{}': {error}",
+                    c.directory
+                )
+            })?;
+            let mut ac = AutoCheckpointConfig::new(&c.directory, c.interval)?;
             ac.max_checkpoints = c.max_checkpoints;
-            ac
-        });
+            Some(ac)
+        } else {
+            None
+        };
 
         let mut leaderboard = DynLeaderboard::for_objectives(&config.objectives);
         // Opt-in bounded mode. None (default) keeps the leaderboard unbounded
@@ -1814,16 +2755,24 @@ impl HolaEngine {
             space,
             state: Arc::new(RwLock::new(HolaEngineState {
                 strategy,
+                strategy_template,
                 leaderboard,
                 objectives: config.objectives,
                 next_pending_id: 0,
                 pending: BTreeMap::new(),
                 cancelled: HashSet::new(),
+                ask_idempotency: BTreeMap::new(),
+                lease_deadlines: BTreeMap::new(),
+                completion_receipts: BTreeMap::new(),
+                completion_receipt_order: VecDeque::new(),
             })),
             refit_lock: Arc::new(Mutex::new(())),
             refit_config,
-            strategy_template,
             auto_checkpoint,
+            checkpoint_failures: Arc::new(AtomicU64::new(0)),
+            refit_failures: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            force_refit_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_trials,
             max_leaderboard_size: config.max_leaderboard_size,
         })
@@ -1834,6 +2783,87 @@ impl HolaEngine {
     /// Returns an error if `max_trials` has been reached.
     pub async fn ask(&self) -> Result<DynTrial, String> {
         let mut state = self.state.write().await;
+        state.expire_leases(unix_time_millis());
+        self.ask_locked(&mut state)
+    }
+
+    /// Request a trial with a server-managed lease.
+    pub async fn ask_with_lease(&self, lease: Duration) -> Result<DynTrial, String> {
+        let deadline = lease_deadline(lease)?;
+        let mut state = self.state.write().await;
+        state.expire_leases(unix_time_millis());
+        let trial = self.ask_locked(&mut state)?;
+        state.lease_deadlines.insert(trial.trial_id, deadline);
+        Ok(trial)
+    }
+
+    /// Request a trial with retry-safe allocation semantics.
+    ///
+    /// Repeating the same key while its trial remains pending returns the exact
+    /// same ID and parameters. The bounded key map is included in full
+    /// checkpoints, so retries remain deterministic after a checkpointed
+    /// restart. Keys are removed when their trial completes or is cancelled.
+    pub async fn ask_idempotent(&self, key: &str) -> Result<DynTrial, String> {
+        if key.is_empty() || key.len() > 128 || !key.is_ascii() {
+            return Err("idempotency key must contain 1 to 128 ASCII characters".to_string());
+        }
+        let mut state = self.state.write().await;
+        state.expire_leases(unix_time_millis());
+        if let Some(trial) = state.ask_idempotency.get(key) {
+            return Ok(trial.clone());
+        }
+        let trial = self.ask_locked(&mut state)?;
+        state.record_ask_idempotency(key.to_string(), trial.clone());
+        Ok(trial)
+    }
+
+    /// Retry-safe ask with a renewable server-managed lease.
+    pub async fn ask_idempotent_with_lease(
+        &self,
+        key: &str,
+        lease: Duration,
+    ) -> Result<DynTrial, String> {
+        if key.is_empty() || key.len() > 128 || !key.is_ascii() {
+            return Err("idempotency key must contain 1 to 128 ASCII characters".to_string());
+        }
+        let deadline = lease_deadline(lease)?;
+        let mut state = self.state.write().await;
+        state.expire_leases(unix_time_millis());
+        if let Some(trial) = state.ask_idempotency.get(key).cloned() {
+            state.lease_deadlines.insert(trial.trial_id, deadline);
+            return Ok(trial);
+        }
+        let trial = self.ask_locked(&mut state)?;
+        state.record_ask_idempotency(key.to_string(), trial.clone());
+        state.lease_deadlines.insert(trial.trial_id, deadline);
+        Ok(trial)
+    }
+
+    /// Renew a pending trial lease and return its absolute Unix deadline.
+    pub async fn heartbeat(&self, trial_id: u64, lease: Duration) -> Result<u64, String> {
+        let deadline = lease_deadline(lease)?;
+        let mut state = self.state.write().await;
+        state.expire_leases(unix_time_millis());
+        if !state.pending.contains_key(&trial_id) {
+            return Err(format!(
+                "Trial {trial_id} is not pending or its lease expired"
+            ));
+        }
+        state.lease_deadlines.insert(trial_id, deadline);
+        Ok(deadline)
+    }
+
+    /// Lazily reclaim expired distributed jobs. Returns the number reclaimed.
+    pub async fn expire_pending_leases(&self) -> usize {
+        self.state.write().await.expire_leases(unix_time_millis())
+    }
+
+    fn ask_locked(&self, state: &mut HolaEngineState) -> Result<DynTrial, String> {
+        if state.pending.len() >= MAX_PENDING_TRIALS {
+            return Err(format!(
+                "maximum pending trial limit ({MAX_PENDING_TRIALS}) reached; complete or cancel existing trials"
+            ));
+        }
         if let Some(max) = self.max_trials {
             // Count distinct trials against the budget via the monotonic
             // total_completed() counter plus the in-flight pending trials.
@@ -1846,8 +2876,8 @@ impl HolaEngine {
             // For an unbounded board total_completed() equals len(), so the
             // default behavior is unchanged; for a capped board it keeps
             // growing past the cap, so a bounded study still terminates.
-            let completed = state.leaderboard.total_completed() as usize;
-            let total = completed + state.pending.len();
+            let completed = state.leaderboard.completed_count();
+            let total = completed.saturating_add(state.pending.len());
             if total >= max {
                 return Err(format!(
                     "max_trials ({max}) reached ({completed} completed, {} pending)",
@@ -1881,20 +2911,104 @@ impl HolaEngine {
         trial_id: u64,
         raw_metrics: serde_json::Value,
     ) -> Result<CompletedTrial, String> {
+        self.tell_with_outcome(trial_id, raw_metrics)
+            .await
+            .map(|outcome| outcome.completed)
+    }
+
+    /// Tell the engine and return the completed trial plus the completed-count
+    /// captured by the same commit. Servers use this to avoid reporting a later
+    /// concurrent count as metadata for this operation.
+    pub async fn tell_with_count(
+        &self,
+        trial_id: u64,
+        raw_metrics: serde_json::Value,
+    ) -> Result<(CompletedTrial, usize), String> {
+        self.tell_with_outcome(trial_id, raw_metrics)
+            .await
+            .map(|outcome| (outcome.completed, outcome.trial_count))
+    }
+
+    /// Tell the engine and report whether this call committed new state or
+    /// replayed a retained completion receipt.
+    pub async fn tell_with_outcome(
+        &self,
+        trial_id: u64,
+        raw_metrics: serde_json::Value,
+    ) -> Result<TellOutcome, String> {
+        self.tell_with_outcome_on_commit(trial_id, raw_metrics, |_, _| {})
+            .await
+    }
+
+    /// Tell the engine and synchronously notify a caller at the exact commit
+    /// boundary. The callback runs after the completion receipt is durable in
+    /// engine state and before any post-commit async maintenance can yield.
+    ///
+    /// The HTTP server uses this boundary to publish its SSE event without a
+    /// cancellation window between a successful commit and observability.
+    pub(crate) async fn tell_with_outcome_on_commit<F>(
+        &self,
+        trial_id: u64,
+        raw_metrics: serde_json::Value,
+        on_commit: F,
+    ) -> Result<TellOutcome, String>
+    where
+        F: FnOnce(&CompletedTrial, usize),
+    {
         let mut state = self.state.write().await;
+        state.expire_leases(unix_time_millis());
 
         if state.cancelled.contains(&trial_id) {
             return Err(format!("Trial {trial_id} has been cancelled"));
         }
 
+        if let Some(receipt) = state.completion_receipt(trial_id) {
+            if receipt.completed.metrics != raw_metrics {
+                return Err(format!(
+                    "Trial {trial_id} has already been completed with different metrics"
+                ));
+            }
+            return Ok(TellOutcome {
+                completed: receipt.completed.clone(),
+                trial_count: receipt.committed_count,
+                newly_committed: false,
+                post_commit_warnings: receipt.post_commit_warnings.clone(),
+            });
+        }
+
         if state.leaderboard.contains_trial_id(trial_id) {
-            return Err(format!("Trial {trial_id} has already been completed"));
+            if state.leaderboard.raw_metrics(trial_id) != Some(&raw_metrics) {
+                return Err(format!(
+                    "Trial {trial_id} has already been completed with different metrics"
+                ));
+            }
+            let objectives = state.objectives.clone();
+            let committed_count = state.leaderboard.completed_count();
+            let (mut completed, vector_rank_inputs) = state
+                .leaderboard
+                .completed_for_tell(trial_id, true, &objectives)
+                .ok_or_else(|| format!("Failed to rebuild CompletedTrial for {trial_id}"))?;
+            drop(state);
+            if let Some((participants, target)) = vector_rank_inputs {
+                let (rank, front) = vector_dashboard_rank(&participants, target)
+                    .ok_or_else(|| format!("Failed to rank CompletedTrial for {trial_id}"))?;
+                completed.rank = rank;
+                completed.pareto_front = front;
+            }
+            return Ok(TellOutcome {
+                completed,
+                trial_count: committed_count,
+                newly_committed: false,
+                post_commit_warnings: Vec::new(),
+            });
         }
 
         let candidate = state
             .pending
             .remove(&trial_id)
             .ok_or_else(|| format!("Unknown trial_id: {trial_id}"))?;
+        state.remove_ask_idempotency_for_trial(trial_id);
+        state.lease_deadlines.remove(&trial_id);
 
         // Read objectives, scalarize, and push under the single state lock so a
         // concurrent update_objectives cannot scalarize this trial against a
@@ -1911,96 +3025,211 @@ impl HolaEngine {
         }
         state.strategy.update(&candidate, score);
 
-        let n_trials = state.leaderboard.len();
+        let completed_trials = state.leaderboard.completed_count();
+        let commit_sequence = state.leaderboard.total_completed();
 
-        // Build this trial's view cheaply under the lock. The scalar path returns
-        // a fully ranked CompletedTrial (its rank_of is O(n)). The vector path
-        // fills pareto_front via front-peeling (no trial clones) and returns a
-        // light (trial_id, observation) snapshot so the O(M*N^2) NSGA-II global
-        // rank is computed off-lock below, rather than re-ranking and cloning the
-        // whole board while the write lock is held. The resulting CompletedTrial
-        // is identical in content to the prior full-ranking path.
+        // Build the exact response and receipt before releasing the commit lock.
+        // In particular, a duplicate tell must never observe the vector path's
+        // temporary rank/front placeholders. The snapshot construction is the
+        // only part that reads the leaderboard; ranking then operates on that
+        // owned snapshot.
         let (mut completed, vector_rank_inputs) = state
             .leaderboard
             .completed_for_tell(stored_trial_id, true, &objectives)
             .ok_or_else(|| format!("Failed to build CompletedTrial for {stored_trial_id}"))?;
+        if let Some((participants, target)) = vector_rank_inputs {
+            let (rank, front) = vector_dashboard_rank(&participants, target)
+                .ok_or_else(|| format!("Failed to rank CompletedTrial for {stored_trial_id}"))?;
+            completed.rank = rank;
+            completed.pareto_front = front;
+        }
+        state.record_completion_receipt(commit_sequence, completed.clone(), completed_trials);
         drop(state);
 
-        // Vector studies: finish the global NSGA-II rank off-lock from the cheap
-        // observation snapshot. Scalar studies already have their rank set.
-        if let Some((participants, target)) = vector_rank_inputs {
-            completed.rank = vector_global_rank(&participants, target)
-                .ok_or_else(|| format!("Failed to rank CompletedTrial for {stored_trial_id}"))?;
-        }
+        // There is deliberately no `.await` between recording the receipt and
+        // this hook. Cancellation therefore observes either neither operation
+        // or both the commit and its externally visible event.
+        on_commit(&completed, completed_trials);
 
-        // Auto-refit if configured
-        if let Some(ref config) = self.refit_config
-            && config.should_refit(n_trials)
-            // Skip this periodic refit if one is already in flight: it rebuilds
-            // from the leaderboard and yields a current model, so dropping a
-            // boundary is harmless. Holding the guard across the fit prevents a
-            // stale model from overwriting a newer one.
-            && let Ok(_refit_guard) = self.refit_lock.try_lock()
+        // Own post-commit maintenance in a spawned task. Awaiting it preserves
+        // the synchronous API's warnings on the normal path, while dropping or
+        // timing out this tell future detaches the task instead of cancelling a
+        // scheduled refit/checkpoint after the trial has committed.
+        let post_commit_warnings = if self.refit_config.is_none() && self.auto_checkpoint.is_none()
         {
-            let state_guard = self.state.read().await;
-            let k = config.selection_count(n_trials);
-            // Refit against the current objectives, which may have changed since
-            // this trial was scored if an update_objectives ran concurrently.
-            let refit_objectives = state_guard.objectives.clone();
-            let trials = state_guard
-                .leaderboard
-                .top_k_for_refit(k, &refit_objectives);
-            let mut strategy_snapshot = state_guard.strategy.clone();
-            let space_clone = self.space.clone();
-            drop(state_guard);
-
-            let mut fitted = tokio::task::spawn_blocking(move || {
-                use opt_engine::traits::RefittableStrategy;
-                strategy_snapshot.refit(&space_clone, &trials);
-                strategy_snapshot
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-
-            {
-                use opt_engine::traits::RefittableStrategy;
-                let mut guard = self.state.write().await;
-                fitted.reconcile_after_refit(&guard.strategy);
-                guard.strategy = fitted;
+            Vec::new()
+        } else {
+            let maintenance_engine = self.clone();
+            let maintenance_trial_id = completed.trial_id;
+            let maintenance_task = tokio::spawn(async move {
+                maintenance_engine
+                    .run_post_commit_maintenance(
+                        completed_trials,
+                        commit_sequence,
+                        maintenance_trial_id,
+                    )
+                    .await
+            });
+            match maintenance_task.await {
+                Ok(warnings) => warnings,
+                Err(error) => {
+                    let warning = format!("post-commit maintenance task failed: {error}");
+                    eprintln!("[hola] Warning: {warning}");
+                    self.state.write().await.record_post_commit_warnings(
+                        commit_sequence,
+                        completed.trial_id,
+                        std::slice::from_ref(&warning),
+                    );
+                    vec![warning]
+                }
             }
-        }
+        };
 
-        // Auto-checkpoint if configured
-        if let Some(ref config) = self.auto_checkpoint
-            && config.should_checkpoint(n_trials)
-        {
-            // Save a full checkpoint (leaderboard + strategy_state + config) so
-            // resuming from an auto-checkpoint restores strategy/exploration
-            // progress instead of resetting it.
-            if let Err(e) = self
-                .save_full_checkpoint(
-                    config.filename(n_trials),
-                    Some(&format!("Auto-checkpoint at {n_trials} trials")),
-                )
-                .await
-            {
-                eprintln!("[hola] Warning: auto-checkpoint failed: {e}");
-            } else {
-                eprintln!("[hola] Auto-checkpoint saved at {n_trials} trials");
-                // Rotate old checkpoints
-                if let Some(max) = config.max_checkpoints {
-                    Self::rotate_checkpoints(&config.directory, &config.prefix, max);
+        Ok(TellOutcome {
+            completed,
+            trial_count: completed_trials,
+            newly_committed: true,
+            post_commit_warnings,
+        })
+    }
+
+    async fn run_post_commit_maintenance(
+        &self,
+        completed_trials: usize,
+        commit_sequence: u64,
+        trial_id: u64,
+    ) -> Vec<String> {
+        let mut post_commit_warnings = Vec::new();
+
+        if let Some(ref config) = self.refit_config {
+            if config.should_refit(completed_trials) {
+                // Serialize refits and take the leaderboard snapshot only after
+                // earlier work finishes. A cadence boundary that arrives while
+                // fitting must coalesce into a fit of the latest history rather
+                // than being silently dropped.
+                let _refit_guard = self.refit_lock.lock().await;
+                let state_guard = self.state.read().await;
+                let refit_completed = state_guard.leaderboard.completed_count();
+                let k = config
+                    .selection_count(refit_completed)
+                    .min(MAX_REFIT_SAMPLES);
+                let refit_objectives = state_guard.objectives.clone();
+                let trials = state_guard
+                    .leaderboard
+                    .top_k_for_refit(k, &refit_objectives);
+                let mut strategy_snapshot = state_guard.strategy.clone();
+                let space_clone = self.space.clone();
+                drop(state_guard);
+
+                let force_refit_failure = {
+                    #[cfg(test)]
+                    {
+                        self.force_refit_failure.swap(false, Ordering::SeqCst)
+                    }
+                    #[cfg(not(test))]
+                    {
+                        false
+                    }
+                };
+
+                let fitted_result = tokio::task::spawn_blocking(move || {
+                    if force_refit_failure {
+                        Err("forced refit failure for observability test".to_string())
+                    } else {
+                        strategy_snapshot
+                            .try_refit(&space_clone, &trials)
+                            .map(|()| strategy_snapshot)
+                    }
+                })
+                .await;
+
+                match fitted_result {
+                    Ok(Ok(mut fitted)) => {
+                        use opt_engine::traits::RefittableStrategy;
+                        let mut guard = self.state.write().await;
+                        fitted.reconcile_after_refit(&guard.strategy);
+                        guard.strategy = fitted;
+                    }
+                    Ok(Err(error)) => {
+                        self.refit_failures.fetch_add(1, Ordering::Relaxed);
+                        let warning = format!("post-commit refit failed: {error}");
+                        eprintln!("[hola] Warning: {warning}");
+                        post_commit_warnings.push(warning);
+                    }
+                    Err(error) => {
+                        self.refit_failures.fetch_add(1, Ordering::Relaxed);
+                        let warning = format!("post-commit refit task failed: {error}");
+                        eprintln!("[hola] Warning: {warning}");
+                        post_commit_warnings.push(warning);
+                    }
                 }
             }
         }
 
-        Ok(completed)
+        if let Some(ref config) = self.auto_checkpoint {
+            if config.should_checkpoint(completed_trials) {
+                let mut snapshot = self.checkpoint_snapshot(None).await;
+                let snapshot_completed = snapshot.total_completed;
+                snapshot.description = Some(format!(
+                    "Auto-checkpoint after {snapshot_completed} completed trials ({} retained)",
+                    snapshot.n_trials
+                ));
+                let path = config.filename(snapshot_completed);
+                if let Err(error) = Self::persist_checkpoint_snapshot(snapshot, path).await {
+                    self.checkpoint_failures.fetch_add(1, Ordering::Relaxed);
+                    let warning = format!("post-commit auto-checkpoint failed: {error}");
+                    eprintln!("[hola] Warning: {warning}");
+                    post_commit_warnings.push(warning);
+                } else {
+                    eprintln!(
+                        "[hola] Auto-checkpoint saved after {snapshot_completed} completed trials"
+                    );
+                    if let Some(max) = config.max_checkpoints {
+                        let directory = config.directory.clone();
+                        let prefix = config.prefix.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            Self::rotate_checkpoints(&directory, &prefix, max)
+                        })
+                        .await
+                        {
+                            Ok(failures) if failures > 0 => {
+                                self.checkpoint_failures
+                                    .fetch_add(failures as u64, Ordering::Relaxed);
+                                post_commit_warnings.push(format!(
+                                    "post-commit checkpoint rotation failed for {failures} file(s)"
+                                ));
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                self.checkpoint_failures.fetch_add(1, Ordering::Relaxed);
+                                let warning =
+                                    format!("post-commit checkpoint rotation task failed: {error}");
+                                eprintln!("[hola] Warning: {warning}");
+                                post_commit_warnings.push(warning);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !post_commit_warnings.is_empty() {
+            self.state.write().await.record_post_commit_warnings(
+                commit_sequence,
+                trial_id,
+                &post_commit_warnings,
+            );
+        }
+        post_commit_warnings
     }
 
     /// Cancel a pending trial.
     pub async fn cancel(&self, trial_id: u64) -> Result<(), String> {
         let mut state = self.state.write().await;
+        state.expire_leases(unix_time_millis());
         if state.pending.remove(&trial_id).is_some() {
+            state.remove_ask_idempotency_for_trial(trial_id);
+            state.lease_deadlines.remove(&trial_id);
             state.record_cancelled(trial_id);
             Ok(())
         } else {
@@ -2020,7 +3249,30 @@ impl HolaEngine {
 
     /// Get the number of completed trials.
     pub async fn trial_count(&self) -> usize {
+        self.state.read().await.leaderboard.completed_count()
+    }
+
+    /// Get the number of completed trials currently retained in memory.
+    pub async fn retained_trial_count(&self) -> usize {
         self.state.read().await.leaderboard.len()
+    }
+
+    /// Number of unattended auto-checkpoint or rotation failures observed by
+    /// this engine process.
+    pub fn checkpoint_failure_count(&self) -> u64 {
+        self.checkpoint_failures.load(Ordering::Relaxed)
+    }
+
+    /// Number of failed unattended strategy refits observed by this process.
+    pub fn refit_failure_count(&self) -> u64 {
+        self.refit_failures.load(Ordering::Relaxed)
+    }
+
+    /// Number of issued trials still awaiting a result or cancellation.
+    pub async fn pending_count(&self) -> usize {
+        let mut state = self.state.write().await;
+        state.expire_leases(unix_time_millis());
+        state.pending.len()
     }
 
     /// Get trials on a specific Pareto front.
@@ -2075,6 +3327,11 @@ impl HolaEngine {
     /// `Study.load()` can fully restore a study without the user re-specifying
     /// the space and objectives.
     pub async fn study_config(&self) -> StudyConfig {
+        let state = self.state.read().await;
+        self.study_config_from_state(&state)
+    }
+
+    fn study_config_from_state(&self, state: &HolaEngineState) -> StudyConfig {
         let space: BTreeMap<String, ParamConfig> = self
             .space
             .dims
@@ -2086,15 +3343,13 @@ impl HolaEngine {
         // overrides sampling on resume; carrying the real budget here only fixes
         // the refit schedule, which `from_config` would otherwise re-anchor to a
         // default exploration budget when strategy is None.
-        let state = self.state.read().await;
-        let strategy = self.strategy_template.clone().map(|mut tmpl| {
+        let strategy = state.strategy_template.clone().map(|mut tmpl| {
             if let Some(budget) = state.strategy.exploration_budget() {
                 tmpl.exploration_budget = Some(budget);
             }
             tmpl
         });
         let objectives = state.objectives.clone();
-        drop(state);
         StudyConfig {
             space,
             objectives,
@@ -2115,6 +3370,7 @@ impl HolaEngine {
         let mut state = self.state.write().await;
         let objectives = state.objectives.clone();
         state.leaderboard.rescalarize(&objectives);
+        state.rescore_completion_receipts(&objectives);
     }
 
     /// Update objectives and re-scalarize (for mid-run dashboard adjustments).
@@ -2124,46 +3380,106 @@ impl HolaEngine {
     /// a refit is triggered immediately so the sampling distribution reflects
     /// the new objective weights.
     pub async fn update_objectives(&self, objectives: Vec<ObjectiveConfig>) -> Result<(), String> {
+        self.update_objectives_on_commit(objectives, |_, _| {})
+            .await
+    }
+
+    /// Update objectives and synchronously notify at the committed ranking
+    /// epoch before any asynchronous refit work can yield.
+    pub(crate) async fn update_objectives_on_commit<F>(
+        &self,
+        objectives: Vec<ObjectiveConfig>,
+        on_commit: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(usize, usize),
+    {
         validate_objectives(&objectives)?;
+
+        // Serialize the objective transition with every periodic refit before
+        // changing state. Otherwise an old-objective fit could finish and
+        // commit after the leaderboard had already been re-scalarized.
+        let _refit_guard = if self.refit_config.is_some() {
+            Some(self.refit_lock.lock().await)
+        } else {
+            None
+        };
 
         // Swap objectives and migrate the leaderboard atomically under one write
         // lock so no concurrent tell() observes a half-updated state (new
         // objectives but an un-migrated leaderboard, or vice versa).
-        let n_trials = {
+        let (completed_trials, retained_trials) = {
             let mut state = self.state.write().await;
             state.objectives = objectives.clone();
             state.leaderboard.migrate_for_objectives(&objectives);
-            state.leaderboard.len()
+            state.rescore_completion_receipts(&objectives);
+            (state.leaderboard.completed_count(), state.leaderboard.len())
         };
 
-        // Trigger an immediate refit so the strategy reflects the new scalarization.
-        // Wait for any in-flight refit (do not skip): this refit must run against
-        // the new objectives, and waiting guarantees its model is not clobbered.
-        if let Some(ref config) = self.refit_config
-            && n_trials >= config.min_trials
-        {
-            let _refit_guard = self.refit_lock.lock().await;
-            let state_guard = self.state.read().await;
-            let k = config.selection_count(n_trials);
-            let trials = state_guard.leaderboard.top_k_for_refit(k, &objectives);
-            let mut strategy_snapshot = state_guard.strategy.clone();
-            let space_clone = self.space.clone();
-            drop(state_guard);
+        // As with tell publication, keep the external ranking-epoch signal in
+        // the same cancellation-free synchronous boundary as the state commit.
+        on_commit(completed_trials, retained_trials);
+        drop(_refit_guard);
 
-            if let Ok(mut fitted) = tokio::task::spawn_blocking(move || {
-                use opt_engine::traits::RefittableStrategy;
-                strategy_snapshot.refit(&space_clone, &trials);
-                strategy_snapshot
-            })
-            .await
-            {
+        // Shield the committed transition's refit from caller cancellation.
+        // The task re-reads the latest objectives after acquiring the refit
+        // lock, so queued objective changes coalesce safely to the newest epoch.
+        let refit_engine = self.clone();
+        let refit_task = tokio::spawn(async move {
+            refit_engine.run_objective_update_refit().await;
+        });
+        if let Err(error) = refit_task.await {
+            self.refit_failures.fetch_add(1, Ordering::Relaxed);
+            eprintln!("[hola] Warning: objective-update maintenance task failed: {error}");
+        }
+        Ok(())
+    }
+
+    async fn run_objective_update_refit(&self) {
+        let Some(config) = &self.refit_config else {
+            return;
+        };
+        let _refit_guard = self.refit_lock.lock().await;
+        let state_guard = self.state.read().await;
+        let current_completed = state_guard.leaderboard.completed_count();
+        if current_completed < config.min_trials() {
+            return;
+        }
+        let k = config
+            .selection_count(current_completed)
+            .min(MAX_REFIT_SAMPLES);
+        let objectives = state_guard.objectives.clone();
+        let trials = state_guard.leaderboard.top_k_for_refit(k, &objectives);
+        let mut strategy_snapshot = state_guard.strategy.clone();
+        let space_clone = self.space.clone();
+        drop(state_guard);
+
+        let fitted_result = tokio::task::spawn_blocking(move || {
+            strategy_snapshot
+                .try_refit(&space_clone, &trials)
+                .map(|()| strategy_snapshot)
+        })
+        .await;
+        match fitted_result {
+            Ok(Ok(mut fitted)) => {
                 use opt_engine::traits::RefittableStrategy;
                 let mut guard = self.state.write().await;
                 fitted.reconcile_after_refit(&guard.strategy);
                 guard.strategy = fitted;
             }
+            Ok(Err(error)) => {
+                self.refit_failures.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[hola] Warning: objectives were updated but strategy refit failed: {error}"
+                );
+            }
+            Err(error) => {
+                self.refit_failures.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[hola] Warning: objectives were updated but strategy refit task failed: {error}"
+                );
+            }
         }
-        Ok(())
     }
 
     // =========================================================================
@@ -2189,20 +3505,17 @@ impl HolaEngine {
     ///
     /// This is used by CLI config `checkpoint.load_from`, which historically
     /// accepted leaderboard-only checkpoints. Full checkpoints preserve search
-    /// strategy state; leaderboard-only checkpoints preserve completed trials.
+    /// strategy and runtime state. Leaderboard-only checkpoints preserve
+    /// completed trials, invalidate unknown outstanding work, begin a fresh ID
+    /// epoch, and reconcile the configured strategy with imported history.
     pub async fn load_checkpoint_with_fallback(
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> std::io::Result<CheckpointLoadKind> {
-        let path = path.as_ref();
-        // Read capped and version-gate the envelope before inspecting it, then
-        // delegate to the matching loader (which reads and gates again on its
-        // own load path).
-        let bytes = read_checkpoint_capped(path)?;
-        check_format_version_bytes(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let raw: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let path = path.as_ref().to_path_buf();
+        let raw = tokio::task::spawn_blocking(move || read_checkpoint_document(&path))
+            .await
+            .map_err(|error| std::io::Error::other(format!("checkpoint task failed: {error}")))??;
 
         let has_strategy_state = raw
             .get("checkpoint")
@@ -2210,10 +3523,10 @@ impl HolaEngine {
             .get("strategy_state")
             .is_some();
         if has_strategy_state {
-            self.load_full_checkpoint(path).await?;
+            self.load_full_checkpoint_document(raw).await?;
             Ok(CheckpointLoadKind::Full)
         } else {
-            self.load_leaderboard_checkpoint(path).await?;
+            self.load_leaderboard_checkpoint_document(raw).await?;
             Ok(CheckpointLoadKind::Leaderboard)
         }
     }
@@ -2232,94 +3545,103 @@ impl HolaEngine {
     ) -> std::io::Result<()> {
         let state = self.state.read().await;
         let kind = state.leaderboard.observation_kind();
-        match &state.leaderboard {
-            DynLeaderboard::Scalar(lb) => {
-                let mut cp = LeaderboardCheckpoint::new(lb.clone(), description);
+        let leaderboard = match &state.leaderboard {
+            DynLeaderboard::Scalar(lb) => LeaderboardSnapshot::Scalar(lb.clone()),
+            DynLeaderboard::Vector(lb) => LeaderboardSnapshot::Vector(lb.clone()),
+        };
+        drop(state);
+        let path = path.as_ref().to_path_buf();
+        let description = description.map(str::to_owned);
+        tokio::task::spawn_blocking(move || match leaderboard {
+            LeaderboardSnapshot::Scalar(lb) => {
+                let mut cp = LeaderboardCheckpoint::new(lb, description.as_deref());
                 cp.observation_kind = kind;
                 cp.save_json(path)
             }
-            DynLeaderboard::Vector(lb) => {
-                let mut cp = LeaderboardCheckpoint::new(lb.clone(), description);
+            LeaderboardSnapshot::Vector(lb) => {
+                let mut cp = LeaderboardCheckpoint::new(lb, description.as_deref());
                 cp.observation_kind = kind;
                 cp.save_json(path)
             }
-        }
+        })
+        .await
+        .map_err(|error| std::io::Error::other(format!("checkpoint task failed: {error}")))?
     }
 
     /// Load a leaderboard-only checkpoint, replacing the current trial history.
     ///
-    /// The strategy is not restored; call with `refit()` afterward if using GMM.
+    /// The original runtime and sampler state are unavailable, so HOLA
+    /// invalidates outstanding jobs, begins a fresh trial-ID epoch, advances
+    /// sampling counters, and refits GMM state from the retained history.
     pub async fn load_leaderboard_checkpoint(
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> std::io::Result<()> {
-        // Read capped, version-gate, then parse from the bounded byte buffer so
-        // an oversized or wrong-version file is rejected before deserialization.
-        let bytes = read_checkpoint_capped(path.as_ref())?;
-        check_format_version_bytes(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let raw: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let path = path.as_ref().to_path_buf();
+        let raw = tokio::task::spawn_blocking(move || read_checkpoint_document(&path))
+            .await
+            .map_err(|error| std::io::Error::other(format!("checkpoint task failed: {error}")))??;
+        self.load_leaderboard_checkpoint_document(raw).await
+    }
 
+    async fn load_leaderboard_checkpoint_document(
+        &self,
+        raw: serde_json::Value,
+    ) -> std::io::Result<()> {
+        // Snapshot only the small pieces needed to prepare the replacement.
+        // Parsing, O(N) validation, and GMM fitting all run off the async worker
+        // pool and without holding the engine state lock.
+        let (objectives, strategy, config_snapshot) = {
+            let state = self.state.read().await;
+            (
+                state.objectives.clone(),
+                state.strategy.clone(),
+                self.study_config_from_state(&state),
+            )
+        };
+        let config_snapshot_json = serde_json::to_value(&config_snapshot)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let current_is_vector = count_priority_groups(&objectives) > 1;
+        let space = self.space.clone();
+        let max_leaderboard_size = self.max_leaderboard_size;
+        let (leaderboard, strategy, n) = tokio::task::spawn_blocking(move || {
+            let mut leaderboard = parse_leaderboard_checkpoint(raw, current_is_vector)?;
+            leaderboard
+                .validate_for_study(&space, &objectives)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+
+            let n = leaderboard.len();
+            leaderboard.set_max_size(max_leaderboard_size);
+            let completed_count = leaderboard.completed_count();
+            let trials =
+                leaderboard.top_k_for_refit(completed_count.min(MAX_REFIT_SAMPLES), &objectives);
+            let mut strategy = strategy;
+            strategy
+                .reconcile_imported_history(&space, completed_count, &trials)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            Ok::<_, std::io::Error>((leaderboard, strategy, n))
+        })
+        .await
+        .map_err(|error| std::io::Error::other(format!("checkpoint task failed: {error}")))??;
+
+        // The final swap is short and serialized with strategy installation. If
+        // a concurrent objective update or another load changed the study
+        // configuration while preparation ran, fail without mutating state.
+        let _refit_guard = self.refit_lock.lock().await;
         let mut state = self.state.write().await;
-        let current_is_vector = count_priority_groups(&state.objectives) > 1;
-
-        // Determine the stored observation topology. Honor the `observation_kind`
-        // tag when present so we deserialize the correct leaderboard type
-        // regardless of the engine's current objectives. Older checkpoints
-        // predate the tag; fall back to the current objective topology for them.
-        let stored_kind = match raw.get("observation_kind") {
-            Some(v) => Some(
-                serde_json::from_value::<ObservationKind>(v.clone())
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
-            ),
-            None => None,
-        };
-
-        if let Some(kind) = stored_kind {
-            let stored_is_vector = matches!(kind, ObservationKind::Vector);
-            if stored_is_vector != current_is_vector {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "leaderboard checkpoint observation_kind ({}) does not match the \
-                         current objective topology ({}); the checkpoint was saved with a \
-                         different number of priority groups. Load it into a study whose \
-                         objectives produce {} observations.",
-                        if stored_is_vector { "vector" } else { "scalar" },
-                        if current_is_vector {
-                            "vector"
-                        } else {
-                            "scalar"
-                        },
-                        if stored_is_vector { "vector" } else { "scalar" },
-                    ),
-                ));
-            }
+        let live_config_json = serde_json::to_value(self.study_config_from_state(&state))
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if live_config_json != config_snapshot_json {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "study configuration changed while preparing checkpoint load; retry the load",
+            ));
         }
-
-        // After the consistency check above, the stored topology equals the
-        // current one, so deserialize the matching leaderboard type.
-        let leaderboard = if current_is_vector {
-            let cp: LeaderboardCheckpoint<serde_json::Value, BTreeMap<String, f64>> =
-                serde_json::from_value(raw)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let n = cp.leaderboard.len();
-            eprintln!("[hola] Loaded leaderboard checkpoint with {n} trials");
-            DynLeaderboard::Vector(cp.leaderboard)
-        } else {
-            let cp: LeaderboardCheckpoint<serde_json::Value, f64> = serde_json::from_value(raw)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let n = cp.leaderboard.len();
-            eprintln!("[hola] Loaded leaderboard checkpoint with {n} trials");
-            DynLeaderboard::Scalar(cp.leaderboard)
-        };
-
+        state.strategy = strategy;
         state.leaderboard = leaderboard;
-        // The loaded board carries whatever cap (if any) it was saved with;
-        // re-apply the engine's configured cap so the bound stays consistent.
-        state.leaderboard.set_max_size(self.max_leaderboard_size);
         state.reset_transient_trial_state_after_load();
+        state.next_pending_id = state.next_pending_id.max(fresh_legacy_trial_id_floor());
+        eprintln!("[hola] Loaded leaderboard checkpoint with {n} trials");
         Ok(())
     }
 
@@ -2329,7 +3651,8 @@ impl HolaEngine {
     /// ```json
     /// {
     ///   "config": { ...StudyConfig... },
-    ///   "checkpoint": { "leaderboard": ..., "strategy_state": ..., "metadata": ... }
+    ///   "checkpoint": { "leaderboard": ..., "strategy_state": ..., "metadata": ... },
+    ///   "runtime_state": { "next_pending_id": ..., "pending": ..., "cancelled": ... }
     /// }
     /// ```
     ///
@@ -2340,58 +3663,93 @@ impl HolaEngine {
         path: impl AsRef<std::path::Path>,
         description: Option<&str>,
     ) -> std::io::Result<()> {
-        let config = self.study_config().await;
+        self.save_full_checkpoint_with_metadata(path, description)
+            .await
+            .map(|_| ())
+    }
+
+    /// Save a full checkpoint and return metadata from the exact snapshot that
+    /// was written. This avoids recounting live state after the write, when
+    /// concurrent tells may already have advanced the study.
+    pub async fn save_full_checkpoint_with_metadata(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        description: Option<&str>,
+    ) -> std::io::Result<SavedCheckpoint> {
+        let snapshot = self.checkpoint_snapshot(description).await;
+        Self::persist_checkpoint_snapshot(snapshot, path.as_ref().to_path_buf()).await
+    }
+
+    async fn checkpoint_snapshot(&self, description: Option<&str>) -> FullCheckpointSnapshot {
         let state = self.state.read().await;
-        let strategy = state.strategy.clone();
-        let checkpoint_json = match &state.leaderboard {
-            DynLeaderboard::Scalar(lb) => {
-                let checkpoint =
-                    opt_engine::persistence::Checkpoint::new(lb.clone(), strategy, description);
-                drop(state);
-                serde_json::to_value(&checkpoint)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
-            }
-            DynLeaderboard::Vector(lb) => {
-                let checkpoint =
-                    opt_engine::persistence::Checkpoint::new(lb.clone(), strategy, description);
-                drop(state);
-                serde_json::to_value(&checkpoint)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
-            }
+        let leaderboard = match &state.leaderboard {
+            DynLeaderboard::Scalar(lb) => LeaderboardSnapshot::Scalar(lb.clone()),
+            DynLeaderboard::Vector(lb) => LeaderboardSnapshot::Vector(lb.clone()),
         };
-
-        let wrapper = serde_json::json!({
-            "config": config,
-            "checkpoint": checkpoint_json,
-        });
-
-        let path = path.as_ref();
-        // Use a per-write-unique temp name so concurrent saves to the same target
-        // do not clobber each other, and remove the temp on every error path so a
-        // failed write never leaks a leftover temp.
-        let tmp = unique_temp_path(path);
-        let file = std::fs::File::create(&tmp)?;
-        let result = (|| {
-            let mut writer = std::io::BufWriter::new(file);
-            serde_json::to_writer_pretty(&mut writer, &wrapper)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let file = writer
-                .into_inner()
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-            file.sync_all()?;
-            std::fs::rename(&tmp, path)
-        })();
-        match result {
-            Ok(()) => {
-                // Make the rename durable by fsyncing the parent directory.
-                sync_parent_dir(path);
-                Ok(())
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(e)
-            }
+        FullCheckpointSnapshot {
+            config: self.study_config_from_state(&state),
+            leaderboard,
+            strategy: state.strategy.clone(),
+            runtime_state: state.runtime_checkpoint_state(),
+            description: description.map(str::to_owned),
+            n_trials: state.leaderboard.len(),
+            total_completed: state.leaderboard.completed_count(),
         }
+    }
+
+    async fn persist_checkpoint_snapshot(
+        snapshot: FullCheckpointSnapshot,
+        path: std::path::PathBuf,
+    ) -> std::io::Result<SavedCheckpoint> {
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let (checkpoint_json, created_at) = match snapshot.leaderboard {
+                LeaderboardSnapshot::Scalar(leaderboard) => {
+                    let checkpoint = Checkpoint::new(
+                        leaderboard,
+                        snapshot.strategy,
+                        snapshot.description.as_deref(),
+                    );
+                    let created_at = checkpoint.metadata.created_at;
+                    let value = serde_json::to_value(checkpoint)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    (value, created_at)
+                }
+                LeaderboardSnapshot::Vector(leaderboard) => {
+                    let checkpoint = Checkpoint::new(
+                        leaderboard,
+                        snapshot.strategy,
+                        snapshot.description.as_deref(),
+                    );
+                    let created_at = checkpoint.metadata.created_at;
+                    let value = serde_json::to_value(checkpoint)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    (value, created_at)
+                }
+            };
+
+            let wrapper = serde_json::json!({
+                "config": snapshot.config,
+                "checkpoint": checkpoint_json,
+                "runtime_state": snapshot.runtime_state,
+            });
+            atomic_write_json(&path, |writer| {
+                serde_json::to_writer_pretty(writer, &wrapper)
+            })?;
+
+            Ok(SavedCheckpoint {
+                n_trials: snapshot.n_trials,
+                created_at,
+            })
+        })
+        .await
+        .map_err(|error| std::io::Error::other(format!("checkpoint task failed: {error}")))?
     }
 
     /// Load a full checkpoint, restoring both leaderboard and strategy state.
@@ -2402,47 +3760,145 @@ impl HolaEngine {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> std::io::Result<()> {
-        // Read capped, version-gate, then parse from the bounded byte buffer so
-        // an oversized or wrong-version file is rejected before deserialization.
-        let bytes = read_checkpoint_capped(path.as_ref())?;
-        check_format_version_bytes(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let raw: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let path = path.as_ref().to_path_buf();
+        let raw = tokio::task::spawn_blocking(move || read_checkpoint_document(&path))
+            .await
+            .map_err(|error| std::io::Error::other(format!("checkpoint task failed: {error}")))??;
+        self.load_full_checkpoint_document(raw).await
+    }
 
-        // New format has "checkpoint" key; legacy format has "leaderboard" at root.
-        let checkpoint_json = if raw.get("checkpoint").is_some() {
-            raw.get("checkpoint").unwrap().clone()
-        } else {
-            raw
+    async fn load_full_checkpoint_document(&self, raw: serde_json::Value) -> std::io::Result<()> {
+        // Capture a small compatibility snapshot, then prepare the complete
+        // replacement off-lock. The final state swap remains the single
+        // linearization point without blocking asks/tells on O(N) parsing.
+        let (current_study_config, current_strategy_template) = {
+            let state = self.state.read().await;
+            (
+                self.study_config_from_state(&state),
+                state.strategy_template.clone(),
+            )
         };
-
-        let mut state = self.state.write().await;
-        if count_priority_groups(&state.objectives) > 1 {
-            let cp: opt_engine::persistence::Checkpoint<
-                serde_json::Value,
-                BTreeMap<String, f64>,
-                DynStrategy,
-            > = serde_json::from_value(checkpoint_json)
+        let current_study_config_json = serde_json::to_value(&current_study_config)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let has_embedded_config = raw.get("config").is_some();
+        let mut loaded_strategy_template = None;
+        if let Some(config_value) = raw.get("config") {
+            let mut saved_config: StudyConfig = serde_json::from_value(config_value.clone())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let n_loaded = cp.leaderboard.len();
-            state.leaderboard = DynLeaderboard::Vector(cp.leaderboard);
-            state.strategy = cp.strategy_state;
-            state.reset_transient_trial_state_after_load();
-            eprintln!("[hola] Loaded full checkpoint with {n_loaded} trials");
-        } else {
-            let cp: opt_engine::persistence::Checkpoint<serde_json::Value, f64, DynStrategy> =
-                serde_json::from_value(checkpoint_json)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let n_loaded = cp.leaderboard.len();
-            state.leaderboard = DynLeaderboard::Scalar(cp.leaderboard);
-            state.strategy = cp.strategy_state;
-            state.reset_transient_trial_state_after_load();
-            eprintln!("[hola] Loaded full checkpoint with {n_loaded} trials");
+            loaded_strategy_template = saved_config.strategy.clone();
+            let mut current_config = current_study_config.clone();
+            // A loaded strategy replaces its sampler state wholesale. Its seed
+            // therefore need not match the temporary target engine's seed—most
+            // importantly, two engines built from the same omitted-seed config
+            // resolve distinct random seeds before one loads the other. Keep
+            // validating strategy kind/refit settings and every study schema
+            // field, but normalize this non-compatibility field.
+            if let Some(strategy) = &mut saved_config.strategy {
+                strategy.seed = None;
+            }
+            if let Some(strategy) = &mut current_config.strategy {
+                strategy.seed = None;
+            }
+            let saved_value = serde_json::to_value(saved_config)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            let current_value = serde_json::to_value(current_config)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            if saved_value != current_value {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "checkpoint study configuration does not match the target engine",
+                ));
+            }
         }
-        // The loaded board carries whatever cap (if any) it was saved with;
-        // re-apply the engine's configured cap so the bound stays consistent.
-        state.leaderboard.set_max_size(self.max_leaderboard_size);
+
+        let vector = count_priority_groups(&current_study_config.objectives) > 1;
+        let objectives = current_study_config.objectives.clone();
+        let strategy_template = loaded_strategy_template.or(current_strategy_template);
+        let space = self.space.clone();
+        let max_leaderboard_size = self.max_leaderboard_size;
+        let (replacement, n_loaded) = tokio::task::spawn_blocking(move || {
+            let (loaded, runtime_state) = parse_full_checkpoint(raw, vector)?;
+            let (leaderboard, strategy, n_loaded) = match loaded {
+                LoadedFullCheckpoint::Scalar(checkpoint) => (
+                    DynLeaderboard::Scalar(checkpoint.leaderboard),
+                    checkpoint.strategy_state,
+                    checkpoint.metadata.n_trials,
+                ),
+                LoadedFullCheckpoint::Vector(checkpoint) => (
+                    DynLeaderboard::Vector(checkpoint.leaderboard),
+                    checkpoint.strategy_state,
+                    checkpoint.metadata.n_trials,
+                ),
+            };
+            let mut strategy_template = strategy_template;
+            let resolved_seed = strategy.resolved_seed();
+            let strategy_config = strategy_template.as_mut().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "target engine has no resolved strategy configuration",
+                )
+            })?;
+            // Older direct full checkpoints did not carry config metadata. Use
+            // the loaded sampler's real seed so subsequent exports never claim
+            // the discarded target engine's seed.
+            if !has_embedded_config || strategy_config.seed.is_none() {
+                strategy_config.seed = Some(resolved_seed);
+            }
+            let strategy_config = strategy_config.clone();
+            let mut replacement = HolaEngineState {
+                strategy,
+                strategy_template,
+                leaderboard,
+                objectives,
+                next_pending_id: 0,
+                pending: BTreeMap::new(),
+                cancelled: HashSet::new(),
+                ask_idempotency: BTreeMap::new(),
+                lease_deadlines: BTreeMap::new(),
+                completion_receipts: BTreeMap::new(),
+                completion_receipt_order: VecDeque::new(),
+            };
+            replacement.leaderboard.set_max_size(max_leaderboard_size);
+            replacement
+                .leaderboard
+                .validate_for_study(&space, &replacement.objectives)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            replacement
+                .restore_runtime_checkpoint_state(runtime_state, &space)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let completed_count = replacement.leaderboard.completed_count();
+            let minimum_issued_count = completed_count
+                .saturating_add(replacement.pending.len())
+                .saturating_add(replacement.cancelled.len());
+            replacement
+                .strategy
+                .validate_for_study(
+                    &strategy_config,
+                    &space,
+                    completed_count,
+                    minimum_issued_count,
+                )
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            Ok::<_, std::io::Error>((replacement, n_loaded))
+        })
+        .await
+        .map_err(|error| std::io::Error::other(format!("checkpoint task failed: {error}")))??;
+
+        // Serialize only the short swap with refit installation. A concurrent
+        // configuration transition makes this prepared replacement stale, so
+        // reject it atomically and ask the caller to retry.
+        let _refit_guard = self.refit_lock.lock().await;
+        let mut state = self.state.write().await;
+        let live_config_json = serde_json::to_value(self.study_config_from_state(&state))
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if live_config_json != current_study_config_json {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "study configuration changed while preparing checkpoint load; retry the load",
+            ));
+        }
+        *state = replacement;
+        eprintln!("[hola] Loaded full checkpoint with {n_loaded} trials");
         Ok(())
     }
 
@@ -2453,13 +3909,11 @@ impl HolaEngine {
     /// the `"config"` key. Returns an error if the config is missing (i.e.,
     /// the file was saved with an older version of HOLA).
     pub async fn load_from_checkpoint(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
-        // Read capped and version-gate the file before extracting the embedded
-        // config, mirroring the gating on the data load path below.
-        let bytes = read_checkpoint_capped(path.as_ref())
-            .map_err(|e| format!("Failed to read checkpoint file: {e}"))?;
-        check_format_version_bytes(&bytes)?;
-        let raw: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("Failed to parse checkpoint JSON: {e}"))?;
+        let path = path.as_ref().to_path_buf();
+        let raw = tokio::task::spawn_blocking(move || read_checkpoint_document(&path))
+            .await
+            .map_err(|error| format!("Checkpoint task failed: {error}"))?
+            .map_err(|error| format!("Failed to read checkpoint file: {error}"))?;
 
         let config_value = raw.get("config").ok_or_else(|| {
             "Checkpoint file does not contain a 'config' key. \
@@ -2474,53 +3928,123 @@ impl HolaEngine {
 
         let engine = Self::from_config(config)?;
         engine
-            .load_full_checkpoint(path)
+            .load_full_checkpoint_document(raw)
             .await
             .map_err(|e| format!("Failed to load checkpoint data: {e}"))?;
         Ok(engine)
     }
 
     /// Delete oldest checkpoint files to keep at most `max` files.
-    fn rotate_checkpoints(directory: &std::path::Path, prefix: &str, max: usize) {
+    fn rotate_checkpoints(directory: &std::path::Path, prefix: &str, max: usize) -> usize {
         let pattern = format!("{prefix}_");
-        // Pair each candidate with its modified-time so we can order by age. A
-        // lexicographic sort on the filenames mis-orders at the digit-count
-        // boundary (e.g. "checkpoint_999999" sorts after "checkpoint_1000000"),
-        // which would delete the newest file instead of the oldest. mtime is
-        // unaffected by the zero-padding width changing.
-        let mut checkpoints: Vec<(std::time::SystemTime, std::path::PathBuf)> =
-            std::fs::read_dir(directory)
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.extension().is_some_and(|ext| ext == "json")
-                        && p.file_name()
-                            .and_then(|f| f.to_str())
-                            .is_some_and(|f| f.starts_with(&pattern))
-                })
-                .map(|p| {
-                    let mtime = p
-                        .metadata()
-                        .and_then(|m| m.modified())
-                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    (mtime, p)
-                })
-                .collect();
+        // Parse the numeric snapshot count rather than relying on lexical names
+        // or mutable filesystem timestamps. This remains correctly ordered when
+        // the counter grows beyond the six-digit zero-padding width.
+        let mut checkpoints: Vec<(usize, std::path::PathBuf)> = std::fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter_map(|p| {
+                if p.extension().is_none_or(|ext| ext != "json") {
+                    return None;
+                }
+                p.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|stem| stem.strip_prefix(&pattern))
+                    .and_then(|suffix| suffix.parse::<usize>().ok())
+                    .map(|sequence| (sequence, p))
+            })
+            .collect();
 
         if checkpoints.len() <= max {
-            return;
+            return 0;
         }
 
         // Oldest first, so the leading `to_delete` entries are the ones to evict.
-        checkpoints.sort_by_key(|(mtime, _)| *mtime);
+        checkpoints.sort_by_key(|(sequence, _)| *sequence);
         let to_delete = checkpoints.len() - max;
+        let mut failures = 0;
         for (_, path) in checkpoints.into_iter().take(to_delete) {
             if let Err(e) = std::fs::remove_file(&path) {
+                failures += 1;
                 eprintln!("[hola] Warning: failed to delete old checkpoint {path:?}: {e}");
             }
         }
+        failures
+    }
+}
+
+fn read_checkpoint_document(path: &std::path::Path) -> std::io::Result<serde_json::Value> {
+    let bytes = read_checkpoint_capped(path)?;
+    check_format_version_bytes(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn parse_full_checkpoint(
+    raw: serde_json::Value,
+    vector: bool,
+) -> std::io::Result<(LoadedFullCheckpoint, Option<RuntimeCheckpointState>)> {
+    let runtime_state = raw
+        .get("runtime_state")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let checkpoint_json = raw.get("checkpoint").cloned().unwrap_or(raw);
+    let checkpoint = if vector {
+        LoadedFullCheckpoint::Vector(
+            serde_json::from_value(checkpoint_json)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+        )
+    } else {
+        LoadedFullCheckpoint::Scalar(
+            serde_json::from_value(checkpoint_json)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+        )
+    };
+    Ok((checkpoint, runtime_state))
+}
+
+fn parse_leaderboard_checkpoint(
+    raw: serde_json::Value,
+    current_is_vector: bool,
+) -> std::io::Result<DynLeaderboard> {
+    let stored_kind = raw
+        .get("observation_kind")
+        .cloned()
+        .map(serde_json::from_value::<ObservationKind>)
+        .transpose()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if let Some(kind) = stored_kind {
+        let stored_is_vector = matches!(kind, ObservationKind::Vector);
+        if stored_is_vector != current_is_vector {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "leaderboard checkpoint observation_kind ({}) does not match the current objective topology ({})",
+                    if stored_is_vector { "vector" } else { "scalar" },
+                    if current_is_vector {
+                        "vector"
+                    } else {
+                        "scalar"
+                    },
+                ),
+            ));
+        }
+    }
+
+    if current_is_vector {
+        let checkpoint: LeaderboardCheckpoint<serde_json::Value, BTreeMap<String, f64>> =
+            serde_json::from_value(raw)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(DynLeaderboard::Vector(checkpoint.leaderboard))
+    } else {
+        let checkpoint: LeaderboardCheckpoint<serde_json::Value, f64> = serde_json::from_value(raw)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(DynLeaderboard::Scalar(checkpoint.leaderboard))
     }
 }
 
@@ -2532,7 +4056,7 @@ impl HolaEngine {
 fn scalarize_raw(raw: &serde_json::Value, objectives: &[ObjectiveConfig]) -> f64 {
     let mut total = 0.0;
     for obj in objectives {
-        let val = match raw.get(&obj.field).and_then(|v| v.as_f64()) {
+        let val = match raw_metric_f64(raw, &obj.field) {
             Some(v) => v,
             None => return f64::INFINITY,
         };
@@ -2554,7 +4078,7 @@ fn scalarize_raw(raw: &serde_json::Value, objectives: &[ObjectiveConfig]) -> f64
 fn vectorize_raw(raw: &serde_json::Value, objectives: &[ObjectiveConfig]) -> BTreeMap<String, f64> {
     let mut groups: BTreeMap<String, f64> = BTreeMap::new();
     for obj in objectives {
-        let val = match raw.get(&obj.field).and_then(|v| v.as_f64()) {
+        let val = match raw_metric_f64(raw, &obj.field) {
             Some(v) => v,
             None => {
                 groups.insert(group_key(obj), f64::INFINITY);
@@ -2656,6 +4180,192 @@ mod tests {
         let raw_perfect = serde_json::json!({"loss": 0.0});
         let score_perfect = scalarize_raw(&raw_perfect, &objectives);
         assert!((score_perfect).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_scalar_score_vector_uses_the_priority_group_name() {
+        let one = vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: Some("quality".to_string()),
+        }];
+        assert_eq!(
+            compute_score_vector(&serde_json::json!({"loss": 2.0}), &one),
+            serde_json::json!({"quality": 2.0})
+        );
+
+        let shared = vec![
+            one[0].clone(),
+            ObjectiveConfig {
+                field: "calibration".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: Some("quality".to_string()),
+            },
+        ];
+        assert_eq!(
+            compute_score_vector(
+                &serde_json::json!({"loss": 2.0, "calibration": 3.0}),
+                &shared,
+            ),
+            serde_json::json!({"quality": 5.0})
+        );
+    }
+
+    #[test]
+    fn test_public_score_json_preserves_all_non_finite_values() {
+        assert_eq!(f64_to_json(f64::INFINITY), serde_json::json!("inf"));
+        assert_eq!(f64_to_json(f64::NEG_INFINITY), serde_json::json!("-inf"));
+        assert_eq!(f64_to_json(f64::NAN), serde_json::json!("nan"));
+        assert_eq!(f64_to_json(1.25), serde_json::json!(1.25));
+
+        let observation = BTreeMap::from([
+            ("finite".to_string(), 1.25),
+            ("nan".to_string(), f64::NAN),
+            ("negative".to_string(), f64::NEG_INFINITY),
+            ("positive".to_string(), f64::INFINITY),
+        ]);
+        assert_eq!(
+            f64_map_to_json(&observation),
+            serde_json::json!({
+                "finite": 1.25,
+                "nan": "nan",
+                "negative": "-inf",
+                "positive": "inf",
+            })
+        );
+
+        // Finite inputs and weights can overflow in either direction. When
+        // opposite infinities share one group, their aggregate is NaN. Every
+        // public scoring helper must preserve those three distinct outcomes.
+        let objectives = vec![
+            ObjectiveConfig {
+                field: "positive".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: f64::MAX,
+                group: Some("combined".to_string()),
+            },
+            ObjectiveConfig {
+                field: "negative".to_string(),
+                obj_type: "maximize".to_string(),
+                target: None,
+                limit: None,
+                priority: f64::MAX,
+                group: Some("combined".to_string()),
+            },
+        ];
+        let raw = serde_json::json!({"positive": f64::MAX, "negative": f64::MAX});
+        assert_eq!(
+            compute_scores(&raw, &objectives),
+            serde_json::json!({"positive": "inf", "negative": "-inf"})
+        );
+        assert_eq!(
+            compute_score_vector(&raw, &objectives),
+            serde_json::json!({"combined": "nan"})
+        );
+
+        // Strict JSON transports (including the Python binding) use string
+        // sentinels for non-finite raw metrics. Decode them before objective
+        // direction/scalarization instead of treating them as missing fields.
+        let sentinel_objectives = vec![
+            ObjectiveConfig {
+                field: "min_loss".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: Some("min".to_string()),
+            },
+            ObjectiveConfig {
+                field: "max_reward".to_string(),
+                obj_type: "maximize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: Some("max".to_string()),
+            },
+            ObjectiveConfig {
+                field: "unstable".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: Some("nan".to_string()),
+            },
+        ];
+        let sentinel_raw = serde_json::json!({
+            "min_loss": "-inf",
+            "max_reward": "inf",
+            "unstable": "nan",
+        });
+        assert_eq!(
+            compute_scores(&sentinel_raw, &sentinel_objectives),
+            serde_json::json!({
+                "min_loss": "-inf",
+                "max_reward": "-inf",
+                "unstable": "nan",
+            })
+        );
+        assert_eq!(
+            compute_score_vector(&sentinel_raw, &sentinel_objectives),
+            serde_json::json!({"max": "-inf", "min": "-inf", "nan": "nan"})
+        );
+    }
+
+    #[test]
+    fn test_scalar_single_trial_rank_matches_full_total_order() {
+        let objectives = vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }];
+        let mut leaderboard = Leaderboard::<serde_json::Value, f64>::new();
+
+        // Put NaN first so a partial_cmp(None) -> Equal implementation would
+        // incorrectly rank it ahead of every later value by trial ID.
+        for (trial_id, observation) in [
+            (0, f64::NAN),
+            (1, f64::INFINITY),
+            (2, 2.0),
+            (3, f64::NEG_INFINITY),
+            (4, -1.0),
+        ] {
+            leaderboard.push_with_raw_trial_id(
+                serde_json::json!({"x": trial_id}),
+                observation,
+                serde_json::json!({"loss": trial_id}),
+                trial_id,
+            );
+        }
+
+        let leaderboard = DynLeaderboard::Scalar(leaderboard);
+        let full = leaderboard.completed_trials("rank", true, &objectives);
+        assert_eq!(
+            full.iter().map(|trial| trial.trial_id).collect::<Vec<_>>(),
+            vec![4, 2, 3, 1, 0],
+            "canonical order is finite numeric values, infinities, then NaN"
+        );
+
+        for expected in full {
+            let single = leaderboard
+                .get_completed(expected.trial_id, true, &objectives)
+                .expect("every stored trial must have a single-trial view");
+            assert_eq!(
+                single.rank, expected.rank,
+                "single-trial and full-board ranks diverged for trial {}",
+                expected.trial_id
+            );
+        }
     }
 
     #[test]
@@ -2786,6 +4496,93 @@ mod tests {
         // Log spans are ln(max) - ln(min), finite for any finite positive
         // bounds, so a positive-bounded log param stays accepted.
         assert!(validate_space_config(&study(1e-6, 1e6, "log").space).is_ok());
+
+        // Fixed dimensions are intentional constants and map to the unit-cube
+        // midpoint rather than dividing by a zero span.
+        assert!(validate_space_config(&study(0.5, 0.5, "linear").space).is_ok());
+    }
+
+    #[test]
+    fn test_validate_space_rejects_duplicate_categories_and_inexact_integer_range() {
+        let duplicate = BTreeMap::from([(
+            "optimizer".to_string(),
+            ParamConfig::Categorical {
+                choices: vec!["adam".into(), "sgd".into(), "adam".into()],
+            },
+        )]);
+        let error = validate_space_config(&duplicate).unwrap_err();
+        assert!(error.contains("optimizer"));
+        assert!(error.contains("duplicate choice 'adam'"));
+
+        let too_wide = BTreeMap::from([(
+            "integer".to_string(),
+            ParamConfig::Integer {
+                min: 0,
+                max: 1i64 << 52,
+            },
+        )]);
+        let error = validate_space_config(&too_wide).unwrap_err();
+        assert!(error.contains("integer"));
+        assert!(error.contains("exact unit-cube mapping limit"));
+    }
+
+    #[test]
+    fn test_validate_objectives_rejects_incomplete_and_duplicate_contracts() {
+        let objective = |field: &str, target, limit| ObjectiveConfig {
+            field: field.to_string(),
+            obj_type: "minimize".to_string(),
+            target,
+            limit,
+            priority: 1.0,
+            group: None,
+        };
+
+        let incomplete = [objective("loss", Some(0.0), None)];
+        let error = validate_objectives(&incomplete).unwrap_err();
+        assert!(error.contains("target and limit must either both be set"));
+
+        let duplicate = [objective("loss", None, None), objective("loss", None, None)];
+        let error = validate_objectives(&duplicate).unwrap_err();
+        assert!(error.contains("configured more than once"));
+    }
+
+    #[test]
+    fn test_config_deserialization_rejects_unknown_fields() {
+        let param = serde_json::json!({
+            "type": "real",
+            "min": 0.0,
+            "max": 1.0,
+            "typo_scale": "log10"
+        });
+        assert!(serde_json::from_value::<ParamConfig>(param).is_err());
+
+        let objective = serde_json::json!({
+            "field": "loss",
+            "type": "minimize",
+            "prioirty": 1.0
+        });
+        assert!(serde_json::from_value::<ObjectiveConfig>(objective).is_err());
+
+        let strategy = serde_json::json!({
+            "type": "gmm",
+            "refit_interval": 10,
+            "elite_fracton": 0.25
+        });
+        assert!(serde_json::from_value::<StrategyConfig>(strategy).is_err());
+
+        let checkpoint = serde_json::json!({
+            "directory": ".",
+            "interval": 10,
+            "max_checkpoint": 3
+        });
+        assert!(serde_json::from_value::<CheckpointConfig>(checkpoint).is_err());
+
+        let study = serde_json::json!({
+            "space": {"x": {"type": "real", "min": 0.0, "max": 1.0}},
+            "objectives": [{"field": "loss", "type": "minimize"}],
+            "max_trial": 10
+        });
+        assert!(serde_json::from_value::<StudyConfig>(study).is_err());
     }
 
     #[test]
@@ -3002,7 +4799,9 @@ mod tests {
             inner: DynStrategyInner::Auto(AutoStrategy::new(1, 4, Some(7))),
         };
         if let DynStrategyInner::Auto(a) = &mut live.inner {
-            a.gmm.set_params(GmmParams::uniform_prior(1, 0.1));
+            a.gmm
+                .set_params(GmmParams::uniform_prior(1, 0.1).unwrap())
+                .unwrap();
             a.trial_count = 9;
             a.issued_count.store(12, Ordering::Relaxed);
         }
@@ -3012,12 +4811,12 @@ mod tests {
         let two_cluster_samples: Vec<Vec<f64>> = (0..50)
             .map(|i| vec![if i < 25 { 0.2 } else { 0.8 }])
             .collect();
-        let fitted_model = GmmParams::fit(&two_cluster_samples, 2, 100, 1e-6, 1e-4, 1);
+        let fitted_model = GmmParams::fit(&two_cluster_samples, 2, 100, 1e-6, 1e-4, 1).unwrap();
         assert_eq!(fitted_model.n_components(), 2);
 
         let mut fitted = live.clone();
         if let DynStrategyInner::Auto(a) = &mut fitted.inner {
-            a.gmm.set_params(fitted_model);
+            a.gmm.set_params(fitted_model).unwrap();
             a.trial_count = 5;
             a.issued_count.store(5, Ordering::Relaxed);
         }
@@ -3046,6 +4845,23 @@ mod tests {
         };
         assert_ne!(live_sobol_index, fitted_sobol_index);
 
+        // Exploitation suggestions advance a separate GMM seed counter. It is
+        // just as important as the Sobol index: rewinding it would repeat a
+        // previously issued candidate after the refit commits.
+        let live_gmm_counter = if let DynStrategyInner::Auto(a) = &live.inner {
+            a.gmm.suggest(&space);
+            a.gmm.suggest(&space);
+            serde_json::to_value(&a.gmm).unwrap()["counter"].clone()
+        } else {
+            panic!("expected Auto strategy");
+        };
+        let fitted_gmm_counter = if let DynStrategyInner::Auto(a) = &fitted.inner {
+            serde_json::to_value(&a.gmm).unwrap()["counter"].clone()
+        } else {
+            panic!("expected Auto strategy");
+        };
+        assert_ne!(live_gmm_counter, fitted_gmm_counter);
+
         fitted.reconcile_after_refit(&live);
 
         match &fitted.inner {
@@ -3058,9 +4874,12 @@ mod tests {
                 let reconciled_sobol_index =
                     serde_json::to_value(&a.sobol).unwrap()["index"].clone();
                 assert_eq!(reconciled_sobol_index, live_sobol_index);
+                let reconciled_gmm_counter =
+                    serde_json::to_value(&a.gmm).unwrap()["counter"].clone();
+                assert_eq!(reconciled_gmm_counter, live_gmm_counter);
                 // The freshly fitted GMM model is kept (two components, not the
                 // single-component prior that `live` still held).
-                assert_eq!(a.gmm.params().n_components(), 2);
+                assert_eq!(a.gmm.params().unwrap().n_components(), 2);
             }
             _ => panic!("expected Auto strategy"),
         }
@@ -3177,6 +4996,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_auto_generated_seed_is_exported_and_reproducible() {
+        let mut config = single_objective_config("random");
+        config.strategy.as_mut().unwrap().seed = None;
+        let engine = HolaEngine::from_config(config).unwrap();
+
+        let exported = engine.study_config().await;
+        let resolved_seed = exported
+            .strategy
+            .as_ref()
+            .and_then(|strategy| strategy.seed);
+        assert!(resolved_seed.is_some(), "resolved seed must be exported");
+
+        let reproduced = HolaEngine::from_config(exported).unwrap();
+        let original_trial = engine.ask().await.unwrap();
+        let reproduced_trial = reproduced.ask().await.unwrap();
+        assert_eq!(original_trial.params, reproduced_trial.params);
+    }
+
+    #[tokio::test]
+    async fn test_full_load_adopts_the_loaded_strategy_seed_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.json");
+        let resaved_path = dir.path().join("resaved.json");
+
+        let mut source_config = single_objective_config("random");
+        source_config.strategy.as_mut().unwrap().seed = Some(11);
+        let source = HolaEngine::from_config(source_config).unwrap();
+        source
+            .save_full_checkpoint(&source_path, None)
+            .await
+            .unwrap();
+
+        let mut target_config = single_objective_config("random");
+        target_config.strategy.as_mut().unwrap().seed = Some(22);
+        let target = HolaEngine::from_config(target_config).unwrap();
+        target.load_full_checkpoint(&source_path).await.unwrap();
+
+        assert_eq!(
+            target
+                .study_config()
+                .await
+                .strategy
+                .and_then(|strategy| strategy.seed),
+            Some(11),
+            "metadata must describe the loaded sampler, not the discarded target seed"
+        );
+        assert_eq!(
+            source.ask().await.unwrap().params,
+            target.ask().await.unwrap().params
+        );
+
+        target
+            .save_full_checkpoint(&resaved_path, None)
+            .await
+            .unwrap();
+        let resaved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(resaved_path).unwrap()).unwrap();
+        assert_eq!(resaved["config"]["strategy"]["seed"], 11);
+
+        // Legacy direct full checkpoints have no embedded config. The loaded
+        // sampler is still authoritative; re-export metadata must not retain
+        // the temporary target engine's seed.
+        let mut direct: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&source_path).unwrap()).unwrap();
+        direct.as_object_mut().unwrap().remove("config");
+        let mut direct_target_config = single_objective_config("random");
+        direct_target_config.strategy.as_mut().unwrap().seed = Some(22);
+        let direct_target = HolaEngine::from_config(direct_target_config).unwrap();
+        direct_target
+            .load_full_checkpoint_document(direct)
+            .await
+            .unwrap();
+        assert_eq!(
+            direct_target
+                .study_config()
+                .await
+                .strategy
+                .and_then(|strategy| strategy.seed),
+            Some(11)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_objective_update_rescores_retry_receipts_and_remains_loadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updated-objectives.json");
+        let engine = HolaEngine::from_config(single_objective_config("random")).unwrap();
+        let trial = engine.ask().await.unwrap();
+        let metrics = serde_json::json!({"loss": 0.4, "accuracy": 0.9});
+        engine.tell(trial.trial_id, metrics.clone()).await.unwrap();
+        let better = engine.ask().await.unwrap();
+        engine
+            .tell(
+                better.trial_id,
+                serde_json::json!({"loss": 0.5, "accuracy": 0.95}),
+            )
+            .await
+            .unwrap();
+
+        engine
+            .update_objectives(vec![ObjectiveConfig {
+                field: "accuracy".to_string(),
+                obj_type: "maximize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: Some("quality".to_string()),
+            }])
+            .await
+            .unwrap();
+        let retry = engine
+            .tell_with_outcome(trial.trial_id, metrics.clone())
+            .await
+            .unwrap();
+        assert!(!retry.newly_committed);
+        assert_eq!(retry.trial_count, 2);
+        assert_eq!(retry.completed.rank, 1);
+        assert_eq!(
+            retry.completed.score_vector,
+            serde_json::json!({"quality": -0.9})
+        );
+
+        engine.save_full_checkpoint(&path, None).await.unwrap();
+        let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+        let retry_after_restore = restored
+            .tell_with_outcome(trial.trial_id, metrics)
+            .await
+            .unwrap();
+        assert!(!retry_after_restore.newly_committed);
+        assert_eq!(
+            retry_after_restore.completed.score_vector,
+            retry.completed.score_vector
+        );
+    }
+
+    #[tokio::test]
     async fn test_concurrent_tells_and_update_objectives_consistent() {
         // Objectives + leaderboard live behind one lock, so concurrent
         // tell()s racing an update_objectives must never panic, deadlock, lose a
@@ -3194,9 +5149,11 @@ mod tests {
         );
 
         let n = 80usize;
+        let start = Arc::new(tokio::sync::Barrier::new(n + 2));
         let mut handles = Vec::new();
         for i in 0..n {
             let eng = engine.clone();
+            let start = Arc::clone(&start);
             handles.push(tokio::spawn(async move {
                 let trial = eng.ask().await.expect("ask should succeed");
                 // Provide both metric fields so the post-migration vector
@@ -3205,6 +5162,7 @@ mod tests {
                     "loss": (i as f64) / (n as f64),
                     "latency": (n - i) as f64,
                 });
+                start.wait().await;
                 eng.tell(trial.trial_id, metrics)
                     .await
                     .expect("tell should succeed");
@@ -3217,6 +5175,7 @@ mod tests {
         // concurrently with the in-flight tells.
         let updater = {
             let eng = engine.clone();
+            let start = Arc::clone(&start);
             tokio::spawn(async move {
                 let new_objectives = vec![
                     ObjectiveConfig {
@@ -3236,11 +5195,16 @@ mod tests {
                         group: Some("speed".to_string()),
                     },
                 ];
+                start.wait().await;
                 eng.update_objectives(new_objectives)
                     .await
                     .expect("update_objectives should succeed");
             })
         };
+
+        // Release every tell and the topology migration from the same barrier,
+        // forcing real lock contention instead of relying on scheduler timing.
+        start.wait().await;
 
         for h in handles {
             h.await.expect("tell task must not panic or deadlock");
@@ -3364,6 +5328,724 @@ mod tests {
             "resumed strategy must propose the same candidate as an uninterrupted \
              seeded run; a mismatch means strategy state was not truly restored"
         );
+    }
+
+    #[tokio::test]
+    async fn test_full_checkpoint_roundtrip_preserves_infeasible_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("infeasible.json");
+        let mut config = single_objective_config("random");
+        config.objectives[0].target = Some(0.0);
+        config.objectives[0].limit = Some(1.0);
+
+        let engine = HolaEngine::from_config(config).unwrap();
+        let trial = engine.ask().await.unwrap();
+        engine
+            .tell(trial.trial_id, serde_json::json!({ "loss": 2.0 }))
+            .await
+            .unwrap();
+
+        engine.save_full_checkpoint(&path, None).await.unwrap();
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(json.contains("$hola.float"));
+        assert!(!json.contains("\"observation\": null"));
+
+        let resumed = HolaEngine::load_from_checkpoint(&path)
+            .await
+            .expect("a checkpoint containing an infeasible trial must remain loadable");
+        assert_eq!(resumed.trial_count().await, 1);
+        let restored = resumed
+            .completed_trial(trial.trial_id, true)
+            .await
+            .expect("the infeasible trial must survive the round trip");
+        assert_eq!(restored.trial_id, trial.trial_id);
+    }
+
+    #[tokio::test]
+    async fn full_checkpoint_roundtrip_accepts_canonicalized_scalar_and_vector_nan() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let scalar = HolaEngine::from_config(single_objective_config("random")).unwrap();
+        let scalar_trial = scalar.ask().await.unwrap();
+        scalar
+            .tell(scalar_trial.trial_id, serde_json::json!({"loss": "nan"}))
+            .await
+            .unwrap();
+        let scalar_path = dir.path().join("scalar-nan.json");
+        scalar
+            .save_full_checkpoint(&scalar_path, None)
+            .await
+            .unwrap();
+        let restored_scalar = HolaEngine::load_from_checkpoint(&scalar_path)
+            .await
+            .expect("canonicalized scalar NaN must remain loadable");
+        assert_eq!(restored_scalar.trial_count().await, 1);
+
+        let mut vector_config = single_objective_config("random");
+        vector_config.objectives[0].group = Some("quality".to_string());
+        vector_config.objectives.push(ObjectiveConfig {
+            field: "latency".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: Some("speed".to_string()),
+        });
+        let vector = HolaEngine::from_config(vector_config).unwrap();
+        let vector_trial = vector.ask().await.unwrap();
+        vector
+            .tell(
+                vector_trial.trial_id,
+                serde_json::json!({"loss": "nan", "latency": 1.0}),
+            )
+            .await
+            .unwrap();
+        let vector_path = dir.path().join("vector-nan.json");
+        vector
+            .save_full_checkpoint(&vector_path, None)
+            .await
+            .unwrap();
+        let restored_vector = HolaEngine::load_from_checkpoint(&vector_path)
+            .await
+            .expect("canonicalized vector NaN must remain loadable");
+        assert_eq!(restored_vector.trial_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_full_checkpoint_roundtrip_preserves_pending_jobs_and_id_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.json");
+        let engine = HolaEngine::from_config(single_objective_config("sobol")).unwrap();
+
+        let completed = engine.ask().await.unwrap();
+        engine
+            .tell(completed.trial_id, serde_json::json!({ "loss": 0.5 }))
+            .await
+            .unwrap();
+        let pending = engine.ask().await.unwrap();
+        engine.save_full_checkpoint(&path, None).await.unwrap();
+
+        let resumed = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+        let restored = resumed
+            .tell(pending.trial_id, serde_json::json!({ "loss": 0.25 }))
+            .await
+            .expect("a late worker result must match the pending job saved before restart");
+        assert_eq!(restored.trial_id, pending.trial_id);
+        let restored_x = restored.params["x"].as_f64().unwrap();
+        let pending_x = pending.params["x"].as_f64().unwrap();
+        assert!((restored_x - pending_x).abs() <= f64::EPSILON);
+
+        let next = resumed.ask().await.unwrap();
+        assert!(
+            next.trial_id > pending.trial_id,
+            "resumed ID allocation must not reuse a persisted pending ID"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_full_checkpoint_rejects_incompatible_engine_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("configured.json");
+        let source = HolaEngine::from_config(single_objective_config("random")).unwrap();
+        let trial = source.ask().await.unwrap();
+        source
+            .tell(trial.trial_id, serde_json::json!({ "loss": 0.5 }))
+            .await
+            .unwrap();
+        source.save_full_checkpoint(&path, None).await.unwrap();
+
+        let mut incompatible = single_objective_config("random");
+        incompatible.space.insert(
+            "y".to_string(),
+            ParamConfig::Real {
+                min: -1.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        );
+        let target = HolaEngine::from_config(incompatible).unwrap();
+        let error = target.load_full_checkpoint(&path).await.unwrap_err();
+        assert!(error.to_string().contains("does not match"));
+        assert_eq!(target.trial_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_load_rejects_forged_completed_state_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let full_path = dir.path().join("full.json");
+        let leaderboard_path = dir.path().join("leaderboard.json");
+        let source = HolaEngine::from_config(single_objective_config("random")).unwrap();
+        let trial = source.ask().await.unwrap();
+        source
+            .tell(trial.trial_id, serde_json::json!({"loss": 0.5}))
+            .await
+            .unwrap();
+        source.save_full_checkpoint(&full_path, None).await.unwrap();
+        source
+            .save_leaderboard_checkpoint_to(&leaderboard_path, None)
+            .await
+            .unwrap();
+
+        let target = HolaEngine::from_config(single_objective_config("random")).unwrap();
+        let retained = target.ask().await.unwrap();
+        target
+            .tell(retained.trial_id, serde_json::json!({"loss": 0.25}))
+            .await
+            .unwrap();
+
+        let mut forged_candidate: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&full_path).unwrap()).unwrap();
+        forged_candidate["checkpoint"]["leaderboard"]["trials"][0]["candidate"]["unexpected"] =
+            serde_json::json!(true);
+        let error = target
+            .load_full_checkpoint_document(forged_candidate)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("configured space"));
+        assert_eq!(target.trial_count().await, 1);
+        assert_eq!(target.top_k(1, true).await[0].metrics["loss"], 0.25);
+
+        let mut forged_observation: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&full_path).unwrap()).unwrap();
+        forged_observation["checkpoint"]["leaderboard"]["trials"][0]["observation"] =
+            serde_json::json!(999.0);
+        let error = target
+            .load_full_checkpoint_document(forged_observation)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("conflicts with its raw metrics"));
+        assert_eq!(target.trial_count().await, 1);
+
+        let mut forged_leaderboard: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&leaderboard_path).unwrap()).unwrap();
+        forged_leaderboard["leaderboard"]["trials"][0]["candidate"]["unexpected"] =
+            serde_json::json!(true);
+        let error = target
+            .load_leaderboard_checkpoint_document(forged_leaderboard)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("configured space"));
+        assert_eq!(target.trial_count().await, 1);
+        assert_eq!(target.top_k(1, true).await[0].metrics["loss"], 0.25);
+
+        let mut forged_receipt_count: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&full_path).unwrap()).unwrap();
+        forged_receipt_count["runtime_state"]["completion_receipts"]["0"]["committed_count"] =
+            serde_json::json!(0);
+        let error = target
+            .load_full_checkpoint_document(forged_receipt_count)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("mismatched committed_count"));
+        assert_eq!(target.trial_count().await, 1);
+
+        let mut forged_receipt_candidate: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&full_path).unwrap()).unwrap();
+        forged_receipt_candidate["runtime_state"]["completion_receipts"]["0"]["completed"]["params"]
+            ["x"] = serde_json::json!(0.75);
+        let error = target
+            .load_full_checkpoint_document(forged_receipt_candidate)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("leaderboard identity"));
+        assert_eq!(target.trial_count().await, 1);
+
+        let mut oversized_cancelled: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&full_path).unwrap()).unwrap();
+        oversized_cancelled["runtime_state"]["cancelled"] = serde_json::Value::Array(
+            (0..=MAX_CANCELLED_RETAINED)
+                .map(|id| serde_json::json!(10_000 + id))
+                .collect(),
+        );
+        let error = target
+            .load_full_checkpoint_document(oversized_cancelled)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled trial ids"));
+        assert_eq!(target.trial_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_full_checkpoint_rejects_strategy_variant_conflicting_with_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sobol.json");
+        let source = HolaEngine::from_config(single_objective_config("sobol")).unwrap();
+        source.save_full_checkpoint(&path, None).await.unwrap();
+
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        raw["config"]["strategy"]["strategy_type"] = serde_json::json!("random");
+
+        let target = HolaEngine::from_config(single_objective_config("random")).unwrap();
+        let error = target.load_full_checkpoint_document(raw).await.unwrap_err();
+        assert!(error.to_string().contains("strategy state is 'sobol'"));
+        assert_eq!(target.trial_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_full_checkpoint_rejects_strategy_dimension_conflicting_with_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one-dimensional.json");
+        let source = HolaEngine::from_config(single_objective_config("gmm")).unwrap();
+        source.save_full_checkpoint(&path, None).await.unwrap();
+
+        let mut target_config = single_objective_config("gmm");
+        target_config.space.insert(
+            "y".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        );
+        let target = HolaEngine::from_config(target_config).unwrap();
+        let target_space =
+            serde_json::to_value(target.study_config().await).unwrap()["space"].clone();
+
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        raw["config"]["space"] = target_space;
+        let error = target.load_full_checkpoint_document(raw).await.unwrap_err();
+        assert!(error.to_string().contains("GMM dimension"));
+        assert_eq!(target.trial_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn full_checkpoint_rejects_forged_strategy_seed_and_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("random-pending.json");
+        let mut config = single_objective_config("random");
+        config.strategy.as_mut().unwrap().seed = Some(11);
+        let source = HolaEngine::from_config(config.clone()).unwrap();
+        let _pending = source.ask().await.unwrap();
+        source.save_full_checkpoint(&path, None).await.unwrap();
+        let pristine: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+
+        let mut forged_cursor = pristine.clone();
+        forged_cursor["checkpoint"]["strategy_state"]["inner"]["counter"] = serde_json::json!(0);
+        let target = HolaEngine::from_config(config.clone()).unwrap();
+        let error = target
+            .load_full_checkpoint_document(forged_cursor)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("random cursor"));
+        assert_eq!(target.pending_count().await, 0);
+
+        let mut forged_seed = pristine;
+        forged_seed["checkpoint"]["strategy_state"]["inner"]["seed"] = serde_json::json!(12);
+        let target = HolaEngine::from_config(config).unwrap();
+        let error = target
+            .load_full_checkpoint_document(forged_seed)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("random seed"));
+        assert_eq!(target.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_full_checkpoint_rejects_stale_runtime_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale-runtime.json");
+        let engine = HolaEngine::from_config(single_objective_config("random")).unwrap();
+        let _pending = engine.ask().await.unwrap();
+        engine.save_full_checkpoint(&path, None).await.unwrap();
+
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        raw["runtime_state"]["next_pending_id"] = serde_json::json!(0);
+        std::fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let error = HolaEngine::load_from_checkpoint(&path)
+            .await
+            .err()
+            .expect("stale runtime cursor must be rejected");
+        assert!(error.contains("next_pending_id"));
+    }
+
+    #[test]
+    fn test_auto_checkpoint_directory_is_created_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint_dir = dir.path().join("nested/checkpoints");
+        let mut config = single_objective_config("random");
+        config.checkpoint = Some(CheckpointConfig {
+            directory: checkpoint_dir.to_string_lossy().into_owned(),
+            interval: 10,
+            max_checkpoints: Some(2),
+            load_from: None,
+        });
+
+        HolaEngine::from_config(config).unwrap();
+        assert!(checkpoint_dir.is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_bounded_auto_checkpoint_uses_total_completed_cadence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = single_objective_config("random");
+        config.max_leaderboard_size = Some(3);
+        config.checkpoint = Some(CheckpointConfig {
+            directory: dir.path().to_string_lossy().into_owned(),
+            interval: 2,
+            max_checkpoints: None,
+            load_from: None,
+        });
+
+        let engine = HolaEngine::from_config(config).unwrap();
+        for loss in 0..6 {
+            let trial = engine.ask().await.unwrap();
+            engine
+                .tell(trial.trial_id, serde_json::json!({"loss": loss as f64}))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            engine.retained_trial_count().await,
+            3,
+            "retained history stays capped"
+        );
+        let mut checkpoint_names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        checkpoint_names.sort();
+        assert_eq!(
+            checkpoint_names,
+            vec![
+                "checkpoint_000002.json",
+                "checkpoint_000004.json",
+                "checkpoint_000006.json",
+            ],
+            "checkpoint cadence must keep advancing after retained length reaches its cap"
+        );
+
+        let latest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("checkpoint_000006.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(latest["checkpoint"]["metadata"]["n_trials"], 3);
+        assert_eq!(latest["checkpoint"]["leaderboard"]["total_completed"], 6);
+        assert!(
+            latest["checkpoint"]["metadata"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("6 completed")
+                    && description.contains("3 retained"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_hook_is_exactly_once_when_post_commit_work_is_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = single_objective_config("random");
+        config.checkpoint = Some(CheckpointConfig {
+            directory: dir.path().to_string_lossy().into_owned(),
+            interval: 1,
+            max_checkpoints: None,
+            load_from: None,
+        });
+        let engine = HolaEngine::from_config(config).unwrap();
+        let trial = engine.ask().await.unwrap();
+
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let callback_count_for_task = Arc::clone(&callback_count);
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let task_gate = Arc::clone(&gate);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let task_engine = engine.clone();
+        let tell_task = tokio::spawn(async move {
+            task_engine
+                .tell_with_outcome_on_commit(
+                    trial.trial_id,
+                    serde_json::json!({"loss": 0.25}),
+                    move |_, _| {
+                        callback_count_for_task.fetch_add(1, Ordering::SeqCst);
+                        let _ = entered_tx.send(());
+                        // Keep the task inside the synchronous commit boundary
+                        // until the test has requested cancellation.
+                        task_gate.wait();
+                    },
+                )
+                .await
+        });
+
+        entered_rx
+            .await
+            .expect("commit callback should run before checkpoint I/O");
+        tell_task.abort();
+        tokio::task::spawn_blocking(move || gate.wait())
+            .await
+            .unwrap();
+        assert!(
+            tell_task.await.unwrap_err().is_cancelled(),
+            "the request-side future should be cancellable after publication"
+        );
+        assert_eq!(engine.trial_count().await, 1);
+        assert_eq!(callback_count.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let saved = std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"));
+                if saved {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("auto-checkpoint maintenance must survive tell-future cancellation");
+
+        let replay_count = Arc::clone(&callback_count);
+        let replay = engine
+            .tell_with_outcome_on_commit(
+                trial.trial_id,
+                serde_json::json!({"loss": 0.25}),
+                move |_, _| {
+                    replay_count.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!replay.newly_committed);
+        assert_eq!(replay.completed.trial_id, trial.trial_id);
+        assert_eq!(callback_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_auto_checkpoint_failure_is_counted_after_tell_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint_dir = dir.path().join("checkpoints");
+        let mut config = single_objective_config("random");
+        config.checkpoint = Some(CheckpointConfig {
+            directory: checkpoint_dir.to_string_lossy().into_owned(),
+            interval: 1,
+            max_checkpoints: None,
+            load_from: None,
+        });
+        let engine = HolaEngine::from_config(config).unwrap();
+
+        // Construction creates the directory. Replace it with a regular file so
+        // the unattended write fails deterministically on every platform.
+        std::fs::remove_dir(&checkpoint_dir).unwrap();
+        std::fs::write(&checkpoint_dir, b"not a directory").unwrap();
+
+        let trial = engine.ask().await.unwrap();
+        let outcome = engine
+            .tell_with_outcome(trial.trial_id, serde_json::json!({"loss": 0.5}))
+            .await
+            .expect("checkpoint post-processing must not make a committed tell retryable");
+        assert_eq!(outcome.completed.trial_id, trial.trial_id);
+        assert_eq!(outcome.post_commit_warnings.len(), 1);
+        assert!(outcome.post_commit_warnings[0].contains("auto-checkpoint failed"));
+        assert_eq!(engine.trial_count().await, 1);
+        assert_eq!(engine.checkpoint_failure_count(), 1);
+
+        let retry = engine
+            .tell_with_outcome(trial.trial_id, serde_json::json!({"loss": 0.5}))
+            .await
+            .unwrap();
+        assert!(!retry.newly_committed);
+        assert_eq!(retry.post_commit_warnings, outcome.post_commit_warnings);
+    }
+
+    #[tokio::test]
+    async fn post_commit_refit_failure_is_counted_warned_and_retry_safe() {
+        let mut config = single_objective_config("gmm");
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(1);
+        strategy.refit_interval = 1;
+        let engine = HolaEngine::from_config(config).unwrap();
+        engine.force_refit_failure.store(true, Ordering::SeqCst);
+
+        let trial = engine.ask().await.unwrap();
+        let metrics = serde_json::json!({"loss": 0.25});
+        let outcome = engine
+            .tell_with_outcome(trial.trial_id, metrics.clone())
+            .await
+            .unwrap();
+        assert!(outcome.newly_committed);
+        assert_eq!(engine.refit_failure_count(), 1);
+        assert_eq!(outcome.post_commit_warnings.len(), 1);
+        assert!(outcome.post_commit_warnings[0].contains("refit failed"));
+
+        let retry = engine
+            .tell_with_outcome(trial.trial_id, metrics)
+            .await
+            .unwrap();
+        assert!(!retry.newly_committed);
+        assert_eq!(retry.post_commit_warnings, outcome.post_commit_warnings);
+        assert_eq!(engine.refit_failure_count(), 1);
+    }
+
+    #[test]
+    fn test_bounded_refit_schedule_uses_total_completed() {
+        let config = RefitConfig::with_top_k(2, 2, 2);
+        let objectives = vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }];
+        let mut leaderboard = DynLeaderboard::Scalar(Leaderboard::new());
+        leaderboard.set_max_size(Some(3));
+        let mut refit_at = Vec::new();
+
+        for completed in 1..=6 {
+            match &mut leaderboard {
+                DynLeaderboard::Scalar(inner) => {
+                    inner.push(serde_json::json!({"x": completed}), completed as f64);
+                }
+                DynLeaderboard::Vector(_) => unreachable!(),
+            }
+            assert!(leaderboard.len() <= 3);
+            let cadence = leaderboard.completed_count();
+            if config.should_refit(cadence) {
+                refit_at.push(cadence);
+                assert_eq!(
+                    leaderboard
+                        .top_k_for_refit(config.selection_count(cadence), &objectives)
+                        .len(),
+                    2
+                );
+            }
+        }
+
+        assert_eq!(refit_at, vec![2, 4, 6]);
+        assert_eq!(leaderboard.len(), 3);
+        assert_eq!(leaderboard.completed_count(), 6);
+    }
+
+    #[test]
+    #[ignore = "performance probe; run explicitly with --ignored --nocapture"]
+    fn bounded_refit_workset_scaling_probe() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let objectives = vec![ObjectiveConfig {
+            field: "loss".to_string(),
+            obj_type: "minimize".to_string(),
+            target: None,
+            limit: None,
+            priority: 1.0,
+            group: None,
+        }];
+
+        for history_size in [1_000usize, 10_000, 100_000] {
+            let mut inner = Leaderboard::with_capacity(history_size);
+            for trial_id in 0..history_size {
+                inner.push(
+                    serde_json::json!({"x": trial_id as f64 / history_size as f64}),
+                    ((trial_id.wrapping_mul(37)) % history_size) as f64,
+                );
+            }
+            let leaderboard = DynLeaderboard::Scalar(inner);
+            let started = Instant::now();
+            let workset = black_box(leaderboard.top_k_for_refit(MAX_REFIT_SAMPLES, &objectives));
+            let elapsed = started.elapsed();
+
+            assert_eq!(workset.len(), history_size.min(MAX_REFIT_SAMPLES));
+            assert!(workset.len() <= MAX_REFIT_SAMPLES);
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "bounded refit selection exceeded the 5s debug budget at history={history_size}: {elapsed:?}"
+            );
+            eprintln!(
+                "history={history_size}, scanned_at_most={MAX_REFIT_CANDIDATES}, workset={}, selection={elapsed:?}",
+                workset.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "performance probe; run explicitly with --ignored --nocapture"]
+    async fn tell_hot_path_scaling_probe() {
+        use std::time::{Duration, Instant};
+
+        for vector in [false, true] {
+            let mut config = single_objective_config("random");
+            if vector {
+                config.objectives = vec![
+                    ObjectiveConfig {
+                        field: "loss".to_string(),
+                        obj_type: "minimize".to_string(),
+                        target: None,
+                        limit: None,
+                        priority: 1.0,
+                        group: Some("quality".to_string()),
+                    },
+                    ObjectiveConfig {
+                        field: "latency".to_string(),
+                        obj_type: "minimize".to_string(),
+                        target: None,
+                        limit: None,
+                        priority: 1.0,
+                        group: Some("speed".to_string()),
+                    },
+                ];
+            }
+            let engine = HolaEngine::from_config(config).unwrap();
+            {
+                let mut state = engine.state.write().await;
+                let objectives = state.objectives.clone();
+                for trial_id in 0..100_000u64 {
+                    let metrics = if vector {
+                        serde_json::json!({
+                            "loss": (trial_id % 997) as f64,
+                            "latency": ((100_000 - trial_id) % 991) as f64,
+                        })
+                    } else {
+                        serde_json::json!({"loss": (trial_id % 997) as f64})
+                    };
+                    state.leaderboard.push_with_raw(
+                        trial_id,
+                        serde_json::json!({"x": trial_id as f64 / 100_000.0}),
+                        metrics,
+                        &objectives,
+                    );
+                }
+            }
+
+            let trial = engine.ask().await.unwrap();
+            let metrics = if vector {
+                serde_json::json!({"loss": 0.25, "latency": 0.75})
+            } else {
+                serde_json::json!({"loss": 0.25})
+            };
+            let started = Instant::now();
+            engine.tell(trial.trial_id, metrics).await.unwrap();
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "{} tell exceeded the 5s debug budget: {elapsed:?}",
+                if vector { "two-objective" } else { "scalar" }
+            );
+            eprintln!(
+                "{} tell at 100k history: {elapsed:?}",
+                if vector { "two-objective" } else { "scalar" }
+            );
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_config_rejects_zero_retention() {
+        let mut config = single_objective_config("random");
+        config.checkpoint = Some(CheckpointConfig {
+            directory: ".".to_string(),
+            interval: 1,
+            max_checkpoints: Some(0),
+            load_from: None,
+        });
+        let error = HolaEngine::from_config(config)
+            .err()
+            .expect("zero retained checkpoints must fail validation");
+        assert!(error.contains("checkpoint.max_checkpoints"));
+        assert!(error.contains("at least 1"));
     }
 
     #[tokio::test]
@@ -3517,12 +6199,17 @@ mod tests {
         }
 
         assert_eq!(
-            bounded.trial_count().await,
+            bounded.retained_trial_count().await,
             cap,
             "bounded study must retain at most max_leaderboard_size trials"
         );
         assert_eq!(
-            unbounded.trial_count().await,
+            bounded.trial_count().await,
+            n,
+            "public completed count must remain monotonic past the retention cap"
+        );
+        assert_eq!(
+            unbounded.retained_trial_count().await,
             n,
             "default (unbounded) study must retain every trial"
         );
@@ -3627,7 +6314,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            engine.trial_count().await,
+            engine.retained_trial_count().await,
             cap,
             "scalar bounded study must not exceed the cap"
         );
@@ -3646,7 +6333,7 @@ mod tests {
             "study must be vector after flipping to two priority groups"
         );
         assert!(
-            engine.trial_count().await <= cap,
+            engine.retained_trial_count().await <= cap,
             "migration must carry the cap; the rebuilt board must stay bounded"
         );
 
@@ -3667,7 +6354,7 @@ mod tests {
                         .unwrap();
                     completed += 1;
                     assert!(
-                        engine.trial_count().await <= cap,
+                        engine.retained_trial_count().await <= cap,
                         "bounded study must never exceed the cap mid-run"
                     );
                 }
@@ -3686,7 +6373,7 @@ mod tests {
             "study must terminate exactly when the monotonic completed count reaches max_trials"
         );
         assert!(
-            engine.trial_count().await <= cap,
+            engine.retained_trial_count().await <= cap,
             "final bounded study must still respect the cap"
         );
     }
@@ -3695,13 +6382,10 @@ mod tests {
     async fn test_bounded_vector_study_with_infeasible_terminates_across_migration() {
         // Exercises the migration counter carry-over on a VECTOR board that
         // holds an infeasible (infinite-observation) trial. An over-limit latency
-        // maps to +inf in the vector observation; serde_json renders +inf as
-        // `null` and cannot read it back as f64, so restoring total_completed via
-        // a JSON round-trip would fail and fall back to the retained (capped)
-        // length, dropping the evicted history and leaving the max_trials stopping
-        // check (driven by total_completed) unable to fire. set_total_completed
-        // carries the counter directly, with no round-trip, so the study
-        // terminates exactly at max_trials.
+        // maps to +inf in the vector observation. The migration carries the
+        // monotonic counter directly rather than deriving it from the retained
+        // (capped) length, so evicted history cannot prevent the max_trials
+        // stopping check from firing.
         let cap = 5usize;
         let max_trials = 12usize;
 
@@ -3755,7 +6439,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            engine.trial_count().await,
+            engine.retained_trial_count().await,
             cap,
             "vector bounded study must not exceed the cap"
         );
@@ -3792,7 +6476,7 @@ mod tests {
                         .unwrap();
                     completed += 1;
                     assert!(
-                        engine.trial_count().await <= cap,
+                        engine.retained_trial_count().await <= cap,
                         "bounded study must never exceed the cap mid-run"
                     );
                 }
@@ -3833,7 +6517,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(engine.trial_count().await, cap);
+        assert_eq!(engine.retained_trial_count().await, cap);
         engine.save(&path).await.unwrap();
 
         // A fresh bounded engine loads the checkpoint and must keep the cap.
@@ -3842,7 +6526,7 @@ mod tests {
         let loaded = HolaEngine::from_config(cfg2).unwrap();
         loaded.load(&path).await.unwrap();
         assert_eq!(
-            loaded.trial_count().await,
+            loaded.retained_trial_count().await,
             cap,
             "loaded board must be capped down to the configured max_leaderboard_size"
         );
@@ -3864,7 +6548,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            loaded.trial_count().await,
+            loaded.retained_trial_count().await,
             cap,
             "post-load pushes must continue to respect the cap"
         );
@@ -3879,17 +6563,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let prefix = "checkpoint";
 
-        // Counters around the 6->7 digit boundary. Listed oldest-first; we set
-        // mtimes in this order so the last entry is the newest.
+        // Counters around the 6->7 digit boundary. Give newer sequences older
+        // mtimes deliberately: rotation must trust the checkpoint sequence,
+        // not mutable filesystem timestamps.
         let counters = [999_997usize, 999_998, 999_999, 1_000_000, 1_000_001];
         let mut paths = Vec::new();
         let base = std::time::SystemTime::UNIX_EPOCH;
         for (i, c) in counters.iter().enumerate() {
             let path = dir.path().join(format!("{prefix}_{c:06}.json"));
             std::fs::write(&path, b"{}").unwrap();
-            // Give each file a strictly increasing mtime in oldest-first order so
-            // age, not filename lexicography, drives rotation.
-            let mtime = base + std::time::Duration::from_secs((i as u64 + 1) * 100);
+            let mtime = base + std::time::Duration::from_secs(((counters.len() - i) as u64) * 100);
             std::fs::File::options()
                 .write(true)
                 .open(&path)
@@ -3899,12 +6582,11 @@ mod tests {
             paths.push((path, *c));
         }
 
-        // Keep only the 2 newest; the 3 oldest must be deleted.
+        // Keep only the 2 highest snapshot sequences; the 3 oldest must be deleted.
         HolaEngine::rotate_checkpoints(dir.path(), prefix, 2);
 
-        // The two newest-by-mtime counters (1_000_000, 1_000_001) survive; the
-        // three oldest are gone, even though "checkpoint_1000000" would sort
-        // before "checkpoint_0999998" lexicographically.
+        // The two newest sequence counters (1_000_000, 1_000_001) survive; the
+        // three oldest are gone despite both lexical-width and mtime traps.
         for (path, c) in &paths {
             let should_exist = *c == 1_000_000 || *c == 1_000_001;
             assert_eq!(
@@ -4092,7 +6774,7 @@ mod tests {
                         .unwrap();
                     completed += 1;
                     assert!(
-                        engine.trial_count().await <= cap,
+                        engine.retained_trial_count().await <= cap,
                         "bounded study must never exceed the cap mid-run"
                     );
                 }

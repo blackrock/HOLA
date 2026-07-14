@@ -172,12 +172,15 @@ fn test_dyn_engine_config_validation_rejects_invalid_space_shapes() {
     real.space.insert(
         "x".to_string(),
         ParamConfig::Real {
-            min: 1.0,
+            min: 2.0,
             max: 1.0,
             scale: "linear".to_string(),
         },
     );
-    assert_config_error(real, &["Parameter 'x'", "min must be less than max"]);
+    assert_config_error(
+        real,
+        &["Parameter 'x'", "min must be less than or equal to max"],
+    );
 
     let mut integer = valid_config_for_validation();
     integer.space.insert(
@@ -186,7 +189,10 @@ fn test_dyn_engine_config_validation_rejects_invalid_space_shapes() {
     );
     assert_config_error(
         integer,
-        &["Parameter 'layers'", "integer min must be <= max"],
+        &[
+            "Parameter 'layers'",
+            "min must be less than or equal to max",
+        ],
     );
 
     let mut categorical = valid_config_for_validation();
@@ -1396,15 +1402,31 @@ async fn test_dyn_engine_concurrent_refit_serialization() {
 
     let engine = HolaEngine::from_config(config).unwrap();
 
+    // Stop immediately before the first periodic refit threshold so the
+    // barrier-released workload must race a real refit with objective migration.
+    for i in 0..4 {
+        let trial = engine.ask().await.unwrap();
+        engine
+            .tell(
+                trial.trial_id,
+                json!({"loss": i as f64 / 100.0, "accuracy": 1.0 - i as f64 / 100.0}),
+            )
+            .await
+            .unwrap();
+    }
+
     // Bounded, deterministic workload: a few writer tasks each driving a mix of
     // ask()/tell() across the refit threshold, plus one update_objectives().
     const WRITERS: usize = 4;
     const TELLS_PER_WRITER: usize = 10;
 
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS + 2));
     let mut handles = Vec::new();
     for w in 0..WRITERS {
         let engine = engine.clone();
+        let start = std::sync::Arc::clone(&start);
         handles.push(tokio::spawn(async move {
+            start.wait().await;
             for i in 0..TELLS_PER_WRITER {
                 let t = engine.ask().await.unwrap();
                 let v = ((w * TELLS_PER_WRITER + i) as f64) / 100.0;
@@ -1419,7 +1441,9 @@ async fn test_dyn_engine_concurrent_refit_serialization() {
     // Concurrent objectives swap racing the refit-triggering tell()s.
     let updater = {
         let engine = engine.clone();
+        let start = std::sync::Arc::clone(&start);
         tokio::spawn(async move {
+            start.wait().await;
             engine
                 .update_objectives(vec![ObjectiveConfig {
                     field: "accuracy".to_string(),
@@ -1434,13 +1458,15 @@ async fn test_dyn_engine_concurrent_refit_serialization() {
         })
     };
 
+    start.wait().await;
+
     for h in handles {
         h.await.unwrap();
     }
     updater.await.unwrap();
 
     // Final-state consistency: every tell() was recorded exactly once.
-    assert_eq!(engine.trial_count().await, WRITERS * TELLS_PER_WRITER);
+    assert_eq!(engine.trial_count().await, 4 + WRITERS * TELLS_PER_WRITER);
 
     // The concurrent update_objectives must win the final state: a clobber or a
     // skipped/serialization-lost update would leave the stale "loss" objective.
@@ -1604,12 +1630,16 @@ async fn test_dyn_engine_leaderboard_checkpoint_resume_uses_fresh_trial_id() {
     );
 
     let trial = restored.ask().await.unwrap();
-    assert_eq!(trial.trial_id, 2);
+    assert!(
+        trial.trial_id >= (1_u64 << 62),
+        "leaderboard-only restore must allocate from a fresh high ID epoch"
+    );
+    let resumed_id = trial.trial_id;
     let completed = restored
         .tell(trial.trial_id, json!({"loss": 0.1}))
         .await
         .unwrap();
-    assert_eq!(completed.trial_id, 2);
+    assert_eq!(completed.trial_id, resumed_id);
 
     let ids: Vec<u64> = restored
         .trials("index", true)
@@ -1617,7 +1647,7 @@ async fn test_dyn_engine_leaderboard_checkpoint_resume_uses_fresh_trial_id() {
         .into_iter()
         .map(|trial| trial.trial_id)
         .collect();
-    assert_eq!(ids, vec![0, 1, 2]);
+    assert_eq!(ids, vec![0, 1, resumed_id]);
 }
 
 #[tokio::test]
@@ -1703,6 +1733,157 @@ async fn test_dyn_engine_full_checkpoint_resume_returns_new_completed_trial() {
 }
 
 #[tokio::test]
+async fn test_full_checkpoint_preserves_pending_ask_idempotency() {
+    let engine = HolaEngine::from_config(scalar_checkpoint_config(Some(41))).unwrap();
+    let first = engine
+        .ask_idempotent_with_lease("worker-3-request-8", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("idempotent-ask.json");
+    engine.save_full_checkpoint(&path, None).await.unwrap();
+
+    let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+    let replay = restored
+        .ask_idempotent_with_lease("worker-3-request-8", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let next = restored
+        .ask_idempotent_with_lease("worker-3-request-9", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    assert_eq!(replay, first);
+    assert_eq!(next.trial_id, first.trial_id + 1);
+}
+
+#[tokio::test]
+async fn test_full_version_one_checkpoint_migrates_without_runtime_state() {
+    let mut config = scalar_checkpoint_config(Some(10));
+    config.strategy = Some(StrategyConfig {
+        strategy_type: "sobol".to_string(),
+        refit_interval: 20,
+        total_budget: None,
+        exploration_budget: None,
+        seed: Some(17),
+        elite_fraction: None,
+    });
+    let engine = HolaEngine::from_config(config).unwrap();
+    let first = engine.ask().await.unwrap();
+    engine
+        .tell(first.trial_id, json!({"loss": 0.25}))
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-v1-full.json");
+    engine.save_full_checkpoint(&path, None).await.unwrap();
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    document["checkpoint"]["metadata"]["format_version"] = json!(1);
+    document.as_object_mut().unwrap().remove("runtime_state");
+    std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+    let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+    assert_eq!(restored.trial_count().await, 1);
+    let next = restored.ask().await.unwrap();
+    assert_eq!(next.trial_id, 1);
+    let completed = restored
+        .tell(next.trial_id, json!({"loss": 0.1}))
+        .await
+        .unwrap();
+    assert_eq!(completed.trial_id, 1);
+}
+
+#[tokio::test]
+async fn test_live_ask_idempotency_keys_are_not_evicted_at_the_old_capacity() {
+    let engine = HolaEngine::from_config(scalar_checkpoint_config(None)).unwrap();
+    let first = engine
+        .ask_idempotent("worker-key-0")
+        .await
+        .expect("first keyed ask should succeed");
+
+    // The old key ledger retained only 4096 entries while pending work allowed
+    // 10,000. Crossing that boundary evicted worker-key-0 even though its trial
+    // was still pending, and replaying it allocated duplicate work.
+    for index in 1..=4096 {
+        engine
+            .ask_idempotent(&format!("worker-key-{index}"))
+            .await
+            .expect("keyed ask within pending bound should succeed");
+    }
+
+    let replay = engine
+        .ask_idempotent("worker-key-0")
+        .await
+        .expect("oldest live key should still replay");
+    assert_eq!(replay, first);
+    assert_eq!(engine.pending_count().await, 4097);
+}
+
+#[tokio::test]
+async fn test_completion_receipt_survives_leaderboard_eviction_and_checkpoint_restart() {
+    let mut config = scalar_checkpoint_config(None);
+    config.max_leaderboard_size = Some(1);
+    let engine = HolaEngine::from_config(config).unwrap();
+
+    let first_trial = engine.ask().await.unwrap();
+    let first = engine
+        .tell_with_outcome(first_trial.trial_id, json!({"loss": 0.4}))
+        .await
+        .unwrap();
+    assert!(first.newly_committed);
+
+    let second_trial = engine.ask().await.unwrap();
+    engine
+        .tell(second_trial.trial_id, json!({"loss": 0.2}))
+        .await
+        .unwrap();
+    assert_eq!(engine.trials("index", true).await.len(), 1);
+    assert!(
+        engine
+            .trials("index", true)
+            .await
+            .iter()
+            .all(|trial| trial.trial_id != first_trial.trial_id),
+        "the first trial must actually be evicted for this regression"
+    );
+
+    let retry = engine
+        .tell_with_outcome(first_trial.trial_id, json!({"loss": 0.4}))
+        .await
+        .expect("an exact retry must replay its completion receipt");
+    assert!(!retry.newly_committed);
+    assert_eq!(retry.trial_count, first.trial_count);
+    assert_eq!(
+        serde_json::to_value(&retry.completed).unwrap(),
+        serde_json::to_value(&first.completed).unwrap()
+    );
+    assert!(
+        engine
+            .tell(first_trial.trial_id, json!({"loss": 9.0}))
+            .await
+            .unwrap_err()
+            .contains("different metrics")
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("completion-receipt.json");
+    engine.save_full_checkpoint(&path, None).await.unwrap();
+    let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+    let retry_after_restart = restored
+        .tell_with_outcome(first_trial.trial_id, json!({"loss": 0.4}))
+        .await
+        .expect("completion receipt must survive a checkpointed restart");
+    assert!(!retry_after_restart.newly_committed);
+    assert_eq!(
+        serde_json::to_value(retry_after_restart.completed).unwrap(),
+        serde_json::to_value(first.completed).unwrap()
+    );
+}
+
+#[tokio::test]
 async fn test_dyn_engine_full_checkpoint_resume_preserves_vector_trial_ids() {
     let config = vector_checkpoint_config();
     let engine = HolaEngine::from_config(config.clone()).unwrap();
@@ -1779,7 +1960,82 @@ async fn test_dyn_engine_checkpoint_load_with_fallback_supports_full_and_leaderb
         .unwrap();
     assert_eq!(kind, CheckpointLoadKind::Leaderboard);
     assert_eq!(restored_leaderboard.trial_count().await, 1);
-    assert_eq!(restored_leaderboard.ask().await.unwrap().trial_id, 1);
+    assert!(restored_leaderboard.ask().await.unwrap().trial_id >= (1_u64 << 62));
+}
+
+#[tokio::test]
+async fn leaderboard_reimport_uses_completed_count_not_sparse_trial_ids_as_sampler_cursor() {
+    for strategy_type in ["sobol", "auto"] {
+        let mut config = scalar_checkpoint_config(None);
+        config.strategy = Some(StrategyConfig {
+            strategy_type: strategy_type.to_string(),
+            refit_interval: 20,
+            total_budget: Some(100),
+            exploration_budget: Some(10),
+            seed: Some(73),
+            elite_fraction: Some(0.5),
+        });
+
+        // Establish the deterministic fifth sample for this strategy after four
+        // ordinary completed trials.
+        let baseline = HolaEngine::from_config(config.clone()).unwrap();
+        for loss in [0.4, 0.3, 0.2, 0.1] {
+            let trial = baseline.ask().await.unwrap();
+            baseline
+                .tell(trial.trial_id, json!({"loss": loss}))
+                .await
+                .unwrap();
+        }
+        let expected_fifth = baseline.ask().await.unwrap().params;
+
+        let source = HolaEngine::from_config(config.clone()).unwrap();
+        for loss in [0.4, 0.3, 0.2] {
+            let trial = source.ask().await.unwrap();
+            source
+                .tell(trial.trial_id, json!({"loss": loss}))
+                .await
+                .unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join(format!("{strategy_type}-first.json"));
+        source
+            .save_leaderboard_checkpoint_to(&first_path, None)
+            .await
+            .unwrap();
+
+        // This restore deliberately assigns the fourth trial a sparse high ID.
+        let first_restore = HolaEngine::from_config(config.clone()).unwrap();
+        first_restore
+            .load_leaderboard_checkpoint(&first_path)
+            .await
+            .unwrap();
+        let fourth = first_restore.ask().await.unwrap();
+        assert!(fourth.trial_id >= (1_u64 << 62));
+        first_restore
+            .tell(fourth.trial_id, json!({"loss": 0.1}))
+            .await
+            .unwrap();
+
+        let second_path = dir.path().join(format!("{strategy_type}-second.json"));
+        first_restore
+            .save_leaderboard_checkpoint_to(&second_path, None)
+            .await
+            .unwrap();
+
+        // Reimport must advance from total_completed=4, not saturate/wrap a
+        // Sobol cursor derived from the sparse high trial ID.
+        let second_restore = HolaEngine::from_config(config).unwrap();
+        second_restore
+            .load_leaderboard_checkpoint(&second_path)
+            .await
+            .unwrap();
+        let actual_fifth = second_restore.ask().await.unwrap();
+        assert_eq!(
+            actual_fifth.params, expected_fifth,
+            "{strategy_type} sampler cursor changed after sparse-ID reimport"
+        );
+    }
 }
 
 // ==========================================================================
@@ -2154,6 +2410,115 @@ async fn test_pareto_front_multi_objective() {
 }
 
 #[tokio::test]
+async fn test_live_vector_ranks_respect_direction_and_never_promote_infeasible_trials() {
+    let config = StudyConfig {
+        space: BTreeMap::from([(
+            "x".to_string(),
+            ParamConfig::Real {
+                min: 0.0,
+                max: 1.0,
+                scale: "linear".to_string(),
+            },
+        )]),
+        objectives: vec![
+            ObjectiveConfig {
+                field: "loss".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: Some("loss".to_string()),
+            },
+            ObjectiveConfig {
+                field: "accuracy".to_string(),
+                obj_type: "maximize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: Some("accuracy".to_string()),
+            },
+            ObjectiveConfig {
+                field: "latency".to_string(),
+                obj_type: "minimize".to_string(),
+                target: Some(0.0),
+                limit: Some(10.0),
+                priority: 1.0,
+                group: Some("constraint".to_string()),
+            },
+        ],
+        strategy: Some(StrategyConfig {
+            strategy_type: "random".to_string(),
+            refit_interval: 20,
+            total_budget: None,
+            exploration_budget: None,
+            seed: Some(7),
+            elite_fraction: None,
+        }),
+        checkpoint: None,
+        max_trials: None,
+        max_leaderboard_size: None,
+    };
+
+    let engine = HolaEngine::from_config(config.clone()).unwrap();
+    let cases = [
+        json!({"loss": 1.0, "accuracy": 0.8, "latency": 5.0}),
+        json!({"loss": 2.0, "accuracy": 0.9, "latency": 5.0}),
+        json!({"loss": 2.0, "accuracy": 0.7, "latency": 5.0}),
+        // Excellent unconstrained metrics, but latency violates the limit.
+        json!({"loss": 0.5, "accuracy": 0.95, "latency": 20.0}),
+    ];
+    let mut completed = Vec::new();
+    for metrics in cases {
+        let trial = engine.ask().await.unwrap();
+        completed.push(engine.tell(trial.trial_id, metrics).await.unwrap());
+    }
+
+    // Maximize is oriented as a negative cost, so the first two trials trade
+    // off and the third is dominated by trial 0.
+    assert_eq!(completed[0].score_vector["accuracy"], json!(-0.8));
+    assert_eq!(completed[1].score_vector["accuracy"], json!(-0.9));
+    assert_eq!(completed[0].pareto_front, 0);
+    assert_eq!(completed[1].pareto_front, 0);
+    assert!(completed[2].pareto_front > 0);
+
+    // The tell response is the exact DTO sent in the live SSE event.
+    assert_eq!(completed[3].score_vector["constraint"], "inf");
+    assert!(completed[3].pareto_front > 0);
+
+    let all = engine.trials("rank", true).await;
+    let infeasible = all.iter().find(|trial| trial.trial_id == 3).unwrap();
+    assert!(infeasible.pareto_front > 0);
+    assert!(infeasible.rank >= 3);
+    let front_ids: Vec<u64> = engine
+        .pareto_front(0, true)
+        .await
+        .into_iter()
+        .map(|trial| trial.trial_id)
+        .collect();
+    assert_eq!(front_ids, vec![0, 1]);
+
+    // Even an all-infeasible live study reserves front zero for feasible work.
+    let all_infeasible = HolaEngine::from_config(config).unwrap();
+    let trial = all_infeasible.ask().await.unwrap();
+    let event_trial = all_infeasible
+        .tell(
+            trial.trial_id,
+            json!({"loss": 0.1, "accuracy": 0.99, "latency": 100.0}),
+        )
+        .await
+        .unwrap();
+    assert!(event_trial.pareto_front > 0);
+    assert!(all_infeasible.pareto_front(0, true).await.is_empty());
+    assert!(
+        all_infeasible
+            .trials("rank", true)
+            .await
+            .iter()
+            .all(|trial| trial.pareto_front > 0)
+    );
+}
+
+#[tokio::test]
 async fn test_pareto_front_scalar_study_errors() {
     let config = StudyConfig {
         space: BTreeMap::from([(
@@ -2459,4 +2824,36 @@ async fn test_hola_engine_concurrent_tell_preserves_all_observations() {
         recorded_losses, expected,
         "recorded observation multiset must equal the set of sent values"
     );
+}
+
+#[tokio::test]
+async fn test_concurrent_tell_returns_each_atomic_commit_count() {
+    let engine =
+        std::sync::Arc::new(HolaEngine::from_config(scalar_checkpoint_config(None)).unwrap());
+    let first = engine.ask().await.unwrap();
+    let second = engine.ask().await.unwrap();
+
+    let a = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .tell_with_count(first.trial_id, json!({"loss": 0.4}))
+                .await
+                .unwrap()
+                .1
+        })
+    };
+    let b = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .tell_with_count(second.trial_id, json!({"loss": 0.2}))
+                .await
+                .unwrap()
+                .1
+        })
+    };
+    let mut counts = vec![a.await.unwrap(), b.await.unwrap()];
+    counts.sort_unstable();
+    assert_eq!(counts, vec![1, 2]);
 }

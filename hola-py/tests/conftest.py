@@ -26,8 +26,6 @@ import urllib.request
 
 import pytest
 
-from hola_opt import Categorical, Integer, Real, Space
-
 # ==========================================================================
 # Reusable spaces
 # ==========================================================================
@@ -35,16 +33,22 @@ from hola_opt import Categorical, Integer, Real, Space
 
 @pytest.fixture
 def simple_space():
+    from hola_opt import Real, Space
+
     return Space(x=Real(0.0, 1.0))
 
 
 @pytest.fixture
 def sphere_space():
+    from hola_opt import Real, Space
+
     return Space(x=Real(-5.0, 5.0), y=Real(-5.0, 5.0))
 
 
 @pytest.fixture
 def multi_param_space():
+    from hola_opt import Categorical, Integer, Real, Space
+
     return Space(
         lr=Real(1e-4, 0.1, scale="log10"),
         layers=Integer(1, 10),
@@ -89,7 +93,8 @@ def cli_binary():
     if result.returncode != 0:
         pytest.skip(f"Failed to build hola-cli: {result.stderr}")
 
-    binary = os.path.join(project_root, "target", "debug", "hola")
+    binary_name = "hola.exe" if os.name == "nt" else "hola"
+    binary = os.path.join(project_root, "target", "debug", binary_name)
     if not os.path.exists(binary):
         pytest.skip(f"CLI binary not found at {binary}")
     return binary

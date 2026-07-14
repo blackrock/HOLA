@@ -73,9 +73,12 @@ impl Scale for LinearScale {
 /// sentinel [`f64::NEG_INFINITY`] so the result is always well-defined.
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use opt_engine::{ContinuousSpace, LogScale};
+///
 /// // Learning rate between 1e-4 and 0.1, sampled on a natural log scale
 /// let space = ContinuousSpace::with_scale(1e-4, 0.1, LogScale);
+/// assert_eq!(space.min(), 1e-4);
 /// ```
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LogScale;
@@ -106,9 +109,12 @@ impl Scale for LogScale {
 /// the sentinel [`f64::NEG_INFINITY`] so the result is always well-defined.
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use opt_engine::{ContinuousSpace, Log10Scale};
+///
 /// // Learning rate between 1e-4 and 0.1, sampled on a log10 scale
 /// let space = ContinuousSpace::with_scale(1e-4, 0.1, Log10Scale);
+/// assert_eq!(space.max(), 0.1);
 /// ```
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Log10Scale;

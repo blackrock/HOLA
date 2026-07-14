@@ -8,6 +8,13 @@ members = [
 ]
 
 [workspace.package]
+authors = ["BlackRock, Inc."]
+homepage = "https://github.com/blackrock/HOLA"
+repository = "https://github.com/blackrock/HOLA"
+readme = "README.md"
+license = "Apache-2.0"
+keywords = ["optimization", "hyperparameter", "machine-learning"]
+categories = ["algorithms", "science"]
 # Minimum Supported Rust Version. The code uses std features stabilized in
 # Rust 1.87 (e.g. integer `is_multiple_of`), so this is the true floor.
 # Verified to build with `cargo build --locked --workspace`.

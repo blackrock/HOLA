@@ -53,9 +53,9 @@ evaluate (your code)
 
 tell()
   ├─ Engine validates metrics against the objective schema
-  ├─ Engine scalarizes metrics → single observation (f64)
+  ├─ Engine computes per-group costs (plus a scalar fitting proxy)
   ├─ Leaderboard stores the trial (params, score_vector, metrics, timestamp)
-  └─ Strategy updates its model from the new observation
+  └─ Strategy updates its model from the scalar fitting proxy
 ```
 
 ## The Unit Hypercube
@@ -146,9 +146,11 @@ space matters.
 
 ## Objective Scalarization
 
-We convert your multi-field metrics dict into a single scalar
-**score** that strategies can optimize. The method depends on how
-you define objectives.
+We convert each metric field into a directed, priority-weighted contribution.
+Contributions in the same priority group are summed. A study with one group
+uses that scalar group cost for ranking; multiple groups retain a cost vector
+and use Pareto/NSGA-II ranking. Strategies may use a summed proxy internally
+for fitting, but the public multi-group leaderboard remains Pareto-ranked.
 
 ### Single Field
 
@@ -156,10 +158,10 @@ With `Minimize("loss")`, the score is the value of the
 `"loss"` field. With `Maximize("accuracy")`, we negate the value
 since the engine always minimizes internally.
 
-### Weighted Sum
+### Weighted Sum Within a Group
 
-When you specify multiple objectives without targets or limits,
-we compute a priority-weighted sum
+When several objectives share one `group`, we compute that group's
+priority-weighted sum
 
 $$
 \text{score} = \sum_i p_i d_i x_i
@@ -192,19 +194,24 @@ this ordering must agree: a configuration whose ordering contradicts its
 `type` (for example `type: maximize` with `target < limit`) is rejected
 at validation rather than silently optimized in the wrong direction.
 
-The final score is the sum of all field contributions
+Within each priority group, the final group cost is the sum of its field
+contributions
 
 $$
-\text{score} = \sum_i \text{contribution}_i
+\text{group cost} = \sum_{i \in \text{group}} \text{contribution}_i
 $$
 
-Trials where any field exceeds its limit are effectively
-infeasible (score $= \infty$).
+Trials where any field exceeds its limit are effectively infeasible (the
+corresponding group cost is $\infty$). When `group` is omitted, each field uses
+its own group, so two or more omitted-group objectives form Pareto axes rather
+than one unconditional weighted sum.
 
 ## The Leaderboard
 
-We maintain an append-only store of all completed trials. It
-provides the following.
+By default we retain all completed trials. Long-running studies can set
+`max_leaderboard_size` to retain a bounded recent/ranked working set while the
+monotonic completed count continues to drive budgets, refits, and checkpoints.
+The leaderboard provides the following.
 
 **Lazy ranking.** We rank trials on demand, not on every insert.
 
@@ -216,6 +223,10 @@ provides the following.
 **Pareto front.** For multi-objective studies (objectives with
 distinct `group` labels), we provide `pareto_front()`,
 `non_dominated_sort()`, and NSGA-II crowding distance.
+Two-group front ranking uses an exact $O(N \log N)$ sweep. Exact ranking for
+three or more groups remains quadratic in the retained population; configure a
+finite `max_leaderboard_size` for large many-objective studies so latency and
+memory have an explicit bound.
 
 **Rescalarization.** When objectives are updated mid-run, we
 rescalarize all existing trials with the new objectives.
@@ -244,11 +255,12 @@ Each trial record contains the following fields.
 We support atomic JSON checkpoints for both warm starts and exact
 resumes.
 
-- **Leaderboard checkpoint.** All completed trials with params,
-  scores, metrics, and timestamps.
-- **Full checkpoint.** A leaderboard checkpoint plus the current
-  search strategy state (e.g., Sobol sequence position, GMM
-  parameters) and study configuration.
+- **Leaderboard-only checkpoint.** Completed trials with params, scores,
+  metrics, and timestamps. This legacy format is a warm-start artifact.
+- **Full checkpoint.** A leaderboard checkpoint plus study configuration,
+  search strategy state (for example, Sobol sequence position or GMM
+  parameters), pending and cancelled work, leases, idempotency records,
+  completion receipts, and the next trial ID.
 
 Checkpoints enable the following.
 
@@ -256,11 +268,13 @@ Checkpoints enable the following.
 - Offline analysis in the dashboard
 - Carrying over a leaderboard to a new engine (warm-start)
 
-Loading a checkpoint replaces the in-memory pending and cancelled
-sets. Pending or cancelled in-flight trials from the pre-load engine
-state do not survive the load; the restored engine resumes from
-completed trials and issues fresh trial IDs after the restored
-leaderboard.
+Loading a current full checkpoint restores its runtime state, including
+pending IDs, so workers can report results issued before the restart without
+ID reuse. Loading a legacy leaderboard-only checkpoint necessarily invalidates
+outstanding jobs because the file does not identify them. HOLA then begins a
+fresh trial-ID epoch and reconciles the configured strategy with imported
+history by advancing sampling counters and refitting a model where applicable.
+That legacy path is a warm start, not an exact continuation.
 
 We write checkpoint files atomically (first to a temp file, then
 rename) to prevent corruption.

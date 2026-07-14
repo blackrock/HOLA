@@ -66,11 +66,12 @@ const MAX_SOBOL_SAMPLES: u32 = 1 << 16;
 /// preserves the exact position in the Sobol' sequence.
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use opt_engine::{ContinuousSpace, Log10Scale, SobolStrategy, Strategy};
+///
 /// // 1-D continuous space with Log10 scale
 /// let space = ContinuousSpace::with_scale(1e-4, 0.1, Log10Scale);
 /// let strategy = SobolStrategy::<_, f64>::new(42); // explicit observation type
-/// let strategy = SobolStrategy::new(42);            // defaults to f64
 ///
 /// // Generate points
 /// let point1 = strategy.suggest(&space);
@@ -132,6 +133,21 @@ impl<S, Obs> SobolStrategy<S, Obs> {
     /// Create a new Sobol' strategy with an automatically chosen seed.
     pub fn auto_seed() -> Self {
         Self::new(rand::random())
+    }
+
+    /// Advance the sequence cursor without generating discarded samples.
+    pub fn advance_to(&self, index: u32) {
+        self.index.fetch_max(index, Ordering::Relaxed);
+    }
+
+    /// Owen-scrambling seed recorded in checkpoints.
+    pub fn seed(&self) -> u32 {
+        self.seed
+    }
+
+    /// Next sequence position.
+    pub fn index(&self) -> u32 {
+        self.index.load(Ordering::Relaxed)
     }
 }
 
@@ -421,13 +437,16 @@ mod tests {
 
     #[test]
     fn test_sobol_high_dimensional_does_not_panic() {
-        // More than the 256-dimension limit of `sobol_burley::sample`: must not
-        // reach the crate's always-on assert.
-        let space = HighDimSpace { dim: 300 };
-        let strat = SobolStrategy::<HighDimSpace>::new(42);
-        let point = strat.suggest(&space);
-        assert_eq!(point.len(), 300);
-        assert!(space.contains(&point), "fallback point should be in bounds");
+        for dim in [255, 256, 257] {
+            let space = HighDimSpace { dim };
+            let strat = SobolStrategy::<HighDimSpace>::new(42);
+            let point = strat.suggest(&space);
+            assert_eq!(point.len(), dim);
+            assert!(
+                space.contains(&point),
+                "dimension {dim} should stay in bounds"
+            );
+        }
     }
 
     #[test]
@@ -447,21 +466,16 @@ mod tests {
         let space = UnitInterval;
         let strat = SobolStrategy::<UnitInterval>::new(42);
 
-        // Position the next draw at `2^16 - 1` (still valid for Sobol').
-        strat.index.store(MAX_SOBOL_SAMPLES - 1, Ordering::Relaxed);
-
-        // Index `2^16 - 1`: last valid Sobol' draw.
-        let p1 = strat.suggest(&space);
-        assert!((0.0..=1.0).contains(&p1), "Sobol point {p1} out of bounds");
-
-        // Index `2^16`: without the sample-count guard this would trip
-        // `sobol_burley::sample`'s `debug_assert!(sample_index < 1 << 16)` and
-        // panic in a test build. The guard routes it to the deterministic
-        // pseudo-random fallback instead.
-        let p2 = strat.suggest(&space);
-        assert!(
-            (0.0..=1.0).contains(&p2),
-            "fallback point {p2} out of bounds"
-        );
+        // Exercise the 65,535th, 65,536th, and 65,537th public draws. The first
+        // two are valid Sobol indices; the third must route to the deterministic
+        // fallback rather than reaching the dependency's debug assertion.
+        strat.index.store(MAX_SOBOL_SAMPLES - 2, Ordering::Relaxed);
+        for draw in [65_535usize, 65_536, 65_537] {
+            let point = strat.suggest(&space);
+            assert!(
+                (0.0..=1.0).contains(&point),
+                "draw {draw} produced out-of-bounds point {point}"
+            );
+        }
     }
 }

@@ -153,23 +153,25 @@ class TestRestEndpoints:
         status, body = http_json(
             f"{self.url}/api/checkpoint/save",
             method="POST",
-            body={"path": "test_checkpoint.json"},
+            body={"description": "test checkpoint"},
         )
         assert status == 200
         assert body["status"] == "ok"
         assert body["checkpoint_type"] == "full"
+        assert os.path.basename(body["path"]).startswith("checkpoint_")
         assert os.path.exists(body["path"])
         restored = Study.load(body["path"])
         assert restored.trial_count() == 1
 
-    def test_checkpoint_save_rejects_absolute_path(self):
+    def test_checkpoint_save_rejects_client_selected_path(self):
         status, body = http_json(
             f"{self.url}/api/checkpoint/save",
             method="POST",
             body={"path": "/tmp/hola_escape.json"},
         )
         assert status == 400
-        assert "relative" in body["error"]
+        assert body["code"] == "invalid_request"
+        assert body["error"] == "request body or parameters are invalid"
 
 
 def _free_port():
@@ -269,7 +271,7 @@ def test_cli_load_from_rest_full_checkpoint_preserves_sobol_sequence(
         status, body = http_json(
             f"{url}/api/checkpoint/save",
             method="POST",
-            body={"path": "server-full.json", "description": "server full"},
+            body={"description": "server full"},
         )
         assert status == 200
         assert body["checkpoint_type"] == "full"

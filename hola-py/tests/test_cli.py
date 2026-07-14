@@ -19,6 +19,7 @@ trial completion, and HOLA_PARAMS environment variable passing.
 
 import os
 import subprocess
+import sys
 import time
 
 from conftest import _wait_for_server, http_json, write_yaml_config
@@ -34,6 +35,13 @@ def _find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
+
+
+def _python_command(tmp_path, name, source):
+    """Write a worker program and return one shell command for every OS."""
+    script = tmp_path / name
+    script.write_text(source)
+    return f'"{sys.executable}" "{script}"'
 
 
 # ==========================================================================
@@ -57,7 +65,7 @@ def test_serve_starts_responds(cli_binary, tmp_path):
     port = _find_free_port()
     config_path = write_yaml_config(tmp_path)
     url = f"http://localhost:{port}"
-    stderr = ""
+    logs = ""
 
     proc = subprocess.Popen(
         [cli_binary, "serve", str(config_path), "--port", str(port)],
@@ -70,9 +78,10 @@ def test_serve_starts_responds(cli_binary, tmp_path):
         assert status == 200
     finally:
         proc.terminate()
-        _, stderr = proc.communicate(timeout=5)
-        stderr = stderr.decode("utf-8", errors="replace")
-    assert f"127.0.0.1:{port}" in stderr
+        stdout, stderr = proc.communicate(timeout=5)
+        logs = (stdout + stderr).decode("utf-8", errors="replace")
+    assert "127.0.0.1" in logs
+    assert str(port) in logs
 
 
 def test_serve_bad_config_exits(cli_binary):
@@ -178,6 +187,11 @@ def test_worker_completes_trials(cli_binary, tmp_path):
     )
     try:
         assert _wait_for_server(url), "Server did not start"
+        exec_cmd = _python_command(
+            tmp_path,
+            "constant_metrics.py",
+            "import json\nprint(json.dumps({'loss': 0.5}))\n",
+        )
 
         worker = subprocess.Popen(
             [
@@ -188,7 +202,7 @@ def test_worker_completes_trials(cli_binary, tmp_path):
                 "--mode",
                 "exec",
                 "--exec",
-                "echo '{\"loss\": 0.5}'",
+                exec_cmd,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -203,7 +217,7 @@ def test_worker_completes_trials(cli_binary, tmp_path):
                 time.sleep(0.5)
 
             _, body = http_json(f"{url}/api/trial_count")
-            assert body["trial_count"] >= 3, f"Worker completed only {body['count']} trials"
+            assert body["trial_count"] >= 3, f"Worker completed only {body['trial_count']} trials"
         finally:
             worker.kill()
             worker.wait(timeout=5)
@@ -225,13 +239,13 @@ def test_worker_receives_params_env(cli_binary, tmp_path):
     try:
         assert _wait_for_server(url), "Server did not start"
 
-        # Worker script reads HOLA_PARAMS and uses param value as loss
-        exec_cmd = (
-            'python3 -c "'
-            "import os, json; "
-            "p = json.loads(os.environ['HOLA_PARAMS']); "
-            "print(json.dumps({'loss': p['x']}))"
-            '"'
+        # Worker script reads HOLA_PARAMS and uses param value as loss.
+        exec_cmd = _python_command(
+            tmp_path,
+            "params_metrics.py",
+            "import json, os\n"
+            "params = json.loads(os.environ['HOLA_PARAMS'])\n"
+            "print(json.dumps({'loss': params['x']}))\n",
         )
 
         worker = subprocess.Popen(
@@ -264,6 +278,114 @@ def test_worker_receives_params_env(cli_binary, tmp_path):
         server.wait(timeout=5)
 
 
+def test_worker_heartbeats_through_command_longer_than_server_lease(cli_binary, tmp_path):
+    """A built-in worker must renew even the shortest supported server lease."""
+    port = _find_free_port()
+    config_path = write_yaml_config(tmp_path)
+    url = f"http://localhost:{port}"
+
+    server = subprocess.Popen(
+        [
+            cli_binary,
+            "serve",
+            str(config_path),
+            "--port",
+            str(port),
+            "--lease-seconds",
+            "1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert _wait_for_server(url), "Server did not start"
+        exec_cmd = _python_command(
+            tmp_path,
+            "slow_metrics.py",
+            "import json, time\ntime.sleep(2.2)\nprint(json.dumps({'loss': 0.25}))\n",
+        )
+        worker = subprocess.Popen(
+            [cli_binary, "worker", "--server", url, "--mode", "exec", "--exec", exec_cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                _, body = http_json(f"{url}/api/trial_count")
+                if body["trial_count"] >= 1:
+                    break
+                time.sleep(0.2)
+
+            _, body = http_json(f"{url}/api/trial_count")
+            assert body["trial_count"] >= 1, (
+                "Worker result was rejected after the one-second lease; "
+                "periodic heartbeats did not keep it alive"
+            )
+        finally:
+            worker.kill()
+            stdout, stderr = worker.communicate(timeout=5)
+            logs = (stdout + stderr).decode("utf-8", errors="replace")
+            assert "permanent rejection" not in logs.lower()
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+
+
+def test_callback_worker_heartbeats_through_command_longer_than_lease(cli_binary, tmp_path):
+    port = _find_free_port()
+    config_path = write_yaml_config(tmp_path)
+    url = f"http://localhost:{port}"
+    server = subprocess.Popen(
+        [
+            cli_binary,
+            "serve",
+            str(config_path),
+            "--port",
+            str(port),
+            "--lease-seconds",
+            "1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert _wait_for_server(url), "Server did not start"
+        exec_cmd = _python_command(
+            tmp_path,
+            "slow_callback.py",
+            "import json, os, time, urllib.request\n"
+            "time.sleep(2.2)\n"
+            "payload = json.dumps({'trial_id': int(os.environ['HOLA_TRIAL_ID']), "
+            "'metrics': {'loss': 0.25}}).encode()\n"
+            "request = urllib.request.Request(os.environ['HOLA_SERVER'] + '/api/tell', "
+            "data=payload, headers={'Content-Type': 'application/json'})\n"
+            "urllib.request.urlopen(request, timeout=5).read()\n",
+        )
+        worker = subprocess.Popen(
+            [cli_binary, "worker", "--server", url, "--exec", exec_cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                _, body = http_json(f"{url}/api/trial_count")
+                if body["trial_count"] >= 1:
+                    break
+                time.sleep(0.2)
+            _, body = http_json(f"{url}/api/trial_count")
+            assert body["trial_count"] >= 1
+        finally:
+            worker.kill()
+            stdout, stderr = worker.communicate(timeout=5)
+            logs = (stdout + stderr).decode("utf-8", errors="replace")
+            assert "lease heartbeat failed" not in logs.lower()
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+
+
 def test_worker_exec_failure_cancels_not_reports(cli_binary, tmp_path):
     """A non-zero exit must cancel the trial, not POST a fake result.
 
@@ -282,8 +404,12 @@ def test_worker_exec_failure_cancels_not_reports(cli_binary, tmp_path):
     )
     try:
         assert _wait_for_server(url), "Server did not start"
+        exec_cmd = _python_command(
+            tmp_path,
+            "failing_worker.py",
+            "import sys\nsys.stderr.write('boom\\n')\nsys.exit(1)\n",
+        )
 
-        # Command always exits non-zero and writes to stderr.
         worker = subprocess.Popen(
             [
                 cli_binary,
@@ -293,7 +419,7 @@ def test_worker_exec_failure_cancels_not_reports(cli_binary, tmp_path):
                 "--mode",
                 "exec",
                 "--exec",
-                "echo boom >&2; exit 1",
+                exec_cmd,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -332,6 +458,11 @@ def test_worker_exec_invalid_json_cancels(cli_binary, tmp_path):
     )
     try:
         assert _wait_for_server(url), "Server did not start"
+        exec_cmd = _python_command(
+            tmp_path,
+            "invalid_metrics.py",
+            "print('not-json-at-all')\n",
+        )
 
         worker = subprocess.Popen(
             [
@@ -342,7 +473,7 @@ def test_worker_exec_invalid_json_cancels(cli_binary, tmp_path):
                 "--mode",
                 "exec",
                 "--exec",
-                "echo not-json-at-all",
+                exec_cmd,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

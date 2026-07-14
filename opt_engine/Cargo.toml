@@ -2,12 +2,23 @@
 name = "opt_engine"
 version = "1.0.1-rc7"
 edition = "2024"
-license = "Apache-2.0"
+description = "Type-safe optimization primitives and search strategies for HOLA"
+documentation = "https://docs.rs/opt_engine"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Checkpoints promise exact f64 replay. The default best-effort parser can
+# round some emitted decimals one ULP away from their source value.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde-value = "0.7"
 # Engine internals need async locks and blocking refit tasks; tests/examples use Tokio macros.
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "sync"] }
 rand = "0.9.3"
@@ -17,6 +28,9 @@ rand_distr = "0.5"
 # Only need wall-clock time (Utc::now()/timestamp()); dropping default features
 # avoids the wasm-bindgen/js-sys dependency chain.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"

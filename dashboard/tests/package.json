@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "DOM-rendering XSS regression tests for the HOLA dashboard.",
+  "description": "DOM and state regression tests for the HOLA dashboard.",
   "scripts": {
-    "test": "node xss_dom.test.mjs"
+    "test": "node xss_dom.test.mjs && node --test dashboard_state.test.mjs"
   },
   "dependencies": {
     "jsdom": "^24.1.0"

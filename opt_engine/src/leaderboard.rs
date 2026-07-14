@@ -25,7 +25,7 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 // =============================================================================
 // Core Data Structures
@@ -37,10 +37,15 @@ use std::collections::{BTreeMap, HashMap};
 /// Optionally stores the raw metrics (pre-scalarization) to support mid-run
 /// objective weight changes and lazy re-scalarization.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "D: Serialize, Obs: Serialize",
+    deserialize = "D: Deserialize<'de>, Obs: Deserialize<'de>"
+))]
 pub struct Trial<D, Obs> {
     /// The candidate configuration that was evaluated.
     pub candidate: D,
     /// The observation/result from evaluating the candidate.
+    #[serde(with = "crate::persistence::lossless_float")]
     pub observation: Obs,
     /// Raw metrics before scalarization (e.g., `{"loss": 0.3, "latency": 100}`).
     /// Stored when the engine receives JSON metrics from workers.
@@ -101,7 +106,7 @@ impl<D, Obs> Trial<D, Obs> {
 /// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(
-    from = "LeaderboardData<D, Obs>",
+    try_from = "LeaderboardData<D, Obs>",
     bound(deserialize = "D: Deserialize<'de>, Obs: Deserialize<'de>")
 )]
 pub struct Leaderboard<D, Obs> {
@@ -138,28 +143,69 @@ pub struct Leaderboard<D, Obs> {
 struct LeaderboardData<D, Obs> {
     trials: Vec<Trial<D, Obs>>,
     #[serde(default)]
-    next_id: u64,
+    next_id: Option<u64>,
     #[serde(default)]
     max_size: Option<usize>,
     #[serde(default)]
-    total_completed: u64,
+    total_completed: Option<u64>,
 }
 
-impl<D, Obs> From<LeaderboardData<D, Obs>> for Leaderboard<D, Obs> {
-    fn from(data: LeaderboardData<D, Obs>) -> Self {
-        let id_index = build_id_index(&data.trials);
+impl<D, Obs> TryFrom<LeaderboardData<D, Obs>> for Leaderboard<D, Obs> {
+    type Error = String;
+
+    fn try_from(data: LeaderboardData<D, Obs>) -> Result<Self, Self::Error> {
+        let mut id_index = HashMap::with_capacity(data.trials.len());
+        for (index, trial) in data.trials.iter().enumerate() {
+            if id_index.insert(trial.trial_id, index).is_some() {
+                return Err(format!(
+                    "leaderboard contains duplicate trial_id {}",
+                    trial.trial_id
+                ));
+            }
+        }
+
+        let minimum_next_id = match data.trials.iter().map(|trial| trial.trial_id).max() {
+            Some(max_id) => max_id.checked_add(1).ok_or_else(|| {
+                "leaderboard contains trial_id u64::MAX, leaving no assignable ID".to_string()
+            })?,
+            None => 0,
+        };
+        let next_id = data.next_id.unwrap_or(minimum_next_id);
+        if next_id < minimum_next_id {
+            return Err(format!(
+                "leaderboard next_id {next_id} must be greater than every stored trial_id (minimum {minimum_next_id})"
+            ));
+        }
+        if next_id == u64::MAX {
+            return Err("leaderboard next_id u64::MAX leaves no assignable trial ID".to_string());
+        }
+
         // Old checkpoints lack the counter (default 0) and were always
         // unbounded, so total pushed equals stored len. Newer checkpoints
         // restore the real count, which can exceed len under a cap.
-        let total_completed = data.total_completed.max(data.trials.len() as u64);
-        Self {
+        let minimum_completed = data.trials.len() as u64;
+        let total_completed = data.total_completed.unwrap_or(minimum_completed);
+        if total_completed < minimum_completed {
+            return Err(format!(
+                "leaderboard total_completed {total_completed} is smaller than its {} stored trials",
+                data.trials.len()
+            ));
+        }
+        if total_completed == u64::MAX {
+            return Err(
+                "leaderboard total_completed u64::MAX leaves no representable next completion"
+                    .to_string(),
+            );
+        }
+
+        Ok(Self {
             trials: data.trials,
-            next_id: data.next_id,
+            next_id,
             // Normalize a persisted Some(0) to unbounded, matching set_max_size.
             max_size: data.max_size.filter(|&cap| cap > 0),
             total_completed,
             id_index,
-        }
+        })
     }
 }
 
@@ -237,7 +283,7 @@ impl<D, Obs> Leaderboard<D, Obs> {
     /// could not even hold the trial a caller just pushed. It is therefore
     /// normalized to `None` (unbounded) here so every code path treats it the
     /// same way. This matches the `cap > 0` guard in
-    /// [`enforce_max_size`](Self::enforce_max_size) and keeps `max_size()` from
+    /// `enforce_max_size` and keeps `max_size()` from
     /// ever reporting a `Some(0)` that would not actually be enforced. The
     /// product layer rejects `Some(0)` during validation; this normalization is
     /// the library-level backstop.
@@ -278,11 +324,10 @@ impl<D, Obs> Leaderboard<D, Obs> {
     /// `Some(0)` here; the guard makes the no-evict-on-zero contract explicit
     /// and keeps a zero cap from ever dropping the just-pushed trial.
     fn enforce_max_size(&mut self) {
-        if let Some(cap) = self.max_size
-            && cap > 0
-            && self.trials.len() > cap
-        {
-            self.evict_to(cap);
+        if let Some(cap) = self.max_size {
+            if cap > 0 && self.trials.len() > cap {
+                self.evict_to(cap);
+            }
         }
     }
 
@@ -296,7 +341,7 @@ impl<D, Obs> Leaderboard<D, Obs> {
         self.trials.push(trial);
         // Count every stored trial. Eviction below must not lower this, so it
         // tracks trials ever pushed rather than currently stored.
-        self.total_completed += 1;
+        self.total_completed = self.total_completed.saturating_add(1);
         self.enforce_max_size();
     }
 
@@ -437,10 +482,10 @@ impl<D, Obs> Leaderboard<D, Obs> {
         F: Fn(&serde_json::Value) -> Option<Obs>,
     {
         for trial in &mut self.trials {
-            if let Some(ref raw) = trial.raw_metrics
-                && let Some(score) = scalarizer(raw)
-            {
-                trial.observation = score;
+            if let Some(ref raw) = trial.raw_metrics {
+                if let Some(score) = scalarizer(raw) {
+                    trial.observation = score;
+                }
             }
         }
     }
@@ -496,7 +541,22 @@ pub fn is_feasible_scalar(observation: f64) -> bool {
 /// Any objective with `f64::INFINITY` indicates an infeasible solution.
 #[inline]
 pub fn is_feasible_multi(observation: &BTreeMap<String, f64>) -> bool {
-    observation.values().all(|v| v.is_finite())
+    !observation.is_empty() && observation.values().all(|v| v.is_finite())
+}
+
+/// Deterministic score order used everywhere malformed/non-finite values are
+/// included: finite scores first (numeric order), infinities second, NaNs last.
+fn score_cmp(a: f64, b: f64) -> Ordering {
+    let class = |value: f64| {
+        if value.is_finite() {
+            0u8
+        } else if value.is_infinite() {
+            1
+        } else {
+            2
+        }
+    };
+    class(a).cmp(&class(b)).then_with(|| a.total_cmp(&b))
 }
 
 // =============================================================================
@@ -511,17 +571,11 @@ impl<D: Clone> Leaderboard<D, f64> {
     }
 
     fn compare_best(a: &Trial<D, f64>, b: &Trial<D, f64>) -> Ordering {
-        a.observation
-            .partial_cmp(&b.observation)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.trial_id.cmp(&b.trial_id))
+        score_cmp(a.observation, b.observation).then_with(|| a.trial_id.cmp(&b.trial_id))
     }
 
     fn compare_worst(a: &Trial<D, f64>, b: &Trial<D, f64>) -> Ordering {
-        b.observation
-            .partial_cmp(&a.observation)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| a.trial_id.cmp(&b.trial_id))
+        score_cmp(b.observation, a.observation).then_with(|| a.trial_id.cmp(&b.trial_id))
     }
 
     /// Return only feasible trials (those with finite observations).
@@ -564,6 +618,28 @@ impl<D: Clone> Leaderboard<D, f64> {
         }
         feasible.sort_by(|a, b| Self::compare_best(a, b));
 
+        feasible.into_iter().cloned().collect()
+    }
+
+    /// Return the best `k` feasible trials from at most the most recent
+    /// `max_candidates` entries. This bounds repeated selection work for
+    /// long-running refit loops while retaining deterministic partial
+    /// selection within the chosen window.
+    pub fn top_k_recent(&self, k: usize, max_candidates: usize) -> Vec<Trial<D, f64>> {
+        if self.trials.is_empty() || k == 0 || max_candidates == 0 {
+            return Vec::new();
+        }
+        let start = self.trials.len().saturating_sub(max_candidates);
+        let mut feasible: Vec<&Trial<D, f64>> = self.trials[start..]
+            .iter()
+            .filter(|trial| Self::trial_is_feasible(trial))
+            .collect();
+        let limit = k.min(feasible.len());
+        if limit < feasible.len() {
+            feasible.select_nth_unstable_by(limit, |a, b| Self::compare_best(a, b));
+            feasible.truncate(limit);
+        }
+        feasible.sort_by(|a, b| Self::compare_best(a, b));
         feasible.into_iter().cloned().collect()
     }
 
@@ -669,7 +745,7 @@ impl<D: Clone> Leaderboard<D, f64> {
             return None;
         }
 
-        observations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        observations.sort_by(|a, b| score_cmp(*a, *b));
 
         let index = ((observations.len() - 1) as f64 * quantile.clamp(0.0, 1.0)).round() as usize;
         Some(observations[index])
@@ -763,9 +839,15 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
     /// - both NaN is a tie in that objective.
     fn dominates(a: &BTreeMap<String, f64>, b: &BTreeMap<String, f64>) -> bool {
         let mut dominated_some = false;
-        for key in a.keys() {
-            let va = a.get(key).copied().unwrap_or(f64::INFINITY);
-            let vb = b.get(key).copied().unwrap_or(f64::INFINITY);
+        let keys: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+        if keys.is_empty() {
+            return false;
+        }
+        for key in keys {
+            // A missing objective is malformed and ranks as invalid (NaN), not
+            // as a silently omitted dimension.
+            let va = a.get(key).copied().unwrap_or(f64::NAN);
+            let vb = b.get(key).copied().unwrap_or(f64::NAN);
             // Deterministic NaN policy: NaN is strictly worst. Handle the cases
             // involving NaN explicitly because `>` / `<` are always false for
             // NaN and would otherwise be silently treated as a tie.
@@ -794,6 +876,79 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
         dominated_some
     }
 
+    /// Return 0-indexed front membership for a rectangular, finite two-objective
+    /// slice in O(N log N). Returns `None` for every other schema so callers can
+    /// fall back to the general NSGA-II algorithm.
+    fn two_objective_front_indices(
+        trials: &[Trial<D, BTreeMap<String, f64>>],
+    ) -> Option<Vec<Vec<usize>>> {
+        let keys: Vec<&String> = trials.first()?.observation.keys().collect();
+        if keys.len() != 2 {
+            return None;
+        }
+        let (x_key, y_key) = (keys[0], keys[1]);
+        let normalize_zero = |value: f64| if value == 0.0 { 0.0 } else { value };
+        let mut points = Vec::with_capacity(trials.len());
+        for (index, trial) in trials.iter().enumerate() {
+            if trial.observation.len() != 2 {
+                return None;
+            }
+            let x = normalize_zero(*trial.observation.get(x_key)?);
+            let y = normalize_zero(*trial.observation.get(y_key)?);
+            if !x.is_finite() || !y.is_finite() {
+                return None;
+            }
+            points.push((index, x, y));
+        }
+        points.sort_by(|a, b| {
+            a.1.total_cmp(&b.1)
+                .then_with(|| a.2.total_cmp(&b.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let mut y_values: Vec<f64> = points.iter().map(|point| point.2).collect();
+        y_values.sort_by(f64::total_cmp);
+        y_values.dedup_by(|a, b| *a == *b);
+        let mut tree = vec![0usize; y_values.len() + 1];
+        let mut front_by_index = vec![0usize; trials.len()];
+        let mut start = 0;
+        while start < points.len() {
+            let mut end = start + 1;
+            while end < points.len()
+                && points[end].1 == points[start].1
+                && points[end].2 == points[start].2
+            {
+                end += 1;
+            }
+            let y_index = y_values
+                .binary_search_by(|value| value.total_cmp(&points[start].2))
+                .expect("compressed coordinate came from the same finite values")
+                + 1;
+            let mut tree_index = y_index;
+            let mut chain_depth = 0;
+            while tree_index > 0 {
+                chain_depth = chain_depth.max(tree[tree_index]);
+                tree_index &= tree_index - 1;
+            }
+            for point in &points[start..end] {
+                front_by_index[point.0] = chain_depth;
+            }
+            tree_index = y_index;
+            while tree_index < tree.len() {
+                tree[tree_index] = tree[tree_index].max(chain_depth + 1);
+                tree_index += tree_index & tree_index.wrapping_neg();
+            }
+            start = end;
+        }
+
+        let n_fronts = front_by_index.iter().copied().max().unwrap_or(0) + 1;
+        let mut fronts = vec![Vec::new(); n_fronts];
+        for (index, front) in front_by_index.into_iter().enumerate() {
+            fronts[front].push(index);
+        }
+        Some(fronts)
+    }
+
     /// Compute the Pareto front (non-dominated feasible trials).
     ///
     /// Infeasible trials (those with any infinite objective) are excluded.
@@ -805,6 +960,14 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
         let feasible = self.feasible_trials();
         if feasible.is_empty() {
             return Vec::new();
+        }
+        if let Some(fronts) = Self::two_objective_front_indices(&feasible) {
+            return fronts
+                .first()
+                .into_iter()
+                .flatten()
+                .map(|&index| feasible[index].clone())
+                .collect();
         }
 
         let mut front = Vec::new();
@@ -831,6 +994,14 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
     pub fn pareto_front_all(&self) -> Vec<Trial<D, BTreeMap<String, f64>>> {
         if self.trials.is_empty() {
             return Vec::new();
+        }
+        if let Some(fronts) = Self::two_objective_front_indices(&self.trials) {
+            return fronts
+                .first()
+                .into_iter()
+                .flatten()
+                .map(|&index| self.trials[index].clone())
+                .collect();
         }
 
         let mut front = Vec::new();
@@ -918,9 +1089,7 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
         }
 
         let compare = |a: &ScoredMultiTrial<'_, D>, b: &ScoredMultiTrial<'_, D>| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.0.trial_id.cmp(&b.0.trial_id))
+            score_cmp(a.1, b.1).then_with(|| a.0.trial_id.cmp(&b.0.trial_id))
         };
 
         let limit = k.min(scored.len());
@@ -930,6 +1099,42 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
         }
         scored.sort_by(compare);
 
+        scored
+            .into_iter()
+            .map(|(trial, _)| (*trial).clone())
+            .collect()
+    }
+
+    /// Scalarize and select the best `k` feasible trials from a bounded recent
+    /// window. Unlike [`Self::top_k_scalarized`], cost does not grow once the
+    /// leaderboard exceeds `max_candidates`.
+    pub fn top_k_scalarized_recent<F>(
+        &self,
+        k: usize,
+        max_candidates: usize,
+        scalarizer: F,
+    ) -> Vec<Trial<D, BTreeMap<String, f64>>>
+    where
+        F: Fn(&BTreeMap<String, f64>) -> f64,
+    {
+        if self.trials.is_empty() || k == 0 || max_candidates == 0 {
+            return Vec::new();
+        }
+        let start = self.trials.len().saturating_sub(max_candidates);
+        let mut scored: Vec<ScoredMultiTrial<'_, D>> = self.trials[start..]
+            .iter()
+            .filter(|trial| Self::trial_is_feasible(trial))
+            .map(|trial| (trial, scalarizer(&trial.observation)))
+            .collect();
+        let compare = |a: &ScoredMultiTrial<'_, D>, b: &ScoredMultiTrial<'_, D>| {
+            score_cmp(a.1, b.1).then_with(|| a.0.trial_id.cmp(&b.0.trial_id))
+        };
+        let limit = k.min(scored.len());
+        if limit < scored.len() {
+            scored.select_nth_unstable_by(limit, compare);
+            scored.truncate(limit);
+        }
+        scored.sort_by(compare);
         scored
             .into_iter()
             .map(|(trial, _)| (*trial).clone())
@@ -947,9 +1152,7 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
         front.sort_by(|a, b| {
             let sa = scalarizer(&a.observation);
             let sb = scalarizer(&b.observation);
-            sa.partial_cmp(&sb)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.trial_id.cmp(&b.trial_id))
+            score_cmp(sa, sb).then_with(|| a.trial_id.cmp(&b.trial_id))
         });
         front
     }
@@ -962,7 +1165,7 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
             .min_by(|a, b| {
                 let va = a.observation.get(group).unwrap();
                 let vb = b.observation.get(group).unwrap();
-                va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal)
+                score_cmp(*va, *vb)
             })
     }
 
@@ -1060,6 +1263,18 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
             return Vec::new();
         }
 
+        if let Some(front_indices) = Self::two_objective_front_indices(&feasible) {
+            return front_indices
+                .into_iter()
+                .map(|front| {
+                    front
+                        .into_iter()
+                        .map(|index| feasible[index].clone())
+                        .collect()
+                })
+                .collect();
+        }
+
         let n = feasible.len();
 
         let mut domination_count: Vec<usize> = vec![0; n];
@@ -1110,6 +1325,18 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
     pub fn non_dominated_sort_all(&self) -> Vec<Vec<Trial<D, BTreeMap<String, f64>>>> {
         if self.trials.is_empty() {
             return Vec::new();
+        }
+
+        if let Some(front_indices) = Self::two_objective_front_indices(&self.trials) {
+            return front_indices
+                .into_iter()
+                .map(|front| {
+                    front
+                        .into_iter()
+                        .map(|index| self.trials[index].clone())
+                        .collect()
+                })
+                .collect();
         }
 
         let n = self.trials.len();
@@ -1185,10 +1412,10 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
         let n = trials.len();
         let mut distances: Vec<f64> = vec![0.0; n];
 
-        let objectives: Vec<&String> = trials
-            .first()
-            .map(|t| t.observation.keys().collect())
-            .unwrap_or_default();
+        let objectives: BTreeSet<&String> = trials
+            .iter()
+            .flat_map(|trial| trial.observation.keys())
+            .collect();
 
         if objectives.is_empty() {
             return trials.iter().cloned().map(|t| (t, 0.0)).collect();
@@ -1201,7 +1428,7 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
                 .map(|(i, t)| (i, t.observation.get(*obj).copied().unwrap_or(f64::INFINITY)))
                 .collect();
 
-            indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            indexed.sort_by(|a, b| score_cmp(a.1, b.1));
 
             // Compute range from only finite values to avoid NaN from Inf - Inf
             let finite_vals: Vec<f64> = indexed
@@ -1263,28 +1490,19 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
 
             let remaining = k - selected.len();
 
-            if front.len() <= remaining {
-                let with_distance = Self::crowding_distance(&front);
-                for (trial, distance) in with_distance {
-                    selected.push(RankedTrial {
-                        trial,
-                        rank: rank + 1,
-                        crowding_distance: distance,
-                    });
-                }
-            } else {
-                let mut with_distance = Self::crowding_distance(&front);
+            let mut with_distance = Self::crowding_distance(&front);
+            // Keep one canonical NSGA-II order even when the complete front
+            // fits. Callers may rank the full population and only then take k;
+            // leaving full fronts in insertion order would make that disagree
+            // with select_nsga2(k) whenever k cuts through the front.
+            with_distance.sort_by(|a, b| score_cmp(b.1, a.1));
 
-                with_distance
-                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-                for (trial, distance) in with_distance.into_iter().take(remaining) {
-                    selected.push(RankedTrial {
-                        trial,
-                        rank: rank + 1,
-                        crowding_distance: distance,
-                    });
-                }
+            for (trial, distance) in with_distance.into_iter().take(remaining) {
+                selected.push(RankedTrial {
+                    trial,
+                    rank: rank + 1,
+                    crowding_distance: distance,
+                });
             }
         }
 
@@ -1307,28 +1525,15 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
 
             let remaining = k - selected.len();
 
-            if front.len() <= remaining {
-                let with_distance = Self::crowding_distance(&front);
-                for (trial, distance) in with_distance {
-                    selected.push(RankedTrial {
-                        trial,
-                        rank: rank + 1,
-                        crowding_distance: distance,
-                    });
-                }
-            } else {
-                let mut with_distance = Self::crowding_distance(&front);
+            let mut with_distance = Self::crowding_distance(&front);
+            with_distance.sort_by(|a, b| score_cmp(b.1, a.1));
 
-                with_distance
-                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-                for (trial, distance) in with_distance.into_iter().take(remaining) {
-                    selected.push(RankedTrial {
-                        trial,
-                        rank: rank + 1,
-                        crowding_distance: distance,
-                    });
-                }
+            for (trial, distance) in with_distance.into_iter().take(remaining) {
+                selected.push(RankedTrial {
+                    trial,
+                    rank: rank + 1,
+                    crowding_distance: distance,
+                });
             }
         }
 
@@ -1347,7 +1552,7 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
 
         let mut with_distance = Self::crowding_distance(&front);
 
-        with_distance.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        with_distance.sort_by(|a, b| score_cmp(b.1, a.1));
 
         with_distance
             .into_iter()
@@ -1398,10 +1603,7 @@ impl<D> RankedTrial<D> {
             std::cmp::Ordering::Greater => std::cmp::Ordering::Greater,
             std::cmp::Ordering::Equal => {
                 // Same rank: higher crowding distance is better
-                other
-                    .crowding_distance
-                    .partial_cmp(&self.crowding_distance)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                score_cmp(other.crowding_distance, self.crowding_distance)
             }
         }
     }
@@ -1525,6 +1727,39 @@ mod tests {
     }
 
     #[test]
+    fn test_top_k_recent_limits_selection_to_bounded_window() {
+        let mut lb: Leaderboard<&str, f64> = Leaderboard::new();
+
+        lb.push("old_global_best", 0.0);
+        lb.push("recent_worst", 5.0);
+        lb.push("recent_best", 2.0);
+
+        let top = lb.top_k_recent(1, 2);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].candidate, "recent_best");
+        assert!(lb.top_k_recent(1, 0).is_empty());
+    }
+
+    #[test]
+    fn test_scalar_all_order_is_deterministic_for_non_finite_values() {
+        let mut lb: Leaderboard<&str, f64> = Leaderboard::new();
+        lb.push("nan", f64::NAN);
+        lb.push("positive_infinity", f64::INFINITY);
+        lb.push("finite", 1.0);
+        lb.push("negative_infinity", f64::NEG_INFINITY);
+
+        let ordered: Vec<_> = lb
+            .sorted_all()
+            .into_iter()
+            .map(|trial| trial.candidate)
+            .collect();
+        assert_eq!(
+            ordered,
+            ["finite", "negative_infinity", "positive_infinity", "nan"]
+        );
+    }
+
+    #[test]
     fn test_best() {
         let mut lb: Leaderboard<&str, f64> = Leaderboard::new();
 
@@ -1626,6 +1861,23 @@ mod tests {
     }
 
     #[test]
+    fn test_empty_and_heterogeneous_objective_maps_are_not_silently_valid() {
+        assert!(!is_feasible_multi(&BTreeMap::new()));
+
+        let mut lb: Leaderboard<&str, BTreeMap<String, f64>> = Leaderboard::new();
+        lb.push("missing_y", [("x".into(), 0.0)].into());
+        lb.push("complete", [("x".into(), 1.0), ("y".into(), 0.0)].into());
+
+        // The missing y value is invalid/worst in that dimension, so the
+        // superficially better x value cannot make it dominate the complete
+        // trial. Both remain non-dominated under the explicit union schema.
+        let front = lb.pareto_front_all();
+        assert_eq!(front.len(), 2);
+        let distances = Leaderboard::crowding_distance(&front);
+        assert_eq!(distances.len(), 2);
+    }
+
+    #[test]
     fn test_pareto_front_all_dominated() {
         let mut lb: Leaderboard<&str, BTreeMap<String, f64>> = Leaderboard::new();
 
@@ -1678,6 +1930,20 @@ mod tests {
         // Ties broken by trial_id
         assert_eq!(top[0].candidate, "A");
         assert_eq!(top[1].candidate, "B");
+    }
+
+    #[test]
+    fn test_top_k_scalarized_recent_limits_selection_to_bounded_window() {
+        let mut lb: Leaderboard<&str, BTreeMap<String, f64>> = Leaderboard::new();
+
+        lb.push("old_global_best", [("x".into(), 0.0)].into());
+        lb.push("recent_worst", [("x".into(), 5.0)].into());
+        lb.push("recent_best", [("x".into(), 2.0)].into());
+
+        let top = lb.top_k_scalarized_recent(1, 2, |obs| obs["x"]);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].candidate, "recent_best");
+        assert!(lb.top_k_scalarized_recent(1, 0, |obs| obs["x"]).is_empty());
     }
 
     #[test]
@@ -1743,6 +2009,68 @@ mod tests {
         assert_eq!(fronts[1][0].candidate, "B");
         assert_eq!(fronts[2].len(), 1);
         assert_eq!(fronts[2][0].candidate, "C");
+    }
+
+    #[test]
+    fn test_two_objective_fast_fronts_match_pairwise_reference() {
+        let mut lb: Leaderboard<usize, BTreeMap<String, f64>> = Leaderboard::new();
+        for id in 0..256usize {
+            let mut observation = BTreeMap::new();
+            // Deliberately include ties and duplicate points.
+            observation.insert("x".to_string(), ((id * 37) % 23) as f64);
+            observation.insert("y".to_string(), ((id * 61) % 29) as f64);
+            lb.push(id, observation);
+        }
+
+        let trials = lb.trials();
+        let n = trials.len();
+        let mut domination_count = vec![0usize; n];
+        let mut dominated_by = vec![Vec::new(); n];
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if Leaderboard::<usize, BTreeMap<String, f64>>::dominates(
+                    &trials[i].observation,
+                    &trials[j].observation,
+                ) {
+                    dominated_by[i].push(j);
+                    domination_count[j] += 1;
+                } else if Leaderboard::<usize, BTreeMap<String, f64>>::dominates(
+                    &trials[j].observation,
+                    &trials[i].observation,
+                ) {
+                    dominated_by[j].push(i);
+                    domination_count[i] += 1;
+                }
+            }
+        }
+        let mut expected = vec![usize::MAX; n];
+        let mut current: Vec<usize> = (0..n).filter(|&i| domination_count[i] == 0).collect();
+        let mut front = 0;
+        while !current.is_empty() {
+            for &index in &current {
+                expected[index] = front;
+            }
+            let mut next = Vec::new();
+            for &index in &current {
+                for &dominated in &dominated_by[index] {
+                    domination_count[dominated] -= 1;
+                    if domination_count[dominated] == 0 {
+                        next.push(dominated);
+                    }
+                }
+            }
+            current = next;
+            front += 1;
+        }
+
+        let actual = lb.non_dominated_sort_all();
+        let mut actual_by_id = vec![usize::MAX; n];
+        for (front, trials) in actual.iter().enumerate() {
+            for trial in trials {
+                actual_by_id[trial.trial_id as usize] = front;
+            }
+        }
+        assert_eq!(actual_by_id, expected);
     }
 
     #[test]
@@ -2097,6 +2425,31 @@ mod tests {
         assert!(candidates.contains(&"good1"));
         assert!(candidates.contains(&"good2"));
         assert!(!candidates.contains(&"infeasible"));
+    }
+
+    #[test]
+    fn test_full_nsga2_ranking_orders_every_front_by_crowding() {
+        let mut lb: Leaderboard<&str, BTreeMap<String, f64>> = Leaderboard::new();
+        // Insert the interior point first. All three points are on front zero,
+        // but the two boundary points have infinite crowding distance and must
+        // lead both ranked_trials() and select_nsga2(2).
+        lb.push("interior", [("x".into(), 0.5), ("y".into(), 0.5)].into());
+        lb.push("left", [("x".into(), 0.1), ("y".into(), 0.9)].into());
+        lb.push("right", [("x".into(), 0.9), ("y".into(), 0.1)].into());
+
+        let full = lb.ranked_trials();
+        let full_prefix: Vec<&str> = full
+            .iter()
+            .take(2)
+            .map(|ranked| ranked.trial.candidate)
+            .collect();
+        let selected: Vec<&str> = lb
+            .select_nsga2(2)
+            .iter()
+            .map(|ranked| ranked.trial.candidate)
+            .collect();
+        assert_eq!(full_prefix, selected);
+        assert!(!full_prefix.contains(&"interior"));
     }
 
     #[test]
@@ -2504,6 +2857,50 @@ mod tests {
         assert_eq!(lb.max_size(), None);
         assert!(lb.contains_trial_id(3));
         assert_eq!(lb.next_trial_id(), 4);
+    }
+
+    #[test]
+    fn test_deserialization_rejects_duplicate_trial_ids() {
+        let json = r#"{"trials":[
+            {"candidate":"a","observation":0.5,"trial_id":3,"timestamp":7},
+            {"candidate":"b","observation":0.4,"trial_id":3,"timestamp":8}
+        ],"next_id":4,"total_completed":2}"#;
+        let error = serde_json::from_str::<Leaderboard<String, f64>>(json).unwrap_err();
+        assert!(error.to_string().contains("duplicate trial_id 3"));
+    }
+
+    #[test]
+    fn test_deserialization_rejects_stale_next_id_and_count() {
+        let stale_id = r#"{"trials":[
+            {"candidate":"a","observation":0.5,"trial_id":3,"timestamp":7}
+        ],"next_id":3,"total_completed":1}"#;
+        let error = serde_json::from_str::<Leaderboard<String, f64>>(stale_id).unwrap_err();
+        assert!(error.to_string().contains("next_id 3"));
+
+        let stale_count = r#"{"trials":[
+            {"candidate":"a","observation":0.5,"trial_id":0,"timestamp":7},
+            {"candidate":"b","observation":0.4,"trial_id":1,"timestamp":8}
+        ],"next_id":2,"total_completed":1}"#;
+        let error = serde_json::from_str::<Leaderboard<String, f64>>(stale_count).unwrap_err();
+        assert!(error.to_string().contains("total_completed 1"));
+
+        let exhausted_id = format!(
+            r#"{{"trials":[],"next_id":{},"total_completed":0}}"#,
+            u64::MAX
+        );
+        let error = serde_json::from_str::<Leaderboard<String, f64>>(&exhausted_id).unwrap_err();
+        assert!(error.to_string().contains("no assignable trial ID"));
+
+        let exhausted_count = format!(
+            r#"{{"trials":[],"next_id":0,"total_completed":{}}}"#,
+            u64::MAX
+        );
+        let error = serde_json::from_str::<Leaderboard<String, f64>>(&exhausted_count).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no representable next completion")
+        );
     }
 
     #[test]

@@ -37,14 +37,14 @@ cd HOLA
 We build the Python bindings with maturin.
 
 ```bash
-cd hola-py && uv sync --dev
-uv run maturin develop
+uv sync --directory hola-py --locked --dev
+uv run --directory hola-py maturin develop
 ```
 
 We build the CLI binary with cargo.
 
 ```bash
-cargo build -p hola-cli --release
+cargo build --locked -p hola-cli --release
 # Binary at: target/release/hola
 ```
 
@@ -126,7 +126,7 @@ test suites below are for contributors who build from source.
 We run the Rust tests with
 
 ```bash
-cargo test --workspace --all-features
+cargo test --locked --workspace --all-features
 ```
 
 We run the Python tests directly through the venv python (not
@@ -139,8 +139,8 @@ hola-py/.venv/bin/python -m pytest hola-py/tests/ -v
 We lint with
 
 ```bash
-cargo clippy --workspace --all-features -- -D warnings
-uv run --project hola-py ruff check .
+cargo clippy --locked --workspace --all-features -- -D warnings
+uv run --directory hola-py ruff check .
 ```
 
 ## Running Examples
@@ -150,19 +150,18 @@ correctly.
 
 ```bash
 # Python examples (run as scripts)
-uv run python hola-py/examples/basic_optimization.py
-uv run python hola-py/examples/categorical_demo.py
-uv run python hola-py/examples/multi_objective.py
+uv run --directory hola-py python examples/basic_optimization.py
+uv run --directory hola-py python examples/categorical_demo.py
+uv run --directory hola-py python examples/multi_objective.py
 
 # Rust examples
-cargo run -p opt_engine --example rastrigin_gmm
-cargo run -p opt_engine --example pareto_front
-cargo run -p opt_engine --example persistence
+cargo run --locked -p opt_engine --example pareto_front
+cargo run --locked -p opt_engine --example persistence
 ```
 
-If you use a `uv` project rooted in `hola-py/`, run the same
-paths relative to that directory, e.g.,
-`uv run python examples/basic_optimization.py`.
+The `--directory hola-py` option selects the Python project and resolves
+the example paths from that directory while allowing every command above
+to be copied from the repository root.
 
 ## What's Next
 

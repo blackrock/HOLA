@@ -8,8 +8,10 @@ from pathlib import Path
 
 import pytest
 
-DOCS_DIR = Path(__file__).parent.parent.parent / "docs"
+ROOT_DIR = Path(__file__).parent.parent.parent
+DOCS_DIR = ROOT_DIR / "docs"
 PYTHON_BLOCK_RE = re.compile(r"```python\n(.*?)```", re.DOTALL)
+LOCAL_LINK_RE = re.compile(r"(?<!!)\[[^]]+\]\(([^)#]+)(?:#[^)]*)?\)")
 
 # Patterns that indicate a block references undefined names, needs a server,
 # or is pseudo-code (not real Python). These blocks are only syntax-checked.
@@ -80,15 +82,21 @@ def _classify_block(code: str) -> str:
 
 def _collect_doc_blocks():
     """Yield pytest params for all Python code blocks in docs."""
-    for md_file in sorted(DOCS_DIR.glob("*.md")):
+    markdown_files = [ROOT_DIR / "README.md", *sorted(DOCS_DIR.glob("*.md"))]
+    for md_file in markdown_files:
         for lineno, code in _extract_python_blocks(md_file):
             mode = _classify_block(code)
+            # README blocks are self-contained by design. Execute the local
+            # quick start end-to-end; only the remote example needs a server.
+            if md_file.name == "README.md" and "Study.connect(" not in code:
+                mode = "exec"
+            display_name = md_file.relative_to(ROOT_DIR).as_posix()
             yield pytest.param(
-                md_file.name,
+                display_name,
                 lineno,
                 code,
                 mode,
-                id=f"{md_file.stem}:L{lineno}",
+                id=f"{display_name}:L{lineno}",
             )
 
 
@@ -114,7 +122,7 @@ def test_doc_code_block(filename, lineno, code, mode):
 
     # Always check syntax for non-skip blocks
     try:
-        compiled = compile(code, f"docs/{filename}:{lineno}", "exec")
+        compiled = compile(code, f"{filename}:{lineno}", "exec")
     except SyntaxError as e:
         pytest.fail(f"Syntax error in {filename} line {lineno}: {e}")
 
@@ -127,3 +135,29 @@ def test_doc_code_block(filename, lineno, code, mode):
             pytest.fail(f"Import error in {filename} line {lineno}: {e}")
         except Exception as e:
             pytest.fail(f"Runtime error in {filename} line {lineno}: {e}")
+
+
+@pytest.mark.doctest_md
+@pytest.mark.parametrize("filename", ["README.md", "CONTRIBUTING.md"])
+def test_root_document_local_links_exist(filename):
+    """Keep first-run and contributor links anchored to real repository files."""
+    document = ROOT_DIR / filename
+    for target in LOCAL_LINK_RE.findall(document.read_text()):
+        if "://" in target or target.startswith("mailto:"):
+            continue
+        resolved = (document.parent / target).resolve()
+        assert resolved.exists(), f"{filename} links to missing path {target!r}"
+
+
+@pytest.mark.doctest_md
+def test_root_commands_use_the_current_cli_and_python_layout():
+    """Reject the stale names and flags that originally broke the quick start."""
+    text = "\n".join(
+        (ROOT_DIR / filename).read_text() for filename in ("README.md", "CONTRIBUTING.md")
+    )
+    for stale in ("robopt-cli", "robopt-py", "--command"):
+        assert stale not in text
+    assert "hola serve" in text
+    assert "hola worker" in text
+    assert "--exec" in text
+    assert "--directory hola-py" in text

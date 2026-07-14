@@ -84,6 +84,22 @@ impl<S, Obs> RandomStrategy<S, Obs> {
     pub fn auto_seed() -> Self {
         Self::new(rand::random())
     }
+
+    /// Advance the deterministic stream cursor without generating discarded
+    /// samples. Used when importing history that does not carry strategy state.
+    pub fn advance_to(&self, counter: u64) {
+        self.counter.fetch_max(counter, Ordering::Relaxed);
+    }
+
+    /// Base seed recorded in checkpoints.
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Next deterministic stream position.
+    pub fn counter(&self) -> u64 {
+        self.counter.load(Ordering::Relaxed)
+    }
 }
 
 impl<S, Obs> Default for RandomStrategy<S, Obs> {

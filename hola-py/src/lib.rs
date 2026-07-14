@@ -14,10 +14,48 @@
 use hola_engine::hola_engine::{
     HolaEngine, ObjectiveConfig, ParamConfig, StrategyConfig, StudyConfig,
 };
-use pyo3::exceptions::PyValueError;
+use pyo3::create_exception;
+use pyo3::exceptions::{PyRuntimeWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+use uuid::Uuid;
+
+// All public HOLA exceptions remain ValueError subclasses for compatibility
+// with callers that caught the binding's historical catch-all ValueError.
+create_exception!(
+    hola_opt,
+    HolaError,
+    PyValueError,
+    "Base exception for errors raised by HOLA."
+);
+create_exception!(
+    hola_opt,
+    ConfigurationError,
+    HolaError,
+    "Invalid study, strategy, space, objective, or client configuration."
+);
+create_exception!(
+    hola_opt,
+    CheckpointError,
+    HolaError,
+    "Checkpoint loading or saving failed."
+);
+create_exception!(
+    hola_opt,
+    RemoteError,
+    HolaError,
+    "A remote server request, response, or protocol operation failed."
+);
+create_exception!(
+    hola_opt,
+    ObjectiveError,
+    HolaError,
+    "An objective result violated its declared contract or could not be reported."
+);
 
 // =============================================================================
 // Space building helpers
@@ -51,7 +89,7 @@ impl Real {
             // and is treated identically to "log".
             "linear" | "log" | "ln" | "log10" => {}
             _ => {
-                return Err(PyValueError::new_err(
+                return Err(ConfigurationError::new_err(
                     "scale must be \"linear\", \"log\", \"ln\", or \"log10\"",
                 ));
             }
@@ -234,17 +272,19 @@ impl Gmm {
         elite_fraction: Option<f64>,
         exploration_budget: Option<usize>,
     ) -> PyResult<Self> {
-        if let Some(ef) = elite_fraction
-            && (!ef.is_finite() || ef <= 0.0 || ef > 1.0)
-        {
-            return Err(PyValueError::new_err(
-                "elite_fraction must be finite and between 0.0 (exclusive) and 1.0 (inclusive)",
-            ));
+        if let Some(ef) = elite_fraction {
+            if !ef.is_finite() || ef <= 0.0 || ef > 1.0 {
+                return Err(ConfigurationError::new_err(
+                    "elite_fraction must be finite and between 0.0 (exclusive) and 1.0 (inclusive)",
+                ));
+            }
         }
-        if let Some(ri) = refit_interval
-            && ri == 0
-        {
-            return Err(PyValueError::new_err("refit_interval must be at least 1"));
+        if let Some(ri) = refit_interval {
+            if ri == 0 {
+                return Err(ConfigurationError::new_err(
+                    "refit_interval must be at least 1",
+                ));
+            }
         }
         Ok(Self {
             refit_interval,
@@ -332,7 +372,7 @@ fn extract_param_config(obj: &Bound<'_, PyAny>) -> PyResult<ParamConfig> {
     if let Ok(c) = obj.extract::<Categorical>() {
         return Ok(ParamConfig::Categorical { choices: c.choices });
     }
-    Err(PyValueError::new_err(
+    Err(ConfigurationError::new_err(
         "Parameter must be Real, Integer, or Categorical",
     ))
 }
@@ -407,10 +447,16 @@ fn rust_to_py_completed(
 ) -> PyResult<CompletedTrial> {
     Ok(CompletedTrial {
         trial_id: ct.trial_id,
-        params: json_to_py(py, &ct.params)?,
-        metrics: json_to_py(py, &ct.metrics)?,
-        scores: json_to_py(py, &ct.scores)?,
-        score_vector: json_to_py(py, &ct.score_vector)?,
+        // Parameters and raw metrics are arbitrary user JSON. In particular,
+        // categorical values and metadata may legitimately be the literal
+        // strings "inf", "-inf", or "nan", so preserve them verbatim.
+        params: json_to_py(py, &ct.params, JsonStringMode::Literal)?,
+        metrics: json_to_py(py, &ct.metrics, JsonStringMode::Literal)?,
+        // Scores are numeric protocol fields. The engine represents their
+        // non-finite values with the documented string sentinels because JSON
+        // numbers cannot encode them, so decode only in these numeric maps.
+        scores: json_to_py(py, &ct.scores, JsonStringMode::DecodeNonFinite)?,
+        score_vector: json_to_py(py, &ct.score_vector, JsonStringMode::DecodeNonFinite)?,
         rank: ct.rank,
         pareto_front: ct.pareto_front,
         completed_at: ct.completed_at,
@@ -421,22 +467,201 @@ fn rust_to_py_completed(
 // Study: the main user-facing class
 // =============================================================================
 
-/// Internal representation: local engine or remote HTTP client.
+const DEFAULT_CONNECT_TIMEOUT_SECONDS: f64 = 10.0;
+const DEFAULT_REQUEST_TIMEOUT_SECONDS: f64 = 30.0;
+const MAX_ERROR_BODY_CHARS: usize = 4096;
+
+/// One runtime owns all async work issued by Python studies for the lifetime of
+/// the process. Keeping it in a `OnceLock` prevents each `Study` from creating a
+/// full worker pool while still allowing calls from multiple Python threads.
+static SHARED_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+
+fn shared_runtime() -> PyResult<&'static tokio::runtime::Runtime> {
+    match SHARED_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .thread_name("hola-py-worker")
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Failed to create runtime: {e}"))
+    }) {
+        Ok(runtime) => Ok(runtime),
+        Err(message) => Err(HolaError::new_err(message.clone())),
+    }
+}
+
+fn timeout_duration(name: &str, seconds: f64) -> PyResult<Duration> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(ConfigurationError::new_err(format!(
+            "{name} must be a finite number greater than zero"
+        )));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+struct RemoteHttpClient {
+    client: reqwest::Client,
+    token: Option<String>,
+    /// One unresolved ask key is retained until a complete, valid response is
+    /// received. The mutex also serializes concurrent calls so two callers
+    /// cannot accidentally share the same in-flight key/trial.
+    ask_idempotency_key: Mutex<Option<String>>,
+}
+
+impl RemoteHttpClient {
+    fn new(token: Option<String>, connect_timeout: f64, request_timeout: f64) -> PyResult<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(timeout_duration("connect_timeout", connect_timeout)?)
+            .timeout(timeout_duration("request_timeout", request_timeout)?)
+            .build()
+            .map_err(|e| {
+                ConfigurationError::new_err(format!("Failed to create HTTP client: {e}"))
+            })?;
+        Ok(Self {
+            client,
+            token,
+            ask_idempotency_key: Mutex::new(None),
+        })
+    }
+
+    fn with_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.token.as_deref() {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
+    }
+
+    fn get(&self, url: String) -> reqwest::RequestBuilder {
+        self.with_auth(self.client.get(url))
+    }
+
+    fn post(&self, url: String) -> reqwest::RequestBuilder {
+        self.with_auth(self.client.post(url))
+    }
+
+    fn patch(&self, url: String) -> reqwest::RequestBuilder {
+        self.with_auth(self.client.patch(url))
+    }
+}
+
+async fn send_remote(request: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
+    request.send().await.map_err(|e| {
+        if e.is_timeout() {
+            format!("HTTP request timed out: {e}")
+        } else if e.is_connect() {
+            format!("HTTP connection failed: {e}")
+        } else {
+            format!("HTTP request failed: {e}")
+        }
+    })
+}
+
+async fn response_error(response: reqwest::Response) -> String {
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("unable to read error response: {e}"));
+    let detail = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .or_else(|| value.get("message"))
+                .map(|detail| {
+                    detail
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| detail.to_string())
+                })
+        })
+        .unwrap_or_else(|| {
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                "empty response body".to_string()
+            } else {
+                trimmed.chars().take(MAX_ERROR_BODY_CHARS).collect()
+            }
+        });
+    format!("Server returned HTTP {status}: {detail}")
+}
+
+async fn checked_response(request: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
+    let response = send_remote(request).await?;
+    if response.status().is_success() {
+        Ok(response)
+    } else {
+        Err(response_error(response).await)
+    }
+}
+
+async fn response_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, String> {
+    response
+        .json()
+        .await
+        .map_err(|e| format!("Invalid JSON response from server: {e}"))
+}
+
+async fn checked_json<T: DeserializeOwned>(request: reqwest::RequestBuilder) -> Result<T, String> {
+    response_json(checked_response(request).await?).await
+}
+
+fn validate_remote_trial_identity(
+    trial: serde_json::Value,
+    expected_trial_id: u64,
+    source: &str,
+) -> Result<serde_json::Value, String> {
+    let returned_trial_id = trial
+        .get("trial_id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{source} is missing trial_id"))?;
+    if returned_trial_id != expected_trial_id {
+        return Err(format!(
+            "{source} returned trial_id {returned_trial_id} instead of {expected_trial_id}"
+        ));
+    }
+    Ok(trial)
+}
+
+fn validate_status_ok(body: &serde_json::Value, operation: &str) -> Result<(), String> {
+    if body.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        return Err(format!(
+            "{operation} acknowledgement is missing canonical status 'ok'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_post_commit_warnings(
+    body: &serde_json::Value,
+    operation: &str,
+) -> Result<Vec<String>, String> {
+    match body.get("post_commit_warnings") {
+        None => Ok(Vec::new()),
+        Some(serde_json::Value::Array(warnings)) => warnings
+            .iter()
+            .map(|warning| {
+                warning.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    format!(
+                        "{operation} acknowledgement has a non-string post_commit_warnings entry"
+                    )
+                })
+            })
+            .collect(),
+        Some(_) => Err(format!(
+            "{operation} acknowledgement has non-array post_commit_warnings"
+        )),
+    }
+}
+
+/// Internal representation: local engine or remote HTTP client. Async work is
+/// executed on `SHARED_RUNTIME`, never on a runtime owned by an individual study.
 // Exactly one StudyInner exists per Study (never stored in a collection), so the
 // size gap between the engine-bearing Local variant and the Remote variant is
 // immaterial; boxing the engine would only add an indirection for no benefit.
 #[allow(clippy::large_enum_variant)]
 enum StudyInner {
-    Local {
-        engine: HolaEngine,
-        runtime: tokio::runtime::Runtime,
-    },
-    Remote {
-        url: String,
-        token: Option<String>,
-        client: reqwest::Client,
-        runtime: tokio::runtime::Runtime,
-    },
+    Local { engine: HolaEngine },
+    Remote { url: String, http: RemoteHttpClient },
 }
 
 /// The main optimization study.
@@ -465,7 +690,7 @@ struct Study {
 
 fn extract_objectives(objectives: &Bound<'_, PyList>) -> PyResult<Vec<ObjectiveConfig>> {
     if objectives.len() == 0 {
-        return Err(PyValueError::new_err(
+        return Err(ConfigurationError::new_err(
             "At least one objective is required (e.g., [Minimize('loss')])",
         ));
     }
@@ -490,22 +715,12 @@ fn extract_objectives(objectives: &Bound<'_, PyList>) -> PyResult<Vec<ObjectiveC
                 group: m.group,
             });
         } else {
-            return Err(PyValueError::new_err(
+            return Err(ConfigurationError::new_err(
                 "Objectives must be Minimize or Maximize instances",
             ));
         }
     }
     Ok(obj_configs)
-}
-
-fn with_remote_auth(
-    request: reqwest::RequestBuilder,
-    token: &Option<String>,
-) -> reqwest::RequestBuilder {
-    match token.as_deref() {
-        Some(token) => request.bearer_auth(token),
-        None => request,
-    }
 }
 
 #[pymethods]
@@ -523,7 +738,7 @@ impl Study {
         let obj_configs = extract_objectives(objectives)?;
 
         if let Some(0) = max_leaderboard_size {
-            return Err(PyValueError::new_err(
+            return Err(ConfigurationError::new_err(
                 "max_leaderboard_size must be at least 1",
             ));
         }
@@ -572,7 +787,7 @@ impl Study {
                     }
                 } else {
                     let name: String = s.extract().map_err(|_| {
-                        PyValueError::new_err(
+                        ConfigurationError::new_err(
                             "strategy must be a string (\"gmm\", \"sobol\", \"random\") \
                              or a strategy class (Gmm, Sobol, Random)",
                         )
@@ -598,14 +813,14 @@ impl Study {
             max_leaderboard_size,
         };
 
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| PyValueError::new_err(format!("Failed to create runtime: {e}")))?;
-
         let engine = HolaEngine::from_config(config)
-            .map_err(|e| PyValueError::new_err(format!("Failed to create engine: {e}")))?;
+            .map_err(|e| ConfigurationError::new_err(format!("Failed to create engine: {e}")))?;
+        // Initialize the process-wide runtime only after configuration validation
+        // succeeds, so invalid studies do not create worker threads as a side effect.
+        shared_runtime()?;
 
         Ok(Self {
-            inner: StudyInner::Local { engine, runtime },
+            inner: StudyInner::Local { engine },
         })
     }
 
@@ -613,31 +828,62 @@ impl Study {
     ///
     /// The connection is established lazily on the first ``ask``/``tell``; this
     /// call only validates and stores the URL (no network request is made here).
+    ///
+    /// Args:
+    ///     url: Base URL of the HOLA server.
+    ///     token: Optional bearer token sent with every remote request.
+    ///     connect_timeout: Maximum seconds allowed to establish a connection.
+    ///     request_timeout: Maximum seconds allowed for a complete HTTP request.
     #[staticmethod]
-    #[pyo3(signature = (url, token=None))]
-    fn connect(url: &str, token: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (url, token=None, *, connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS, request_timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS))]
+    fn connect(
+        url: &str,
+        token: Option<String>,
+        connect_timeout: f64,
+        request_timeout: f64,
+    ) -> PyResult<Self> {
         // Validate the URL up front so a malformed or non-HTTP URL fails here
         // with a clear error rather than at the first ask/tell. No network
         // request is made; the connection is established lazily.
-        let parsed = reqwest::Url::parse(url)
-            .map_err(|e| PyValueError::new_err(format!("Invalid server URL '{url}': {e}")))?;
+        let mut parsed = reqwest::Url::parse(url)
+            .map_err(|e| ConfigurationError::new_err(format!("Invalid server URL '{url}': {e}")))?;
         match parsed.scheme() {
             "http" | "https" => {}
             other => {
-                return Err(PyValueError::new_err(format!(
+                return Err(ConfigurationError::new_err(format!(
                     "Server URL must use the http or https scheme, got '{other}'"
                 )));
             }
         }
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| PyValueError::new_err(format!("Failed to create runtime: {e}")))?;
-        let client = reqwest::Client::new();
+        if parsed.host_str().is_none() {
+            return Err(ConfigurationError::new_err(format!(
+                "Invalid server URL '{url}': missing host"
+            )));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(ConfigurationError::new_err(
+                "Server URL must not contain embedded userinfo; pass token= for authentication",
+            ));
+        }
+        if parsed.query().is_some() {
+            return Err(ConfigurationError::new_err(
+                "Server URL must not contain query parameters",
+            ));
+        }
+        if parsed.fragment().is_some() {
+            return Err(ConfigurationError::new_err(
+                "Server URL must not contain a fragment",
+            ));
+        }
+        let normalized_path = parsed.path().trim_end_matches('/').to_string();
+        parsed.set_path(&normalized_path);
+        let normalized_url = parsed.to_string().trim_end_matches('/').to_string();
+        let http = RemoteHttpClient::new(token, connect_timeout, request_timeout)?;
+        shared_runtime()?;
         Ok(Self {
             inner: StudyInner::Remote {
-                url: url.trim_end_matches('/').to_string(),
-                token,
-                client,
-                runtime,
+                url: normalized_url,
+                http,
             },
         })
     }
@@ -654,71 +900,72 @@ impl Study {
     /// Returns:
     ///     A fully restored Study that can immediately resume ``ask``/``tell``.
     #[staticmethod]
-    fn load(path: &str) -> PyResult<Self> {
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| PyValueError::new_err(format!("Failed to create runtime: {e}")))?;
-
-        let engine = runtime
-            .block_on(HolaEngine::load_from_checkpoint(path))
-            .map_err(|e| PyValueError::new_err(format!("Failed to load checkpoint: {e}")))?;
+    fn load(py: Python<'_>, path: &str) -> PyResult<Self> {
+        let runtime = shared_runtime()?;
+        // Loading performs filesystem I/O, JSON validation, and strategy
+        // reconstruction. Own the path and release the GIL for the whole
+        // operation so unrelated Python threads keep making progress on large
+        // checkpoints.
+        let path = path.to_string();
+        let engine = py
+            .detach(|| runtime.block_on(HolaEngine::load_from_checkpoint(&path)))
+            .map_err(|e| CheckpointError::new_err(format!("Failed to load checkpoint: {e}")))?;
 
         Ok(Self {
-            inner: StudyInner::Local { engine, runtime },
+            inner: StudyInner::Local { engine },
         })
     }
 
     /// Request the next trial to evaluate.
     fn ask(&self, py: Python<'_>) -> PyResult<Trial> {
+        let runtime = shared_runtime()?;
         match &self.inner {
-            StudyInner::Local { engine, runtime } => {
+            StudyInner::Local { engine } => {
                 // Release the GIL while the engine future runs (RwLock, sampling).
                 let dyn_trial = py
                     .detach(|| runtime.block_on(engine.ask()))
-                    .map_err(PyValueError::new_err)?;
-                let params = json_to_py(py, &dyn_trial.params)?;
+                    .map_err(HolaError::new_err)?;
+                let params = json_to_py(py, &dyn_trial.params, JsonStringMode::Literal)?;
                 Ok(Trial {
                     trial_id: dyn_trial.trial_id,
                     params,
                 })
             }
-            StudyInner::Remote {
-                url,
-                token,
-                client,
-                runtime,
-            } => {
-                // Release the GIL during the HTTP round-trip.
-                let resp: serde_json::Value = py
+            StudyInner::Remote { url, http } => {
+                // Release the GIL during the HTTP round-trip. Keep the same key
+                // after any transport, status, JSON, or schema error: the server
+                // may already have allocated the trial even though this client
+                // did not receive an unambiguous response. Validation happens
+                // while the key slot is locked; only a complete response rotates
+                // it. This also gives concurrent ask() calls distinct keys.
+                let (trial_id, params_json): (u64, serde_json::Value) = py
                     .detach(|| {
-                        runtime.block_on(async {
-                            let resp =
-                                with_remote_auth(client.post(format!("{url}/api/ask")), token)
-                                    .send()
-                                    .await
-                                    .map_err(|e| format!("HTTP error: {e}"))?;
-                            if !resp.status().is_success() {
-                                let body = resp
-                                    .text()
-                                    .await
-                                    .unwrap_or_else(|_| "unknown error".to_string());
-                                return Err(format!("Server error: {body}"));
-                            }
-                            resp.json().await.map_err(|e| format!("JSON error: {e}"))
-                        })
+                        let mut key_slot = http.ask_idempotency_key.lock().map_err(|_| {
+                            "Remote ask idempotency state is unavailable".to_string()
+                        })?;
+                        let idempotency_key = key_slot
+                            .get_or_insert_with(|| Uuid::new_v4().to_string())
+                            .clone();
+                        let resp: serde_json::Value = runtime.block_on(checked_json(
+                            http.post(format!("{url}/api/ask"))
+                                .header("Idempotency-Key", idempotency_key),
+                        ))?;
+                        let trial_id = resp
+                            .get("trial_id")
+                            .and_then(|v| v.as_u64())
+                            .ok_or_else(|| "Missing 'trial_id' in server response".to_string())?;
+                        let params = resp
+                            .get("params")
+                            .filter(|params| params.is_object())
+                            .cloned()
+                            .ok_or_else(|| {
+                                "Missing or non-object 'params' in server response".to_string()
+                            })?;
+                        *key_slot = None;
+                        Ok::<_, String>((trial_id, params))
                     })
-                    .map_err(PyValueError::new_err)?;
-
-                let trial_id = resp
-                    .get("trial_id")
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| {
-                        PyValueError::new_err("Missing 'trial_id' in server response")
-                    })?;
-                let params_json = resp
-                    .get("params")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let params = json_to_py(py, &params_json)?;
+                    .map_err(RemoteError::new_err)?;
+                let params = json_to_py(py, &params_json, JsonStringMode::Literal)?;
                 Ok(Trial { trial_id, params })
             }
         }
@@ -733,88 +980,101 @@ impl Study {
     ) -> PyResult<CompletedTrial> {
         // Convert the metrics dict to owned JSON before releasing the GIL.
         let raw = py_dict_to_json(metrics)?;
+        let runtime = shared_runtime()?;
         match &self.inner {
-            StudyInner::Local { engine, runtime } => {
+            StudyInner::Local { engine } => {
                 // Release the GIL during the engine future (RwLock, GMM refit,
                 // Pareto ranking).
                 let completed = py
                     .detach(|| runtime.block_on(engine.tell(trial_id, raw)))
-                    .map_err(PyValueError::new_err)?;
+                    .map_err(ObjectiveError::new_err)?;
                 rust_to_py_completed(py, &completed)
             }
-            StudyInner::Remote {
-                url,
-                token,
-                client,
-                runtime,
-            } => {
+            StudyInner::Remote { url, http } => {
                 // Release the GIL during the HTTP round-trip(s).
-                let trial_json: serde_json::Value = py
+                let (trial_json, post_commit_warnings): (serde_json::Value, Vec<String>) = py
                     .detach(|| {
                         runtime.block_on(async {
-                            let resp =
-                                with_remote_auth(client.post(format!("{url}/api/tell")), token)
+                            let tell_body: serde_json::Value = checked_json(
+                                http.post(format!("{url}/api/tell"))
                                     .json(&serde_json::json!({
                                         "trial_id": trial_id,
                                         "metrics": raw,
-                                    }))
-                                    .send()
-                                    .await
-                                    .map_err(|e| format!("HTTP error: {e}"))?;
-
-                            if !resp.status().is_success() {
-                                let body = resp
-                                    .text()
-                                    .await
-                                    .unwrap_or_else(|_| "unknown error".to_string());
-                                return Err(format!("Server error: {body}"));
-                            }
-                            let tell_body: serde_json::Value =
-                                resp.json().await.map_err(|e| format!("JSON error: {e}"))?;
+                                    })),
+                            )
+                            .await?;
+                            validate_status_ok(&tell_body, "Tell")?;
+                            let post_commit_warnings =
+                                validate_post_commit_warnings(&tell_body, "Tell")?;
                             if let Some(trial) = tell_body.get("trial") {
-                                return Ok(trial.clone());
+                                return Ok((
+                                    validate_remote_trial_identity(
+                                        trial.clone(),
+                                        trial_id,
+                                        "Tell acknowledgement",
+                                    )?,
+                                    post_commit_warnings,
+                                ));
                             }
 
-                            let trial_resp = client
-                                .get(format!(
-                                    "{url}/api/trial/{trial_id}?include_infeasible=true"
-                                ))
-                                .send()
-                                .await
-                                .map_err(|e| format!("HTTP error: {e}"))?;
+                            // Compatibility fallback for older servers whose
+                            // tell response did not embed the completed trial.
+                            // A missing single-trial endpoint is expected on
+                            // those versions; every other HTTP error is surfaced.
+                            let trial_resp = send_remote(http.get(format!(
+                                "{url}/api/trial/{trial_id}?include_infeasible=true"
+                            )))
+                            .await?;
                             if trial_resp.status().is_success() {
-                                return trial_resp
-                                    .json()
-                                    .await
-                                    .map_err(|e| format!("JSON error: {e}"));
+                                let trial = response_json(trial_resp).await?;
+                                return Ok((
+                                    validate_remote_trial_identity(
+                                        trial,
+                                        trial_id,
+                                        "Single-trial response",
+                                    )?,
+                                    post_commit_warnings,
+                                ));
+                            }
+                            if trial_resp.status() != reqwest::StatusCode::NOT_FOUND
+                                && trial_resp.status() != reqwest::StatusCode::METHOD_NOT_ALLOWED
+                            {
+                                return Err(response_error(trial_resp).await);
                             }
 
-                            let trials_resp: Vec<serde_json::Value> = client
-                                .get(format!(
-                                    "{url}/api/trials?sorted_by=index&include_infeasible=true"
-                                ))
-                                .send()
-                                .await
-                                .map_err(|e| format!("HTTP error: {e}"))?
-                                .json()
-                                .await
-                                .map_err(|e| format!("JSON error: {e}"))?;
-                            trials_resp
+                            let trials_resp: Vec<serde_json::Value> = checked_json(http.get(
+                                format!("{url}/api/trials?sorted_by=index&include_infeasible=true"),
+                            ))
+                            .await?;
+                            let trial = trials_resp
                                 .into_iter()
                                 .find(|t| {
                                     t.get("trial_id").and_then(|v| v.as_u64()) == Some(trial_id)
                                 })
                                 .ok_or_else(|| {
                                     format!("Trial {trial_id} not found in server response")
-                                })
+                                })?;
+                            Ok((trial, post_commit_warnings))
                         })
                     })
-                    .map_err(PyValueError::new_err)?;
+                    .map_err(RemoteError::new_err)?;
 
                 let ct: hola_engine::hola_engine::CompletedTrial =
-                    serde_json::from_value(trial_json).map_err(|e| {
-                        PyValueError::new_err(format!("Deserialization error: {e}"))
-                    })?;
+                    serde_json::from_value(trial_json)
+                        .map_err(|e| RemoteError::new_err(format!("Deserialization error: {e}")))?;
+                let runtime_warning = py.get_type::<PyRuntimeWarning>();
+                let warnings = PyModule::import(py, "warnings")?;
+                for warning in post_commit_warnings {
+                    // Warning filters can be configured as errors. A trial is
+                    // already committed at this point, so never turn operator
+                    // notification policy into an ambiguous tell exception.
+                    if warnings
+                        .call_method1("warn", (&warning, &runtime_warning, 2))
+                        .is_err()
+                    {
+                        eprintln!("[hola] post-commit warning: {warning}");
+                    }
+                }
                 rust_to_py_completed(py, &ct)
             }
         }
@@ -822,69 +1082,99 @@ impl Study {
 
     /// Cancel a pending trial.
     fn cancel(&self, py: Python<'_>, trial_id: u64) -> PyResult<()> {
+        let runtime = shared_runtime()?;
         match &self.inner {
-            StudyInner::Local { engine, runtime } => py
+            StudyInner::Local { engine } => py
                 .detach(|| runtime.block_on(engine.cancel(trial_id)))
-                .map_err(PyValueError::new_err),
-            StudyInner::Remote {
-                url,
-                token,
-                client,
-                runtime,
-            } => py
+                .map_err(HolaError::new_err),
+            StudyInner::Remote { url, http } => py
                 .detach(|| {
                     runtime.block_on(async {
-                        let resp =
-                            with_remote_auth(client.post(format!("{url}/api/cancel")), token)
-                                .json(&serde_json::json!({ "trial_id": trial_id }))
-                                .send()
-                                .await
-                                .map_err(|e| format!("HTTP error: {e}"))?;
-
-                        if !resp.status().is_success() {
-                            let body = resp
-                                .text()
-                                .await
-                                .unwrap_or_else(|_| "unknown error".to_string());
-                            return Err(format!("Server error: {body}"));
+                        let acknowledgement: serde_json::Value = checked_json(
+                            http.post(format!("{url}/api/cancel"))
+                                .json(&serde_json::json!({ "trial_id": trial_id })),
+                        )
+                        .await?;
+                        validate_status_ok(&acknowledgement, "Cancel")?;
+                        if let Some(value) = acknowledgement.get("trial_id") {
+                            let acknowledged_id = value.as_u64().ok_or_else(|| {
+                                "Cancel acknowledgement has a non-integer trial_id".to_string()
+                            })?;
+                            if acknowledged_id != trial_id {
+                                return Err(format!(
+                                    "Cancel acknowledgement returned trial_id {acknowledged_id} instead of {trial_id}"
+                                ));
+                            }
                         }
-                        Ok(())
+                        Ok::<(), String>(())
                     })
                 })
-                .map_err(PyValueError::new_err),
+                .map_err(RemoteError::new_err),
+        }
+    }
+
+    /// Renew the server-managed lease for a pending remote trial.
+    ///
+    /// Returns the new absolute lease deadline as Unix milliseconds. Local
+    /// studies do not use distributed leases and reject this operation.
+    fn heartbeat(&self, py: Python<'_>, trial_id: u64) -> PyResult<u64> {
+        let runtime = shared_runtime()?;
+        match &self.inner {
+            StudyInner::Local { .. } => Err(ConfigurationError::new_err(
+                "heartbeat() is only available for remote connections",
+            )),
+            StudyInner::Remote { url, http } => {
+                let response: serde_json::Value = py
+                    .detach(|| {
+                        runtime.block_on(checked_json(
+                            http.post(format!("{url}/api/heartbeat"))
+                                .json(&serde_json::json!({ "trial_id": trial_id })),
+                        ))
+                    })
+                    .map_err(RemoteError::new_err)?;
+                if response.get("status").and_then(|value| value.as_str()) != Some("ok") {
+                    return Err(RemoteError::new_err(
+                        "Heartbeat response is missing status 'ok'",
+                    ));
+                }
+                let response_trial_id = response
+                    .get("trial_id")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| {
+                    RemoteError::new_err("Heartbeat response is missing 'trial_id'")
+                })?;
+                if response_trial_id != trial_id {
+                    return Err(RemoteError::new_err(format!(
+                        "Heartbeat response returned trial_id {response_trial_id} instead of {trial_id}"
+                    )));
+                }
+                response
+                    .get("lease_expires_at_ms")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| {
+                        RemoteError::new_err("Heartbeat response is missing 'lease_expires_at_ms'")
+                    })
+            }
         }
     }
 
     /// Get the top-k trials by rank.
     #[pyo3(signature = (k, include_infeasible=false))]
     fn top_k(&self, py: Python<'_>, k: usize, include_infeasible: bool) -> PyResult<Py<PyList>> {
+        let runtime = shared_runtime()?;
         match &self.inner {
-            StudyInner::Local { engine, runtime } => {
+            StudyInner::Local { engine } => {
                 let trials = py.detach(|| runtime.block_on(engine.top_k(k, include_infeasible)));
                 completed_vec_to_pylist(py, &trials)
             }
-            StudyInner::Remote {
-                url,
-                client,
-                runtime,
-                ..
-            } => {
+            StudyInner::Remote { url, http } => {
                 let resp: Vec<serde_json::Value> = py
                     .detach(|| {
-                        runtime.block_on(async {
-                            client
-                                .get(format!(
-                                    "{url}/api/top_k?k={k}&include_infeasible={include_infeasible}"
-                                ))
-                                .send()
-                                .await
-                                .map_err(|e| format!("HTTP error: {e}"))?
-                                .json()
-                                .await
-                                .map_err(|e| format!("JSON error: {e}"))
-                        })
+                        runtime.block_on(checked_json(http.get(format!(
+                            "{url}/api/top_k?k={k}&include_infeasible={include_infeasible}"
+                        ))))
                     })
-                    .map_err(PyValueError::new_err)?;
+                    .map_err(RemoteError::new_err)?;
                 json_vec_to_completed_pylist(py, resp)
             }
         }
@@ -898,34 +1188,21 @@ impl Study {
         front: usize,
         include_infeasible: bool,
     ) -> PyResult<Py<PyList>> {
+        let runtime = shared_runtime()?;
         match &self.inner {
-            StudyInner::Local { engine, runtime } => {
+            StudyInner::Local { engine } => {
                 let trials =
                     py.detach(|| runtime.block_on(engine.pareto_front(front, include_infeasible)));
                 completed_vec_to_pylist(py, &trials)
             }
-            StudyInner::Remote {
-                url,
-                client,
-                runtime,
-                ..
-            } => {
+            StudyInner::Remote { url, http } => {
                 let resp: Vec<serde_json::Value> = py
                     .detach(|| {
-                        runtime.block_on(async {
-                            client
-                                .get(format!(
+                        runtime.block_on(checked_json(http.get(format!(
                                     "{url}/api/pareto_front?front={front}&include_infeasible={include_infeasible}"
-                                ))
-                                .send()
-                                .await
-                                .map_err(|e| format!("HTTP error: {e}"))?
-                                .json()
-                                .await
-                                .map_err(|e| format!("JSON error: {e}"))
-                        })
+                                ))))
                     })
-                    .map_err(PyValueError::new_err)?;
+                    .map_err(RemoteError::new_err)?;
                 json_vec_to_completed_pylist(py, resp)
             }
         }
@@ -941,34 +1218,21 @@ impl Study {
     ) -> PyResult<Py<PyList>> {
         // Own the sort key so the detach closure does not borrow the Python str.
         let sorted_by = sorted_by.to_string();
+        let runtime = shared_runtime()?;
         match &self.inner {
-            StudyInner::Local { engine, runtime } => {
+            StudyInner::Local { engine } => {
                 let trials =
                     py.detach(|| runtime.block_on(engine.trials(&sorted_by, include_infeasible)));
                 completed_vec_to_pylist(py, &trials)
             }
-            StudyInner::Remote {
-                url,
-                client,
-                runtime,
-                ..
-            } => {
+            StudyInner::Remote { url, http } => {
                 let resp: Vec<serde_json::Value> = py
                     .detach(|| {
-                        runtime.block_on(async {
-                            client
-                                .get(format!(
+                        runtime.block_on(checked_json(http.get(format!(
                                     "{url}/api/trials?sorted_by={sorted_by}&include_infeasible={include_infeasible}"
-                                ))
-                                .send()
-                                .await
-                                .map_err(|e| format!("HTTP error: {e}"))?
-                                .json()
-                                .await
-                                .map_err(|e| format!("JSON error: {e}"))
-                        })
+                                ))))
                     })
-                    .map_err(PyValueError::new_err)?;
+                    .map_err(RemoteError::new_err)?;
                 json_vec_to_completed_pylist(py, resp)
             }
         }
@@ -976,36 +1240,21 @@ impl Study {
 
     /// Number of completed trials.
     fn trial_count(&self, py: Python<'_>) -> PyResult<usize> {
+        let runtime = shared_runtime()?;
         match &self.inner {
-            StudyInner::Local { engine, runtime } => {
+            StudyInner::Local { engine } => {
                 Ok(py.detach(|| runtime.block_on(engine.trial_count())))
             }
-            StudyInner::Remote {
-                url,
-                client,
-                runtime,
-                ..
-            } => {
+            StudyInner::Remote { url, http } => {
                 let resp: serde_json::Value = py
                     .detach(|| {
-                        runtime.block_on(async {
-                            client
-                                .get(format!("{url}/api/trial_count"))
-                                .send()
-                                .await
-                                .map_err(|e| format!("HTTP error: {e}"))?
-                                .json()
-                                .await
-                                .map_err(|e| format!("JSON error: {e}"))
-                        })
+                        runtime.block_on(checked_json(http.get(format!("{url}/api/trial_count"))))
                     })
-                    .map_err(PyValueError::new_err)?;
+                    .map_err(RemoteError::new_err)?;
                 resp.get("trial_count")
                     .and_then(|v| v.as_u64())
                     .map(|n| n as usize)
-                    .ok_or_else(|| {
-                        PyValueError::new_err("Missing 'trial_count' in server response")
-                    })
+                    .ok_or_else(|| RemoteError::new_err("Missing 'trial_count' in server response"))
             }
         }
     }
@@ -1014,48 +1263,45 @@ impl Study {
     fn update_objectives(&self, py: Python<'_>, objectives: &Bound<'_, PyList>) -> PyResult<()> {
         // Convert objectives to owned Rust configs before releasing the GIL.
         let obj_configs = extract_objectives(objectives)?;
+        let runtime = shared_runtime()?;
         match &self.inner {
-            StudyInner::Local { engine, runtime } => py
+            StudyInner::Local { engine } => py
                 .detach(|| runtime.block_on(engine.update_objectives(obj_configs)))
-                .map_err(PyValueError::new_err),
-            StudyInner::Remote {
-                url,
-                token,
-                client,
-                runtime,
-            } => py
+                .map_err(ConfigurationError::new_err),
+            StudyInner::Remote { url, http } => py
                 .detach(|| {
                     runtime.block_on(async {
-                        let resp =
-                            with_remote_auth(client.patch(format!("{url}/api/objectives")), token)
-                                .json(&serde_json::json!({ "objectives": obj_configs }))
-                                .send()
-                                .await
-                                .map_err(|e| format!("HTTP error: {e}"))?;
-                        if !resp.status().is_success() {
-                            let body = resp
-                                .text()
-                                .await
-                                .unwrap_or_else(|_| "unknown error".to_string());
-                            return Err(format!("Server error: {body}"));
-                        }
-                        Ok(())
+                        let acknowledgement: serde_json::Value = checked_json(
+                            http.patch(format!("{url}/api/objectives"))
+                                .json(&serde_json::json!({ "objectives": obj_configs })),
+                        )
+                        .await?;
+                        validate_status_ok(&acknowledgement, "Objective update")?;
+                        acknowledgement
+                            .get("rescalarized_trials")
+                            .and_then(serde_json::Value::as_u64)
+                            .ok_or_else(|| {
+                                "Objective update acknowledgement is missing rescalarized_trials"
+                                    .to_string()
+                            })?;
+                        Ok::<(), String>(())
                     })
                 })
-                .map_err(PyValueError::new_err),
+                .map_err(RemoteError::new_err),
         }
     }
 
     /// Save a checkpoint to disk.
     fn save(&self, py: Python<'_>, path: &str) -> PyResult<()> {
         match &self.inner {
-            StudyInner::Local { engine, runtime } => {
+            StudyInner::Local { engine } => {
                 // Own the path so the detach closure does not borrow the Python str.
                 let path = path.to_string();
+                let runtime = shared_runtime()?;
                 py.detach(|| runtime.block_on(engine.save(&path)))
-                    .map_err(|e| PyValueError::new_err(format!("Save failed: {e}")))
+                    .map_err(|e| CheckpointError::new_err(format!("Save failed: {e}")))
             }
-            StudyInner::Remote { .. } => Err(PyValueError::new_err(
+            StudyInner::Remote { .. } => Err(ConfigurationError::new_err(
                 "save() is only available for local studies, not remote connections",
             )),
         }
@@ -1086,7 +1332,11 @@ impl Study {
         n_trials: usize,
         n_workers: usize,
     ) -> PyResult<Py<Self>> {
-        let n_workers = n_workers.max(1);
+        if n_trials == 0 {
+            return Ok(slf);
+        }
+        // Never create more executor threads than there is work to perform.
+        let n_workers = n_workers.clamp(1, n_trials);
 
         if n_workers <= 1 {
             // Sequential path: no thread pool overhead
@@ -1104,7 +1354,7 @@ impl Study {
                 let outcome = (|| -> PyResult<()> {
                     let result = func.call1((trial.params,))?;
                     let metrics_dict = result.cast::<PyDict>().map_err(|_| {
-                        PyValueError::new_err("Objective function must return a dict")
+                        ObjectiveError::new_err("Objective function must return a dict")
                     })?;
                     slf.borrow(py).tell(py, trial_id, metrics_dict)?;
                     Ok(())
@@ -1125,39 +1375,78 @@ impl Study {
             let mut outstanding: Vec<u64> = Vec::new();
 
             let outcome = (|| -> PyResult<()> {
-                let mut remaining = n_trials;
-                while remaining > 0 {
-                    let batch_size = remaining.min(n_workers);
+                let mut pending: Vec<(u64, Py<PyAny>)> = Vec::with_capacity(n_workers);
+                let mut submitted = 0usize;
+                let mut deferred_ask_error: Option<PyErr> = None;
 
-                    // Ask for a batch of trials
-                    let mut pending_trials: Vec<Trial> = Vec::with_capacity(batch_size);
-                    for _ in 0..batch_size {
-                        let trial = slf.borrow(py).ask(py)?;
-                        outstanding.push(trial.trial_id);
-                        pending_trials.push(trial);
+                // Keep at most n_workers evaluations in flight. Recording the
+                // id before submit ensures a rare submit failure still cancels
+                // the trial that ask() already reserved in the engine.
+                let submit_one = |pending: &mut Vec<(u64, Py<PyAny>)>,
+                                  outstanding: &mut Vec<u64>|
+                 -> PyResult<()> {
+                    let trial = slf.borrow(py).ask(py)?;
+                    let trial_id = trial.trial_id;
+                    outstanding.push(trial_id);
+                    let future = executor.call_method1("submit", (func, trial.params))?;
+                    pending.push((trial_id, future.unbind()));
+                    Ok(())
+                };
+
+                for _ in 0..n_workers {
+                    match submit_one(&mut pending, &mut outstanding) {
+                        Ok(()) => submitted += 1,
+                        Err(error) => {
+                            deferred_ask_error = Some(error);
+                            break;
+                        }
                     }
+                }
 
-                    // Submit all to executor
-                    let mut futures: Vec<(u64, Py<PyAny>)> = Vec::with_capacity(batch_size);
-                    for trial in &pending_trials {
-                        let future =
-                            executor.call_method1("submit", (func, trial.params.clone_ref(py)))?;
-                        futures.push((trial.trial_id, future.unbind()));
+                while !pending.is_empty() {
+                    // `as_completed` is rebuilt from the current in-flight set
+                    // and advanced once. This waits for whichever objective
+                    // finishes first, rather than blocking on submission order.
+                    let futures = PyList::empty(py);
+                    for (_, future) in &pending {
+                        futures.append(future.bind(py))?;
                     }
-
-                    // Collect results and tell
-                    for (trial_id, future) in futures {
-                        let future_bound = future.bind(py);
-                        let result = future_bound.call_method0("result")?;
-
-                        let metrics_dict = result.cast::<PyDict>().map_err(|_| {
-                            PyValueError::new_err("Objective function must return a dict")
+                    let finished = cf
+                        .getattr("as_completed")?
+                        .call1((futures,))?
+                        .call_method0("__next__")?;
+                    let finished_index = pending
+                        .iter()
+                        .position(|(_, future)| future.bind(py).is(&finished))
+                        .ok_or_else(|| {
+                            HolaError::new_err("Executor returned a future that was not in flight")
                         })?;
-                        slf.borrow(py).tell(py, trial_id, metrics_dict)?;
-                        outstanding.retain(|&id| id != trial_id);
-                    }
+                    let trial_id = pending[finished_index].0;
+                    let result = finished.call_method0("result")?;
+                    let metrics_dict = result.cast::<PyDict>().map_err(|_| {
+                        ObjectiveError::new_err("Objective function must return a dict")
+                    })?;
+                    slf.borrow(py).tell(py, trial_id, metrics_dict)?;
+                    pending.swap_remove(finished_index);
+                    outstanding.retain(|&id| id != trial_id);
 
-                    remaining -= batch_size;
+                    // Refill immediately after tell(), so later suggestions can
+                    // adapt to this just-completed observation and fast workers
+                    // do not wait for the slowest member of a fixed batch.
+                    if submitted < n_trials && deferred_ask_error.is_none() {
+                        match submit_one(&mut pending, &mut outstanding) {
+                            Ok(()) => submitted += 1,
+                            Err(error) => deferred_ask_error = Some(error),
+                        }
+                    }
+                }
+                // An ask can be rejected while already-submitted objectives are
+                // still completing (for example, at max_trials). Drain those
+                // futures first so an objective exception is not masked by the
+                // speculative refill error; surface the ask error only when all
+                // in-flight evaluations completed successfully.
+                if let Some(error) = deferred_ask_error {
+                    return Err(error);
                 }
                 Ok(())
             })();
@@ -1206,22 +1495,21 @@ impl Study {
         dashboard_path: Option<String>,
     ) -> PyResult<()> {
         match &self.inner {
-            StudyInner::Local { engine, runtime } => {
+            StudyInner::Local { engine } => {
                 let engine_clone = engine.clone();
                 let dash = dashboard_path.map(std::path::PathBuf::from);
+                let runtime = shared_runtime()?;
                 if background {
-                    // Spawn server on a new thread with its own tokio runtime.
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Runtime::new()
-                            .expect("Failed to create server runtime");
-                        if let Err(e) = rt.block_on(hola_engine::server::serve(
-                            engine_clone,
-                            port,
-                            dash.as_deref(),
-                        )) {
+                    // Detach the server task onto the process-wide runtime. The
+                    // static runtime owns its lifecycle, so neither a dedicated
+                    // caller thread nor another Tokio worker pool is needed.
+                    std::mem::drop(runtime.spawn(async move {
+                        if let Err(e) =
+                            hola_engine::server::serve(engine_clone, port, dash.as_deref()).await
+                        {
                             eprintln!("HOLA server error: {e}");
                         }
-                    });
+                    }));
                     Ok(())
                 } else {
                     // Block the current thread until the server is stopped.
@@ -1239,10 +1527,10 @@ impl Study {
                             ))
                             .map_err(|e| e.to_string())
                     })
-                    .map_err(|e| PyValueError::new_err(format!("Server error: {e}")))
+                    .map_err(|e| HolaError::new_err(format!("Server error: {e}")))
                 }
             }
-            StudyInner::Remote { .. } => Err(PyValueError::new_err(
+            StudyInner::Remote { .. } => Err(ConfigurationError::new_err(
                 "serve() is only available for local studies, not remote connections",
             )),
         }
@@ -1273,7 +1561,7 @@ fn json_vec_to_completed_pylist(
     // Consume each Value via into_iter() so deserialization does not clone.
     for item in items {
         let ct: hola_engine::hola_engine::CompletedTrial = serde_json::from_value(item)
-            .map_err(|e| PyValueError::new_err(format!("Deserialization error: {e}")))?;
+            .map_err(|e| RemoteError::new_err(format!("Deserialization error: {e}")))?;
         let py_ct = rust_to_py_completed(py, &ct)?;
         list.append(Py::new(py, py_ct)?)?;
     }
@@ -1284,7 +1572,19 @@ fn json_vec_to_completed_pylist(
 // JSON <-> Python conversion helpers
 // =============================================================================
 
-fn json_to_py(py: Python<'_>, val: &serde_json::Value) -> PyResult<Py<PyAny>> {
+#[derive(Clone, Copy)]
+enum JsonStringMode {
+    /// Preserve every JSON string exactly as supplied by the user/server.
+    Literal,
+    /// Decode the engine's non-finite sentinels in numeric score fields.
+    DecodeNonFinite,
+}
+
+fn json_to_py(
+    py: Python<'_>,
+    val: &serde_json::Value,
+    string_mode: JsonStringMode,
+) -> PyResult<Py<PyAny>> {
     match val {
         serde_json::Value::Null => Ok(py.None().into_pyobject(py)?.unbind()),
         serde_json::Value::Bool(b) => Ok((*b).into_pyobject(py)?.to_owned().into_any().unbind()),
@@ -1301,29 +1601,33 @@ fn json_to_py(py: Python<'_>, val: &serde_json::Value) -> PyResult<Py<PyAny>> {
                 Ok(py.None())
             }
         }
-        // Decode the engine's non-finite string convention back to floats so
-        // inf/-inf/nan round-trip through tell()/CompletedTrial.metrics.
-        serde_json::Value::String(s) if s == "inf" => {
+        serde_json::Value::String(s)
+            if matches!(string_mode, JsonStringMode::DecodeNonFinite) && s == "inf" =>
+        {
             Ok(f64::INFINITY.into_pyobject(py)?.into_any().unbind())
         }
-        serde_json::Value::String(s) if s == "-inf" => {
+        serde_json::Value::String(s)
+            if matches!(string_mode, JsonStringMode::DecodeNonFinite) && s == "-inf" =>
+        {
             Ok(f64::NEG_INFINITY.into_pyobject(py)?.into_any().unbind())
         }
-        serde_json::Value::String(s) if s == "nan" => {
+        serde_json::Value::String(s)
+            if matches!(string_mode, JsonStringMode::DecodeNonFinite) && s == "nan" =>
+        {
             Ok(f64::NAN.into_pyobject(py)?.into_any().unbind())
         }
         serde_json::Value::String(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
         serde_json::Value::Array(arr) => {
             let list = PyList::empty(py);
             for item in arr {
-                list.append(json_to_py(py, item)?)?;
+                list.append(json_to_py(py, item, string_mode)?)?;
             }
             Ok(list.into())
         }
         serde_json::Value::Object(map) => {
             let dict = PyDict::new(py);
             for (k, v) in map {
-                dict.set_item(k, json_to_py(py, v)?)?;
+                dict.set_item(k, json_to_py(py, v, string_mode)?)?;
             }
             Ok(dict.into())
         }
@@ -1333,7 +1637,9 @@ fn json_to_py(py: Python<'_>, val: &serde_json::Value) -> PyResult<Py<PyAny>> {
 fn py_dict_to_json(dict: &Bound<'_, PyDict>) -> PyResult<serde_json::Value> {
     let mut map = serde_json::Map::new();
     for (key, val) in dict.iter() {
-        let k: String = key.extract()?;
+        let k: String = key
+            .extract()
+            .map_err(|_| ObjectiveError::new_err("Objective metrics keys must be strings"))?;
         let v = py_to_json(&val)?;
         map.insert(k, v);
     }
@@ -1355,8 +1661,9 @@ fn py_to_json(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     } else if let Ok(f) = obj.extract::<f64>() {
         // serde_json cannot represent non-finite f64 as a JSON number (it would
         // silently become null), so encode using the engine's string convention
-        // ("inf", "-inf", "nan"). json_to_py decodes these back to the matching
-        // float, keeping inf/-inf/nan round-trippable through tell().
+        // ("inf", "-inf", "nan"). Raw metrics preserve those JSON strings on
+        // readback because the protocol cannot distinguish them from literal
+        // user strings; only computed numeric score fields decode sentinels.
         if f.is_finite() {
             Ok(serde_json::json!(f))
         } else if f.is_nan() {
@@ -1374,7 +1681,7 @@ fn py_to_json(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
         let arr: Result<Vec<_>, _> = list.iter().map(|item| py_to_json(&item)).collect();
         Ok(serde_json::Value::Array(arr?))
     } else {
-        Err(PyValueError::new_err(format!(
+        Err(ObjectiveError::new_err(format!(
             "Cannot convert Python object to JSON: {:?}",
             obj.get_type().name()?
         )))
@@ -1387,6 +1694,12 @@ fn py_to_json(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
 
 #[pymodule]
 fn hola_opt(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let py = m.py();
+    m.add("HolaError", py.get_type::<HolaError>())?;
+    m.add("ConfigurationError", py.get_type::<ConfigurationError>())?;
+    m.add("CheckpointError", py.get_type::<CheckpointError>())?;
+    m.add("RemoteError", py.get_type::<RemoteError>())?;
+    m.add("ObjectiveError", py.get_type::<ObjectiveError>())?;
     m.add_class::<Real>()?;
     m.add_class::<Integer>()?;
     m.add_class::<Categorical>()?;

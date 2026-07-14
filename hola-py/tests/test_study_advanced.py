@@ -48,10 +48,12 @@ def test_invalid_space_config_raises_with_parameter_name():
     with pytest.raises(ValueError, match="scale must be"):
         Real(0.0, 1.0, scale="log2")
 
-    with pytest.raises(ValueError, match="Parameter 'x'.*min must be less than max"):
+    with pytest.raises(ValueError, match="Parameter 'x'.*min must be less than or equal to max"):
         Study(space=Space(x=Real(1.0, 0.0)), objectives=[Minimize("loss")])
 
-    with pytest.raises(ValueError, match="Parameter 'layers'.*integer min"):
+    with pytest.raises(
+        ValueError, match="Parameter 'layers'.*min must be less than or equal to max"
+    ):
         Study(space=Space(layers=Integer(5, 1)), objectives=[Minimize("loss")])
 
     with pytest.raises(ValueError, match="Parameter 'opt'.*choices must not be empty"):
@@ -253,8 +255,8 @@ def test_sobol_unique_points_2d(sphere_space):
 def test_sobol_deterministic():
     space1 = Space(x=Real(0.0, 1.0), y=Real(0.0, 1.0))
     space2 = Space(x=Real(0.0, 1.0), y=Real(0.0, 1.0))
-    study1 = Study(space=space1, objectives=[Minimize("loss")], strategy="sobol")
-    study2 = Study(space=space2, objectives=[Minimize("loss")], strategy="sobol")
+    study1 = Study(space=space1, objectives=[Minimize("loss")], strategy="sobol", seed=42)
+    study2 = Study(space=space2, objectives=[Minimize("loss")], strategy="sobol", seed=42)
 
     for _ in range(20):
         t1 = study1.ask()

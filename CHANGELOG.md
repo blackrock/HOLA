@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- API tokens now protect read endpoints and SSE by default. The explicit
+  `--allow-unauthenticated-reads` flag restores the prior open-read behavior
+  for trusted deployments.
+- Checkpoints now preserve non-finite observations and pending job identity,
+  validate internal invariants, and move serialization/filesystem work off the
+  async runtime.
+- Checkpoint format 2 records lossless floats, pending ask idempotency keys, and
+  renewable job leases while retaining migration support for intact version 1
+  checkpoints. Finite JSON floats now also round-trip bit-for-bit.
+- Distributed asks and tells are idempotent; workers use bounded request and
+  command timeouts, durable result outboxes, and process-tree termination.
+  Bounded completion receipts preserve exact tell retries after leaderboard
+  eviction and restart without emitting duplicate completion events.
+- Servers expose health, readiness, Prometheus metrics, request IDs, graceful
+  shutdown, replayable SSE, configurable leases, and a separate read-only role.
+  Cross-origin requests are rejected before dispatch and shutdown drain time is
+  bounded even for long-lived connections. Committed tell/objective maintenance
+  is cancellation-shielded, warning-producing, and separately counted.
+- Space, refit, leaderboard, and GMM state now validate invariants at every
+  construction/deserialization boundary. Two-objective ranking uses an
+  O(N log N) sweep and GMM hot paths reuse allocations and cached distributions.
+- Python studies share one runtime, release the GIL around remote work, schedule
+  parallel objectives by completion, export typed error subclasses, and bundle
+  the versioned dashboard in editable trees, wheels, and source distributions.
+- The dashboard is dependency-free/offline-capable, renders untrusted data as
+  inert text, preserves categorical checkpoint metadata, closes snapshot/SSE
+  races with replay cursors, and uses indexed incremental caches for bounded
+  six-figure rendering.
+- CI pins toolchains and actions, tests the supported OS/Python/MSRV surfaces,
+  audits dependencies, builds release artifacts for supported platforms, and
+  verifies package metadata, licenses, docs, and dashboard contracts.
+
 ## 1.0.1-rc7
 
 This release candidate continues the audit and hardening pass for the

@@ -44,6 +44,35 @@ from hola_opt import (
 )
 ```
 
+## Exceptions
+
+HOLA exposes a small exception hierarchy so callers can distinguish failures
+without parsing message text:
+
+| Exception | Meaning |
+|-----------|---------|
+| `HolaError` | Base class for errors raised by HOLA |
+| `ConfigurationError` | Invalid space, objective, strategy, study, URL, or timeout configuration |
+| `CheckpointError` | Checkpoint loading or saving failed |
+| `RemoteError` | Remote transport, HTTP status, response schema, or protocol failure |
+| `ObjectiveError` | Objective metrics have the wrong shape or violate the declared contract |
+
+All five classes subclass `ValueError`, so code written for earlier releases
+that catches `ValueError` remains compatible. Exceptions raised by the user's
+objective function itself are propagated unchanged, including their traceback.
+
+```python
+from hola_opt import ConfigurationError, RemoteError, Study
+
+try:
+    remote = Study.connect("https://hola.example.com", request_timeout=30)
+    trial = remote.ask()
+except ConfigurationError as error:
+    print(f"Invalid client configuration: {error}")
+except RemoteError as error:
+    print(f"Server request failed: {error}")
+```
+
 ## Defining Parameter Spaces
 
 A `Space` is built by passing parameter builders as keyword
@@ -152,9 +181,10 @@ objectives=[
 ]
 ```
 
-HOLA scalarizes multiple objectives into a single score using a
-priority-weighted sum. By default, all objectives have
-`priority=1.0`.
+Because `group` is omitted here, each field becomes its own priority group and
+the leaderboard uses Pareto/NSGA-II ranking over the two group costs. HOLA sums
+priority-weighted objective contributions only *within* one shared group. To
+request scalar ranking for several fields, give them the same `group` label.
 
 ### Target-Limit-Priority (TLP) Objectives
 
@@ -182,8 +212,8 @@ for the full explanation.
 
 ### Priority Groups
 
-To enable Pareto-front multi-objective optimization, assign
-objectives to different groups using the `group` parameter.
+To control Pareto axes explicitly, assign objectives to groups using the
+`group` parameter.
 Objectives in the same group are summed into a single group cost;
 distinct groups form the axes of the Pareto ranking.
 
@@ -313,8 +343,11 @@ best = study.run(objective, n_trials=100).top_k(1)[0]
 
 With `n_workers > 1`,
 `run()` dispatches trials concurrently using Python's
-`ThreadPoolExecutor`. Each batch asks for `n_workers` trials,
-evaluates them in parallel, then tells the results.
+`ThreadPoolExecutor`. It keeps at most `n_workers` evaluations in flight,
+processes each result as soon as that evaluation finishes, and immediately
+replenishes the free slot. A slow early trial therefore does not hold up faster
+later results, and exceptions cancel any still-pending trials before the pool
+is shut down.
 
 ```python
 # Use 4 parallel workers
@@ -533,6 +566,21 @@ for t in remote.pareto_front():
     print(t.scores)
 ```
 
+Remote requests use a 10-second connection timeout and a 30-second
+whole-request timeout by default. Both are configurable, and a bearer token is
+sent with every endpoint when provided:
+
+```python
+import os
+
+remote = Study.connect(
+    "https://hola.example.com",
+    token=os.environ["HOLA_TOKEN"],
+    connect_timeout=5.0,
+    request_timeout=60.0,
+)
+```
+
 Switching from local to distributed is mostly **replacing**
 `Study(...)` **with** `Study.connect("http://...")` (you no
 longer pass `space` / `objectives` here, since the server
@@ -560,9 +608,8 @@ examples:
 Run an example.
 
 ```bash
-uv run python hola-py/examples/basic_optimization.py
+uv run --directory hola-py python examples/basic_optimization.py
 ```
 
-Run from the repository root. If your working directory is
-`hola-py/`, use `uv run python examples/basic_optimization.py`
-instead.
+Run that command from the repository root. The `--directory` option
+selects the `hola-py` project and its virtual environment explicitly.

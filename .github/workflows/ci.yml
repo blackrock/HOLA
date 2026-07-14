@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -17,18 +21,19 @@ jobs:
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         continue-on-error: true
 
       - name: Format check
@@ -37,38 +42,95 @@ jobs:
       - name: Clippy (all features)
         run: cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
 
+      - name: Feature-minimal library checks
+        if: runner.os == 'Linux'
+        run: |
+          cargo check --locked -p opt_engine --no-default-features --lib
+          cargo check --locked -p hola --no-default-features --lib
+
       - name: Test (all features)
         run: cargo test --locked --workspace --all-features
+
+      - name: Scalability and quality probes
+        if: runner.os == 'Linux'
+        env:
+          RUN_EXPENSIVE_BENCHMARKS: "1"
+        run: |
+          cargo test --locked -p opt_engine --test integration leaderboard_scalability -- --ignored --nocapture
+          cargo test --locked -p opt_engine gmm_hot_path_throughput_probe -- --ignored --nocapture
+          cargo test --locked -p hola bounded_refit_workset_scaling_probe -- --ignored --nocapture
+          cargo test --locked -p hola tell_hot_path_scaling_probe -- --ignored --nocapture
+
+      - name: Documentation (warnings are errors)
+        if: runner.os == 'Linux'
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --locked --workspace --all-features --no-deps
+
+      - name: Verify Cargo package metadata and contents
+        if: runner.os == 'Linux'
+        run: python3 .github/scripts/verify_package_contents.py cargo
+
+  # ── Rust MSRV: keep the manifest's compatibility floor honest ──
+  rust-msrv:
+    name: Rust MSRV (1.87.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: dtolnay/rust-toolchain@e3cc302cc461e47e3db1a82be1553dea32d58d8e # 1.87.0
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: msrv-1.87.0
+        continue-on-error: true
+
+      - name: Check workspace at MSRV
+        run: cargo +1.87.0 check --locked --workspace --all-features
 
   # ── Python: build bindings + ruff + ty + pytest ───────
   python:
     name: Python (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python-version }}
 
-      - uses: astral-sh/setup-uv@v8.2.0
-
-      - uses: actions/setup-node@v6
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
-          node-version: '22'
+          version: "0.9.24"
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        if: matrix.python-version == '3.12'
+        with:
+          node-version: "22.22.2"
+          cache: npm
+          cache-dependency-path: dashboard/tests/package-lock.json
 
       - name: Install dashboard DOM-test dependencies (jsdom)
-        run: npm install
+        if: matrix.python-version == '3.12'
+        run: npm ci
         working-directory: dashboard/tests
 
-      - name: Dashboard DOM XSS test
-        run: node xss_dom.test.mjs
+      - name: Dashboard tests
+        if: matrix.python-version == '3.12'
+        run: npm test
+        working-directory: dashboard/tests
+
+      - name: Dashboard dependency audit
+        if: matrix.python-version == '3.12'
+        run: npm audit --audit-level=high
         working-directory: dashboard/tests
 
       - name: Install dev + benchmark dependencies
@@ -85,30 +147,93 @@ jobs:
         run: uv run ruff check .
         working-directory: hola-py
 
-      - name: Type check (ty)
+      - name: Build wheel
+        working-directory: hola-py
+        run: .venv/bin/maturin build --locked --out dist
+
+      - name: Build source distribution and verify artifacts
         if: matrix.python-version == '3.12'
-        run: uv run ty check .
+        working-directory: hola-py
+        run: |
+          .venv/bin/maturin sdist --out dist
+          .venv/bin/python ../.github/scripts/verify_package_contents.py python dist
+
+      - name: Install the built wheel
+        run: uv pip install --python .venv/bin/python --force-reinstall dist/*.whl
         working-directory: hola-py
 
-      - name: Build & install wheel
-        run: uv run maturin develop
+      - name: Type check (ty) against the built extension
+        if: matrix.python-version == '3.12'
+        run: .venv/bin/ty check
         working-directory: hola-py
 
-      # Use .venv/bin/python after maturin develop to avoid uv re-sync
-      # overwriting the editable install with a stale cached wheel.
+      # Use .venv/bin/python after wheel installation to avoid uv re-sync
+      # replacing the exact artifact under test with an editable source build.
 
       - name: Run unit tests
-        run: .venv/bin/python -m pytest tests/ -v -m "not examples and not benchmarks and not doctest_md" --timeout=120
+        shell: bash
+        run: |
+          wheel_tests="$RUNNER_TEMP/hola-wheel-tests"
+          mkdir -p "$wheel_tests"
+          cp tests/conftest.py \
+             tests/test_exceptions.py \
+             tests/test_ffi_roundtrip.py \
+             tests/test_hola.py \
+             tests/test_remote_client_hardening.py \
+             tests/test_stubs.py \
+             tests/test_study_advanced.py \
+             "$wheel_tests/"
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/hola-py/.venv/bin/python" -m pytest \
+            hola-wheel-tests -v --timeout=120
         working-directory: hola-py
 
       - name: Run example smoke tests
-        run: .venv/bin/python -m pytest tests/test_examples.py -v --timeout=300
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/hola-py/.venv/bin/python" -m pytest \
+            "$GITHUB_WORKSPACE/hola-py/tests/test_examples.py" -v --timeout=300
         working-directory: hola-py
 
       - name: Run benchmark smoke tests
-        run: .venv/bin/python -m pytest tests/test_benchmarks_smoke.py -v --timeout=60
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/hola-py/.venv/bin/python" -m pytest \
+            "$GITHUB_WORKSPACE/hola-py/tests/test_benchmarks_smoke.py" -v --timeout=60
         working-directory: hola-py
 
       - name: Run doc code block tests
-        run: .venv/bin/python -m pytest tests/test_doc_examples.py -v --timeout=30
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/hola-py/.venv/bin/python" -m pytest \
+            "$GITHUB_WORKSPACE/hola-py/tests/test_doc_examples.py" -v --timeout=30
         working-directory: hola-py
+
+      - name: Test package-index generator
+        if: matrix.python-version == '3.12'
+        run: python3 .github/scripts/test_build_simple_index.py
+
+  # ── CLI: real server/worker subprocess flow on every native OS ──
+  cli-integration:
+    name: CLI integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        continue-on-error: true
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - name: Install test runner
+        run: python -m pip install --upgrade pip==25.1.1 pytest==9.0.3
+      - name: Exercise serve and worker lifecycle
+        run: python -m pytest hola-py/tests/test_cli.py -q
