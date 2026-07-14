@@ -1,6 +1,6 @@
 [package]
 name = "opt_engine"
-version = "1.0.1-rc7"
+version = "1.0.1-rc8"
 edition = "2024"
 description = "Type-safe optimization primitives and search strategies for HOLA"
 documentation = "https://docs.rs/opt_engine"

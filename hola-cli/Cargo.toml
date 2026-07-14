@@ -1,6 +1,6 @@
 [package]
 name = "hola-cli"
-version = "1.0.1-rc7"
+version = "1.0.1-rc8"
 edition = "2024"
 description = "Command-line server and distributed worker for HOLA"
 documentation = "https://github.com/blackrock/HOLA/blob/main/docs/cli-guide.md"
@@ -19,7 +19,7 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-hola = { path = "../hola", features = ["server"], version = "1.0.1-rc7" }
+hola = { path = "../hola", features = ["server"], version = "1.0.1-rc8" }
 clap = { version = "4", features = ["derive"] }
 # Keep the established module name while using the maintained, API-compatible fork.
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
