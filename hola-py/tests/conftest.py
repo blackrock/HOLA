@@ -18,15 +18,47 @@ All server/CLI fixtures use only stdlib (no requests/pyyaml dependencies).
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
-from hola_opt import Categorical, Integer, Real, Space
+HOLA_PY_DIR = Path(__file__).resolve().parent.parent
+BENCHMARKS_DIR = HOLA_PY_DIR / "benchmarks"
+
+
+@pytest.fixture(scope="session")
+def isolated_benchmarks_path(tmp_path_factory):
+    """Copy repository-only benchmark helpers into an isolated import root.
+
+    Wheel tests need the benchmark package used by examples and smoke tests,
+    but adding ``hola-py`` itself to ``PYTHONPATH`` would shadow the installed
+    ``hola_opt`` wheel. Copying only ``benchmarks`` avoids that ambiguity and
+    is portable to Windows, where symlinks may require extra privileges.
+    """
+    import_root = tmp_path_factory.mktemp("benchmark-imports")
+    shutil.copytree(
+        BENCHMARKS_DIR,
+        import_root / "benchmarks",
+        ignore=shutil.ignore_patterns("__pycache__", "*.py[co]"),
+    )
+    return import_root
+
+
+@pytest.fixture
+def isolated_benchmarks_env(isolated_benchmarks_path):
+    """Return a subprocess environment exposing only copied benchmarks."""
+    env = os.environ.copy()
+    # Replace, rather than extend, inherited state so a caller-provided source
+    # path cannot make the repository's hola_opt shadow the installed wheel.
+    env["PYTHONPATH"] = str(isolated_benchmarks_path)
+    return env
+
 
 # ==========================================================================
 # Reusable spaces
@@ -35,16 +67,22 @@ from hola_opt import Categorical, Integer, Real, Space
 
 @pytest.fixture
 def simple_space():
+    from hola_opt import Real, Space
+
     return Space(x=Real(0.0, 1.0))
 
 
 @pytest.fixture
 def sphere_space():
+    from hola_opt import Real, Space
+
     return Space(x=Real(-5.0, 5.0), y=Real(-5.0, 5.0))
 
 
 @pytest.fixture
 def multi_param_space():
+    from hola_opt import Categorical, Integer, Real, Space
+
     return Space(
         lr=Real(1e-4, 0.1, scale="log10"),
         layers=Integer(1, 10),
@@ -89,7 +127,8 @@ def cli_binary():
     if result.returncode != 0:
         pytest.skip(f"Failed to build hola-cli: {result.stderr}")
 
-    binary = os.path.join(project_root, "target", "debug", "hola")
+    binary_name = "hola.exe" if os.name == "nt" else "hola"
+    binary = os.path.join(project_root, "target", "debug", binary_name)
     if not os.path.exists(binary):
         pytest.skip(f"CLI binary not found at {binary}")
     return binary
@@ -165,10 +204,11 @@ def yaml_config(tmp_path):
 # ==========================================================================
 
 
-def http_json(url, method="GET", body=None):
+def http_json(url, method="GET", body=None, timeout=5):
     """Make an HTTP request and return (status_code, json_body).
 
-    Uses urllib only — no extra dependencies.
+    Uses urllib only — no extra dependencies. The bounded timeout keeps a
+    wedged child server from hanging the integration suite indefinitely.
     """
     data = None
     if body is not None:
@@ -178,7 +218,7 @@ def http_json(url, method="GET", body=None):
     req.add_header("Content-Type", "application/json")
 
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
             return resp.status, json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:

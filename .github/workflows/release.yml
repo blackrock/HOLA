@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -15,14 +19,15 @@ jobs:
   validate-release:
     name: Validate Release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
@@ -88,11 +93,18 @@ jobs:
               raise SystemExit("\n".join(errors))
           PY
 
+      - name: Verify bundled dashboard assets
+        run: |
+          cmp dashboard/index.html hola-py/hola_opt/dashboard/index.html
+          cmp dashboard/styles.css hola-py/hola_opt/dashboard/styles.css
+          cmp dashboard/app.js hola-py/hola_opt/dashboard/app.js
+
   # ── Python wheels (abi3 — one per platform) ─────────────
   build-wheels:
     name: Wheel (${{ matrix.os }} ${{ matrix.target }})
     needs: [validate-release]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     permissions:
       contents: read
       id-token: write
@@ -112,9 +124,9 @@ jobs:
           - os: windows-latest
             target: x64
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
@@ -133,9 +145,10 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
+          maturin-version: "1.12.6"
           target: ${{ matrix.target }}
           args: --release --locked --out dist ${{ runner.os == 'Linux' && '-i python3.10' || '' }}
-          manylinux: auto
+          manylinux: "2_28"
           working-directory: hola-py
           # ring (via rustls) needs __ARM_ARCH when cross-compiling aarch64 from x86 in manylinux Docker
           docker-options: ${{ matrix.target == 'aarch64' && runner.os == 'Linux' && '-e CFLAGS_aarch64_unknown_linux_gnu=-D__ARM_ARCH=8' || '' }}
@@ -146,7 +159,7 @@ jobs:
           subject-path: hola-py/dist/*.whl
 
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: hola-py/dist/*.whl
@@ -156,20 +169,24 @@ jobs:
     name: Source distribution
     needs: [validate-release]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Build sdist
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
+          maturin-version: "1.12.6"
           command: sdist
           # `maturin sdist` packages sources and does not build, so it rejects
           # the cargo `--locked` flag (unlike the wheel build below). The sdist
-          # bundles Cargo.lock for reproducibility regardless.
+          # bundles Cargo.lock. Its generated workspace omits the unrelated
+          # CLI member, so consumer Cargo may prune unused lock entries while
+          # preserving every selected version needed by the Python build.
           args: --out dist
           working-directory: hola-py
 
@@ -179,7 +196,7 @@ jobs:
           subject-path: hola-py/dist/*.tar.gz
 
       - name: Upload sdist artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: sdist
           path: hola-py/dist/*.tar.gz
@@ -189,6 +206,7 @@ jobs:
     name: CLI (${{ matrix.target }})
     needs: [validate-release]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -209,9 +227,9 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: hola-windows-x86_64.exe
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
         with:
           targets: ${{ matrix.target }}
 
@@ -230,6 +248,14 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CFLAGS_aarch64_unknown_linux_gnu: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && '-D__ARM_ARCH=8' || '' }}
 
+      - name: Smoke CLI binary (Unix native targets)
+        if: runner.os != 'Windows' && matrix.target != 'aarch64-unknown-linux-gnu'
+        run: target/${{ matrix.target }}/release/hola --help
+
+      - name: Smoke CLI binary (Windows)
+        if: runner.os == 'Windows'
+        run: '& "target/${{ matrix.target }}/release/hola.exe" --help'
+
       - name: Package binary (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -243,7 +269,7 @@ jobs:
           Compress-Archive -Path ${{ matrix.artifact }} -DestinationPath ${{ matrix.artifact }}.zip
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cli-${{ matrix.artifact }}
           path: |
@@ -252,20 +278,33 @@ jobs:
 
   # ── Wheel smoke test ────────────────────────────────────
   test-wheels:
-    name: Test wheel (${{ matrix.os }})
+    name: Test wheel (${{ matrix.os }}, Python ${{ matrix.python-version }})
     needs: [build-wheels]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-24.04-arm
+            python-version: "3.11"
+          - os: macos-15-intel
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.14"
     steps:
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Download wheels
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: wheels-*
           merge-multiple: true
@@ -274,22 +313,36 @@ jobs:
       - name: Install and test
         shell: bash
         run: |
-          pip install hola-opt --no-index --find-links dist/
+          python -m pip install --upgrade pip==25.1.1 pytest==9.0.3 pytest-timeout==2.4.0
+          python -m pip install hola-opt --no-index --find-links dist/
           python -c "from hola_opt import Study, Space, Real, Minimize; print('Import OK')"
           python -c "from hola_opt import dashboard_dir; assert dashboard_dir().exists(), 'Dashboard not bundled'"
+          mkdir -p "$RUNNER_TEMP/hola-wheel-tests"
+          cp hola-py/tests/conftest.py \
+             hola-py/tests/test_exceptions.py \
+             hola-py/tests/test_ffi_roundtrip.py \
+             hola-py/tests/test_hola.py \
+             hola-py/tests/test_remote_client_hardening.py \
+             hola-py/tests/test_server.py \
+             hola-py/tests/test_stubs.py \
+             hola-py/tests/test_study_advanced.py \
+             "$RUNNER_TEMP/hola-wheel-tests/"
+          cd "$RUNNER_TEMP"
+          python -m pytest hola-wheel-tests -q --timeout=120
 
   # ── Create GitHub Release ───────────────────────────────
   release:
     name: GitHub Release
     needs: [build-wheels, build-sdist, build-cli, test-wheels]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
           merge-multiple: true
@@ -307,10 +360,11 @@ jobs:
     name: Update Package Index
     needs: [release]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Generate PEP 503 simple index
         env:
@@ -342,7 +396,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m venv /tmp/idxtest
-          /tmp/idxtest/bin/python -m pip install --quiet --upgrade pip
+          /tmp/idxtest/bin/python -m pip install --quiet --upgrade pip==25.1.1
           /tmp/idxtest/bin/python -m pip download --no-deps \
             --index-url "file://$PWD/index/simple/" hola-opt -d /tmp/idxdl
 
@@ -350,6 +404,6 @@ jobs:
         uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./index
-          destination_dir: .
-          keep_files: false
+          publish_dir: ./index/simple
+          destination_dir: simple
+          keep_files: true

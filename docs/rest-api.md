@@ -1,8 +1,11 @@
 # REST API Reference
 
 The HOLA server exposes a REST API for distributed
-optimization. All endpoints accept and return JSON. We enable
-permissive CORS by default.
+optimization. All endpoints accept and return JSON. Browser
+cross-origin access is disabled by default; allow trusted origins
+explicitly with the repeatable `hola serve --cors-origin <ORIGIN>`
+option. CLI, Python, and other non-browser clients are not subject
+to CORS.
 
 Most users do not need to call the REST API directly.
 `Study.connect()` in Python and `hola worker` in the CLI
@@ -20,29 +23,32 @@ The port is configurable via `hola serve --port <PORT>`.
 ## Authentication
 
 By default, a local HOLA server does not require authentication.
-When the server is started with `--auth-token <TOKEN>`, all
-write-capable endpoints require this header:
+When the server is started with `--auth-token <TOKEN>`, all API
+endpoints require this header:
 
 ```http
 Authorization: Bearer <TOKEN>
 ```
 
-This applies to `POST /api/ask`, `POST /api/tell`,
-`POST /api/cancel`, `PATCH /api/objectives`, and
-`POST /api/checkpoint/save`. By default, read-only endpoints and the
-`GET /api/events` SSE stream remain available without a token. To also
-require the bearer token on those read endpoints, start the server with
-`--require-read-auth` (only meaningful together with `--auth-token`).
+Operators may configure a separate `--read-token` for dashboards and
+monitoring. That role can use GET endpoints, SSE, and metrics, but receives HTTP
+401 from ask, tell, cancel, heartbeat, objective updates, and checkpoint saves.
+
+This includes mutation endpoints, read-only endpoints, and the
+`GET /api/events` SSE stream. Operators can deliberately leave reads
+open with `--allow-unauthenticated-reads`; this is intended only for
+trusted networks because study parameters, metrics, and events may be
+sensitive.
 The CLI requires an auth token when binding the server to a non-local
 host.
 
 ## Error Format
 
-All error responses return a JSON object with an `error`
-field.
+All error responses return a stable machine-readable `code` plus a
+human-readable `error` message.
 
 ```json
-{"error": "Trial 42 has already been completed"}
+{"code": "tell_failed", "error": "Trial 42 has already been completed with different metrics"}
 ```
 
 ---
@@ -53,7 +59,16 @@ field.
 
 Request the next trial to evaluate.
 
-**Request.** No body required.
+**Request.** No body required. Distributed workers should attach a unique
+`Idempotency-Key` header and reuse that key until they receive a valid response.
+If a connection fails after the server allocated a trial, retrying with the same
+key returns that trial instead of allocating duplicate work. Keys must contain
+1–128 ASCII characters. The built-in `hola worker` command does this
+automatically.
+
+Server allocations carry a lease (two hours by default). Complete or cancel the
+trial before it expires, or renew it with `POST /api/heartbeat`. Expired work is
+reclaimed lazily and a late tell is rejected deterministically.
 
 **Response (200)**
 
@@ -77,8 +92,32 @@ Request the next trial to evaluate.
 **Example**
 
 ```bash
-curl -X POST http://localhost:8000/api/ask
+curl -X POST http://localhost:8000/api/ask \
+  -H "Idempotency-Key: $(uuidgen)"
 ```
+
+---
+
+### POST /api/heartbeat
+
+Renew the lease for a pending distributed trial. This is a mutation endpoint
+and requires the bearer token when authentication is configured.
+
+**Request**
+
+```json
+{"trial_id": 0}
+```
+
+**Response (200)**
+
+```json
+{"status":"ok","trial_id":0,"lease_expires_at_ms":1783735200000}
+```
+
+The expiry is an absolute Unix timestamp in milliseconds. A missing,
+completed, cancelled, or already-expired trial returns
+`{"code":"heartbeat_failed", ...}` with HTTP 400.
 
 ---
 
@@ -103,6 +142,10 @@ Report the result of a trial.
 | `trial_id` | integer | The trial ID from a previous `ask` |
 | `metrics` | object | Key-value pairs of metric results. Must include fields referenced by objectives. |
 
+Strict JSON has no numeric representation for non-finite floats. Objective
+metric values may therefore use the exact string sentinels `"inf"`, `"-inf"`,
+or `"nan"`; other strings are ordinary raw values and do not parse as numbers.
+
 **Response (200)**
 
 ```json
@@ -126,7 +169,8 @@ Report the result of a trial.
     "rank": 0,
     "pareto_front": 0,
     "completed_at": 1736935800
-  }
+  },
+  "post_commit_warnings": []
 }
 ```
 
@@ -135,12 +179,15 @@ Report the result of a trial.
 | `status` | string | `"ok"` on success |
 | `trial_count` | integer | Total number of completed trials after this tell |
 | `trial` | object | Newly completed trial created by this `tell` |
+| `post_commit_warnings` | array of strings | Refit/checkpoint maintenance failures that occurred after the trial committed. The tell remains successful; clients should surface these warnings and must not retry it as an ingestion failure. |
 
 The returned `trial.trial_id` matches the `trial_id` in the
 request.
 
-**Error (400).** Returned if the trial ID is unknown, cancelled,
-or has already been told.
+An exact duplicate request replays the retained successful receipt without
+committing again or emitting a duplicate event. **Error (400)** is returned if
+the trial ID is unknown/cancelled or if a completed ID is retried with different
+metrics.
 
 ```json
 {"error": "Trial 0 has already been completed"}
@@ -197,8 +244,8 @@ Each element in the array has the following fields.
 |-------|------|-------------|
 | `trial_id` | integer | Unique trial identifier |
 | `params` | object | Parameter values |
-| `score_vector` | object | Mapping of priority-group names to aggregated scores. Infeasible values appear as the string `"inf"`. |
-| `scores` | object | Per-objective scores. Infeasible values appear as the string `"inf"`. |
+| `score_vector` | object | Mapping of priority-group names to aggregated scores. Non-finite values use lossless string sentinels: `"inf"`, `"-inf"`, and `"nan"`. |
+| `scores` | object | Per-objective scores, with the same `"inf"`, `"-inf"`, and `"nan"` sentinels. |
 | `metrics` | object | Original metrics dict from `tell` |
 | `rank` | integer | 0-indexed overall rank |
 | `pareto_front` | integer | 0-indexed Pareto front index |
@@ -277,8 +324,8 @@ Each element in the array has the following fields.
 |-------|------|-------------|
 | `trial_id` | integer | Unique trial identifier |
 | `params` | object | Parameter values |
-| `score_vector` | object | Mapping of priority-group names to aggregated scores. Infeasible values appear as the string `"inf"`. |
-| `scores` | object | Per-objective scores. Infeasible values appear as the string `"inf"`. |
+| `score_vector` | object | Mapping of priority-group names to aggregated scores. Non-finite values use lossless string sentinels: `"inf"`, `"-inf"`, and `"nan"`. |
+| `scores` | object | Per-objective scores, with the same `"inf"`, `"-inf"`, and `"nan"` sentinels. |
 | `metrics` | object | Original metrics dict |
 | `rank` | integer | 0-indexed overall rank |
 | `pareto_front` | integer | 0-indexed Pareto front index |
@@ -340,8 +387,8 @@ following fields.
 |-------|------|-------------|
 | `trial_id` | integer | Unique trial identifier |
 | `params` | object | Parameter values |
-| `score_vector` | object | Mapping of priority-group names to aggregated scores. Infeasible values appear as the string `"inf"`. |
-| `scores` | object | Per-objective scores. Infeasible values appear as the string `"inf"`. |
+| `score_vector` | object | Mapping of priority-group names to aggregated scores. Non-finite values use lossless string sentinels: `"inf"`, `"-inf"`, and `"nan"`. |
+| `scores` | object | Per-objective scores, with the same `"inf"`, `"-inf"`, and `"nan"` sentinels. |
 | `metrics` | object | Original metrics dict |
 | `rank` | integer | 0-indexed overall rank |
 | `pareto_front` | integer | 0-indexed Pareto front index |
@@ -542,14 +589,12 @@ Save the current server state as a full JSON checkpoint file.
 
 ```json
 {
-  "path": "checkpoint.json",
   "description": "After 100 trials"
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `path` | string | no | Relative path under the configured checkpoint directory (default: `"checkpoint.json"`) |
 | `description` | string | no | Optional description stored in the checkpoint metadata |
 
 **Response (200)**
@@ -558,24 +603,27 @@ Save the current server state as a full JSON checkpoint file.
 {
   "status": "ok",
   "checkpoint_type": "full",
-  "path": "./checkpoint.json",
-  "trials_saved": 100
+  "path": "./checkpoints/checkpoint_1783684800000_000000.json",
+  "trials_saved": 100,
+  "created_at": 1783684800
 }
 ```
 
 The saved file includes completed trials, strategy state, and study
-configuration. The returned `path` is the resolved server-side path.
+configuration. The server always generates a unique filename beneath its
+operator-configured `--checkpoint-dir`; clients cannot select or replace a
+server-side path. The returned `path` identifies the generated file.
 
 **Error (400)**
 
 ```json
-{"error": "Checkpoint path must be relative to the configured checkpoint directory"}
+{"code": "invalid_request", "error": "Failed to deserialize the JSON body..."}
 ```
 
 **Error (500)**
 
 ```json
-{"error": "Permission denied: /read-only/path.json"}
+{"code": "checkpoint_save_failed", "error": "failed to save checkpoint"}
 ```
 
 **Example**
@@ -583,7 +631,7 @@ configuration. The returned `path` is the resolved server-side path.
 ```bash
 curl -X POST http://localhost:8000/api/checkpoint/save \
   -H "Content-Type: application/json" \
-  -d '{"path": "checkpoint_100.json", "description": "After 100 trials"}'
+  -d '{"description": "After 100 trials"}'
 ```
 
 ---
@@ -644,12 +692,32 @@ curl http://localhost:8000/api/trial_count
 
 ---
 
+### GET /api/event_cursor
+
+Get the current SSE replay watermark before fetching a REST snapshot.
+The cursor is a decimal string so JavaScript clients retain the full `u64`
+value without precision loss.
+
+```json
+{"last_event_id": "42"}
+```
+
+To avoid losing a completion between `GET /api/trials` and opening the event
+stream, read this cursor first, fetch the snapshot, then send it as the
+`Last-Event-ID` header on `GET /api/events`. Events that overlap the snapshot
+may be delivered twice; clients should upsert trials by `trial_id`.
+
+---
+
 ### GET /api/events
 
 We stream server-sent events (SSE) for real-time updates.
 The dashboard uses this endpoint for live monitoring.
 
-**Response.** SSE stream with `data` fields containing JSON.
+**Response.** SSE stream with monotonic `id` fields and `data` fields containing
+JSON. Reconnect with `Last-Event-ID` to replay retained events. A
+`stream_reset` or `stream_lagged` event means the client must refresh its REST
+snapshot before continuing.
 
 **Event types**
 
@@ -673,10 +741,12 @@ The dashboard uses this endpoint for live monitoring.
 }
 ```
 
-**RefitOccurred.** Emitted when the GMM strategy is refit.
+**ObjectivesChanged.** Emitted after an objective update commits. Because the
+change can alter every historical score, rank, and Pareto front, clients must
+perform the cursor-safe full REST resynchronization described above.
 
 ```json
-{"type": "RefitOccurred", "n_trials": 40}
+{"type": "ObjectivesChanged"}
 ```
 
 **Example**

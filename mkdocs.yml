@@ -31,6 +31,8 @@ nav:
   - Python Guide: python-guide.md
   - CLI & Distributed: cli-guide.md
   - REST API: rest-api.md
+  - Operations: operations.md
+  - Release Verification: release-checklist.md
   - Concepts: concepts.md
   - Dashboard: dashboard.md
   - Rust Internals (Unstable): rust-guide.md

@@ -180,7 +180,7 @@ strategy:
 |-------|---------|-------------|
 | `type` | `"gmm"` | Strategy type: `"gmm"`, `"sobol"`, or `"random"` |
 | `refit_interval` | `20` | How often the GMM refits (only used by `"gmm"`) |
-| `seed` | none | Seed for reproducible runs. When omitted, Sobol uses 42, others use random seeds. |
+| `seed` | none | Seed for reproducible runs. When omitted, HOLA draws one seed once and records it in full checkpoints. |
 | `exploration_budget` | none | Number of issued Sobol exploration suggestions before switching to GMM exploitation. Pending asks count against this budget. When omitted, we use a formula based on `total_budget`. |
 | `elite_fraction` | `0.25` | Fraction of top trials used for GMM refitting. Must be in (0.0, 1.0]. |
 
@@ -206,10 +206,12 @@ hola serve config.yaml --port 8000
 | `--host` | `127.0.0.1` | Host/interface to bind. Use `0.0.0.0` explicitly for network access |
 | `--port` | `8000` | Port to listen on |
 | `--dashboard` | none | Path to a dashboard directory to serve at `/` (e.g. `--dashboard ./dashboard`) |
-| `--auth-token` | none | Bearer token required for write-capable API endpoints |
-| `--require-read-auth` | off | Also require the bearer token for read-only endpoints and the SSE stream (only meaningful with `--auth-token`) |
+| `--auth-token` | none | Bearer token required for all API endpoints |
+| `--read-token` | none | Optional read-only token for dashboards, SSE, and metrics; never permits mutations |
+| `--allow-unauthenticated-reads` | off | Explicitly leave read-only endpoints and SSE open when a token is configured |
 | `--checkpoint-dir` | checkpoint config directory or config file directory | Directory where dashboard/API checkpoint saves are allowed |
 | `--cors-origin` | none | Allowed browser CORS origin. Repeat for multiple origins |
+| `--lease-seconds` | `7200` | Time a distributed trial may remain pending without completion, cancellation, or heartbeat |
 
 The server starts listening on `127.0.0.1:<port>` by default and exposes
 the [REST API](rest-api.md). Binding a non-local host requires `--auth-token`
@@ -227,13 +229,17 @@ hola worker --server http://localhost:8000 --exec "python train.py"
 | `--exec` | required | Shell command to execute for each trial |
 | `--mode` | `callback` | Worker mode: `"callback"` or `"exec"` |
 | `--token` | none | Bearer token for servers started with `--auth-token` |
+| `--request-timeout` | `30` | Maximum seconds for an HTTP request |
+| `--command-timeout` | `3600` | Maximum seconds before the command process tree is terminated |
+| `--outbox-dir` | `.hola-worker-outbox` | Durable, server-scoped queue for exec-mode tells |
 
 ### Callback mode (default)
 
 In callback mode, the worker loop works as follows.
 
 1. `POST /api/ask` to get a trial from the server
-2. Run the `--exec` command via `sh -c` with these
+2. Run the `--exec` command through the platform shell (`sh -c` on Unix,
+   `cmd /C` on Windows) with these
    environment variables set
    - `HOLA_SERVER`. The server URL
      (e.g., `http://localhost:8000`).
@@ -251,8 +257,8 @@ In callback mode, the worker loop works as follows.
    cancels the trial via `POST /api/cancel`
 5. Repeat
 
-If the server is unreachable, the worker retries every
-5 seconds.
+If the server is unreachable, the worker retries with the same ask
+idempotency key, so a lost response cannot allocate duplicate work.
 
 ### Exec mode
 
@@ -261,8 +267,9 @@ reporting on its behalf.
 
 1. `POST /api/ask` to get a trial
 2. Run the `--exec` command with `HOLA_PARAMS` set
-3. Parse the command's stdout as a JSON metrics object
-4. `POST /api/tell` to report the result
+3. Require a successful exit and parse bounded stdout as a JSON metrics object
+4. Persist the tell to the durable outbox, then `POST /api/tell`; uncertain
+   responses are retried before any new work is requested
 5. Repeat
 
 ```bash
@@ -279,11 +286,12 @@ environment variable as a JSON string.
 HOLA_PARAMS='{"learning_rate": 0.001, "num_layers": 5, "optimizer": "adam", "momentum": 0.9}'
 ```
 
-Each invocation of the `--exec` command runs in its own
-`sh -c` process, so `HOLA_PARAMS` (along with `HOLA_SERVER`
+Each invocation of the `--exec` command runs in its own platform-shell
+process group or Windows Job Object, so `HOLA_PARAMS` (along with `HOLA_SERVER`
 and `HOLA_TRIAL_ID`) is per-process. Multiple concurrent
 workers are safe: each worker's script sees only its own
-trial's parameters.
+trial's parameters. A command timeout terminates and reaps the whole process
+tree rather than leaving descendants running.
 
 ### Worker Script Examples
 
@@ -431,11 +439,12 @@ for t in remote.pareto_front():  # multi-objective studies
 
 ## Monitoring with the Dashboard
 
-While the server is running, open `dashboard/index.html` in a
-browser and enter the server URL (e.g.,
-`http://localhost:8000`). The dashboard connects via SSE and
-shows live convergence plots, a trial table, and Pareto
-scatter.
+Start the server with `--dashboard ./dashboard`, then open its URL
+(for example, `http://localhost:8000/`). Serving the UI and API from
+HOLA keeps browser requests on the same origin. The dashboard connects
+via SSE and shows live convergence plots, a trial table, and Pareto
+scatter. If you host the UI elsewhere, allow that exact origin with
+`--cors-origin`.
 
 See the [Dashboard Guide](dashboard.md) for details.
 
@@ -443,10 +452,12 @@ See the [Dashboard Guide](dashboard.md) for details.
 
 ### What gets saved
 
-A leaderboard checkpoint saves all completed trials: their
-parameters, metrics, and scores. A full checkpoint
-additionally saves strategy state (e.g. GMM model parameters).
-We use JSON as the checkpoint format.
+A leaderboard-only checkpoint saves completed trials: their parameters,
+metrics, and scores. A current full checkpoint additionally saves study
+configuration, strategy state (for example, Sobol position or GMM model
+parameters), pending and cancelled work, leases, idempotency records,
+completion receipts, and the next trial ID. We use JSON as the checkpoint
+format.
 
 ### Automatic checkpointing
 
@@ -459,10 +470,8 @@ checkpoint:
   max_checkpoints: 5
 ```
 
-This saves a checkpoint every 50 completed trials, keeping
-the 5 most recent. Automatic checkpoints are leaderboard
-checkpoints: they preserve completed trials and can be used to
-warm-start a restarted server.
+This saves a full checkpoint every 50 completed trials, keeping the 5 most
+recent. It preserves runtime and strategy state for an exact server resume.
 
 ### Manual checkpointing
 
@@ -471,8 +480,11 @@ We can save a checkpoint at any time via the REST API.
 ```bash
 curl -X POST http://localhost:8000/api/checkpoint/save \
   -H "Content-Type: application/json" \
-  -d '{"path": "my_checkpoint.json"}'
+  -d '{"description": "manual CLI checkpoint"}'
 ```
+
+The server generates the filename beneath its configured checkpoint directory
+and returns the full server-side path in the response.
 
 Or from the dashboard's Checkpoints panel.
 Manual REST and dashboard saves write full checkpoints with
@@ -490,13 +502,14 @@ checkpoint:
   load_from: ./checkpoints/checkpoint_000100.json
 ```
 
-On startup, the server loads the specified checkpoint file. Full
-checkpoints restore both the leaderboard and search strategy state.
-Legacy leaderboard-only checkpoints are still accepted as a
-warm-start path; they restore completed trials but do not restore
-strategy state.
+On startup, the server loads the specified checkpoint file. Current full
+checkpoints restore the leaderboard, strategy, and runtime state. Pending IDs
+remain valid, so a worker can finish work issued before the restart without the
+ID being reused.
 
-Checkpoint loads intentionally clear any pending or cancelled
-in-flight trials from the engine state. Restored studies resume from
-the completed trial history, and the next `ask` receives a fresh ID
-after the restored completed trials.
+Legacy leaderboard-only checkpoints remain supported as a warm-start path.
+Because they contain no runtime state, loading one invalidates all outstanding
+jobs and starts a fresh trial-ID epoch so late results cannot collide with new
+work. HOLA reconciles the configured strategy with the imported history by
+advancing its sampling counters and, where applicable, refitting its model;
+this is a history-informed warm start rather than an exact continuation.

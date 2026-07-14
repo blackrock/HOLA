@@ -13,7 +13,7 @@
 
 use crate::scales::{LinearScale, Scale};
 use crate::traits::{SampleSpace, StandardizedSpace};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 /// A continuous range `[min, max]` with an optional scale transformation.
 ///
@@ -21,35 +21,117 @@ use serde::{Deserialize, Serialize};
 /// care about. For example, to search learning rates between `1e-4` and `0.1`
 /// on a log10 scale:
 ///
-/// ```ignore
-/// ContinuousSpace::with_scale(1e-4, 0.1, Log10Scale)
+/// ```
+/// use opt_engine::{ContinuousSpace, Log10Scale};
+///
+/// let space = ContinuousSpace::with_scale(1e-4, 0.1, Log10Scale);
+/// assert_eq!(space.min(), 1e-4);
 /// ```
 ///
 /// Internally, the scale's `inverse` maps actual values to a linear internal
 /// space where unit-cube normalization is performed.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ContinuousSpace<S: Scale = LinearScale> {
-    pub min: f64,
-    pub max: f64,
-    pub scale: S,
+    min: f64,
+    max: f64,
+    scale: S,
 }
 
 impl ContinuousSpace<LinearScale> {
+    /// Construct a validated linear space.
+    ///
+    /// Fixed ranges (`min == max`) are supported. Reversed, non-finite, and
+    /// ranges whose internal span overflows are rejected.
+    pub fn try_new(min: f64, max: f64) -> Result<Self, String> {
+        Self::try_with_scale(min, max, LinearScale)
+    }
+
+    /// Construct a linear space, panicking immediately if its bounds are
+    /// invalid. Prefer [`Self::try_new`] for user-provided configuration.
     pub fn new(min: f64, max: f64) -> Self {
-        Self {
-            min,
-            max,
-            scale: LinearScale,
-        }
+        Self::try_new(min, max).unwrap_or_else(|error| panic!("ContinuousSpace: {error}"))
     }
 }
 
 impl<S: Scale> ContinuousSpace<S> {
+    /// Lower bound in user-facing space.
+    pub fn min(&self) -> f64 {
+        self.min
+    }
+
+    /// Upper bound in user-facing space.
+    pub fn max(&self) -> f64 {
+        self.max
+    }
+
+    /// Scale transformation used by this space.
+    pub fn scale(&self) -> &S {
+        &self.scale
+    }
+
+    /// Create a validated continuous space with a custom scale.
+    ///
+    /// Bounds live in user-facing space. Both bounds and their transformed
+    /// values must be finite. Fixed ranges are represented by the unit-cube
+    /// midpoint; non-fixed ranges must have a finite, non-zero internal span.
+    pub fn try_with_scale(min: f64, max: f64, scale: S) -> Result<Self, String> {
+        if !min.is_finite() || !max.is_finite() {
+            return Err(format!("bounds must be finite, got min={min}, max={max}"));
+        }
+        if min > max {
+            return Err(format!(
+                "min must be less than or equal to max, got min={min}, max={max}"
+            ));
+        }
+
+        let internal_min = scale.inverse(min);
+        let internal_max = scale.inverse(max);
+        if !internal_min.is_finite() || !internal_max.is_finite() {
+            return Err(format!(
+                "{} scale requires bounds in its finite domain, got min={min}, max={max}",
+                S::name()
+            ));
+        }
+
+        if min < max {
+            let span = internal_max - internal_min;
+            if !span.is_finite() || span == 0.0 {
+                return Err(format!(
+                    "{} scale produces an invalid internal span for min={min}, max={max}",
+                    S::name()
+                ));
+            }
+        }
+
+        Ok(Self { min, max, scale })
+    }
+
     /// Create a continuous space with a custom scale.
     ///
     /// `min` and `max` are specified in actual (user-facing) space.
     pub fn with_scale(min: f64, max: f64, scale: S) -> Self {
-        Self { min, max, scale }
+        Self::try_with_scale(min, max, scale)
+            .unwrap_or_else(|error| panic!("ContinuousSpace: {error}"))
+    }
+}
+
+impl<'de, S> Deserialize<'de> for ContinuousSpace<S>
+where
+    S: Scale + Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ContinuousSpaceSerde<S> {
+            min: f64,
+            max: f64,
+            scale: S,
+        }
+
+        let raw = ContinuousSpaceSerde::<S>::deserialize(deserializer)?;
+        Self::try_with_scale(raw.min, raw.max, raw.scale).map_err(de::Error::custom)
     }
 }
 
@@ -58,10 +140,13 @@ impl<S: Scale> SampleSpace for ContinuousSpace<S> {
     type Domain = f64;
 
     fn contains(&self, point: &f64) -> bool {
-        // Scale the tolerance relative to the magnitude of the bounds so that
-        // a fixed absolute eps is neither over-tolerant for tiny ranges nor
-        // too strict for very large ones.
-        let eps = 1e-9 * (1.0 + self.min.abs().max(self.max.abs()));
+        if !point.is_finite() {
+            return false;
+        }
+        // A handful of ULPs tolerates normal floating-point boundary noise
+        // without introducing an absolute floor that can exceed a tiny range.
+        let magnitude = self.min.abs().max(self.max.abs());
+        let eps = 16.0 * f64::EPSILON * magnitude;
         *point >= self.min - eps && *point <= self.max + eps
     }
 
@@ -76,8 +161,11 @@ impl<S: Scale> StandardizedSpace for ContinuousSpace<S> {
     }
 
     fn to_unit_cube(&self, point: &f64) -> Vec<f64> {
+        if self.min == self.max {
+            return vec![0.5];
+        }
         // Map actual value to internal space, then normalize to [0, 1]
-        let internal = self.scale.inverse(*point);
+        let internal = self.scale.inverse(self.clamp(point));
         let internal_min = self.scale.inverse(self.min);
         let internal_max = self.scale.inverse(self.max);
         let span = internal_max - internal_min;
@@ -103,8 +191,22 @@ impl<S: Scale> StandardizedSpace for ContinuousSpace<S> {
         if vec.len() != 1 {
             return None;
         }
+        if !vec[0].is_finite() {
+            return None;
+        }
+        if self.min == self.max {
+            return Some(self.min);
+        }
         // Clamp for numerical safety
         let val = vec[0].clamp(0.0, 1.0);
+        // Transcendental inverse/forward pairs can overflow or move one ULP at
+        // extreme finite bounds. Preserve the declared endpoints exactly.
+        if val == 0.0 {
+            return Some(self.min);
+        }
+        if val == 1.0 {
+            return Some(self.max);
+        }
         // Map from unit cube to internal space, then apply forward transformation
         let internal_min = self.scale.inverse(self.min);
         let internal_max = self.scale.inverse(self.max);
@@ -119,7 +221,8 @@ impl<S: Scale> StandardizedSpace for ContinuousSpace<S> {
             return Some(self.scale.forward(internal_min));
         }
         let internal = internal_min + val * span;
-        Some(self.scale.forward(internal))
+        let actual = self.scale.forward(internal);
+        actual.is_finite().then(|| actual.clamp(self.min, self.max))
     }
 }
 
@@ -169,29 +272,7 @@ mod tests {
         assert_eq!(restored, 5.0);
         // to_unit_cube must not divide by a zero span (which would yield NaN).
         let unit = space.to_unit_cube(&5.0);
-        assert_eq!(unit.len(), 1);
-        assert!(
-            unit[0].is_finite(),
-            "degenerate min==max must not produce NaN"
-        );
-
-        // A log-scale space with non-positive bounds maps to non-finite
-        // internal values, making the span NaN. to_unit_cube must still return
-        // a finite midpoint rather than letting NaN escape.
-        let log_degenerate = ContinuousSpace::with_scale(0.0, 0.0, LogScale);
-        let unit = log_degenerate.to_unit_cube(&0.0);
-        assert_eq!(unit.len(), 1);
-        assert_eq!(
-            unit[0], 0.5,
-            "log-scale degenerate space must return finite 0.5, not NaN"
-        );
-        // from_unit_cube must symmetrically guard the non-finite span: without
-        // the guard the NaN span would make the reconstructed value non-finite.
-        let restored = log_degenerate.from_unit_cube(&[0.5]).unwrap();
-        assert!(
-            restored.is_finite(),
-            "log-scale degenerate from_unit_cube must return finite value, got {restored}"
-        );
+        assert_eq!(unit, vec![0.5]);
     }
 
     #[test]
@@ -247,15 +328,13 @@ mod tests {
 
     #[test]
     fn test_contains_relative_eps_tiny_range() {
-        // For a tiny range the scale-relative eps is essentially the fixed
-        // 1e-9 floor, so a value beyond max by more than that must be rejected.
-        let space = ContinuousSpace::new(1e-12, 1e-9);
-        // eps = 1e-9 * (1 + 1e-9) ~= 1e-9. A point above max by ~1e-6 (>> eps)
-        // must not be considered contained.
-        assert!(!space.contains(&(1e-9 + 1e-6)));
+        let space = ContinuousSpace::new(1e-12, 2e-12);
+        // This is only one range-width beyond max. The old absolute 1e-9
+        // tolerance accepted it even though it is materially out of range.
+        assert!(!space.contains(&3e-12));
         // The exact boundaries are still contained.
         assert!(space.contains(&1e-12));
-        assert!(space.contains(&1e-9));
+        assert!(space.contains(&2e-12));
     }
 
     #[test]
@@ -266,10 +345,61 @@ mod tests {
         let space = ContinuousSpace::new(1e9, 2e9);
         assert!(space.contains(&1e9));
         assert!(space.contains(&2e9));
-        // eps ~= 1e-9 * (1 + 2e9) = ~2.0, so values a hair past the bounds are
-        // still tolerated at this scale.
-        assert!(space.contains(&(2e9 + 1.0)));
-        assert!(space.contains(&(1e9 - 1.0)));
+        // One adjacent representable value is boundary noise and is accepted.
+        let above = f64::from_bits(2e9f64.to_bits() + 1);
+        let below = f64::from_bits(1e9f64.to_bits() - 1);
+        assert!(space.contains(&above));
+        assert!(space.contains(&below));
+    }
+
+    #[test]
+    fn test_contains_rejects_non_finite_points_at_extreme_fixed_bounds() {
+        let positive = ContinuousSpace::new(f64::MAX, f64::MAX);
+        assert!(positive.contains(&f64::MAX));
+        assert!(!positive.contains(&f64::INFINITY));
+        assert!(!positive.contains(&f64::NAN));
+
+        let negative = ContinuousSpace::new(-f64::MAX, -f64::MAX);
+        assert!(negative.contains(&-f64::MAX));
+        assert!(!negative.contains(&f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn test_extreme_log10_cube_endpoint_stays_finite_and_exact() {
+        let space = ContinuousSpace::with_scale(1.0, f64::MAX, Log10Scale);
+        assert_eq!(space.from_unit_cube(&[0.0]), Some(1.0));
+        assert_eq!(space.from_unit_cube(&[1.0]), Some(f64::MAX));
+        let midpoint = space.from_unit_cube(&[0.5]).unwrap();
+        assert!(midpoint.is_finite());
+        assert!(space.contains(&midpoint));
+        assert!(space.from_unit_cube(&[f64::NAN]).is_none());
+        assert!(space.from_unit_cube(&[f64::INFINITY]).is_none());
+    }
+
+    #[test]
+    fn test_try_constructors_reject_invalid_bounds() {
+        assert!(ContinuousSpace::try_new(2.0, 1.0).is_err());
+        assert!(ContinuousSpace::try_new(f64::NAN, 1.0).is_err());
+        assert!(ContinuousSpace::try_new(0.0, f64::INFINITY).is_err());
+        assert!(ContinuousSpace::try_new(-f64::MAX, f64::MAX).is_err());
+        assert!(ContinuousSpace::try_new(4.0, 4.0).is_ok());
+
+        assert!(ContinuousSpace::try_with_scale(0.0, 1.0, LogScale).is_err());
+        assert!(ContinuousSpace::try_with_scale(-1.0, 1.0, Log10Scale).is_err());
+        assert!(ContinuousSpace::try_with_scale(0.5, 0.5, LogScale).is_ok());
+    }
+
+    #[test]
+    fn test_deserialization_validates_bounds_and_scale_domain() {
+        let reversed = r#"{"min":2.0,"max":1.0,"scale":null}"#;
+        assert!(serde_json::from_str::<ContinuousSpace>(reversed).is_err());
+
+        let invalid_log = r#"{"min":0.0,"max":1.0,"scale":null}"#;
+        assert!(serde_json::from_str::<ContinuousSpace<LogScale>>(invalid_log).is_err());
+
+        let fixed = r#"{"min":5.0,"max":5.0,"scale":null}"#;
+        let restored: ContinuousSpace = serde_json::from_str(fixed).unwrap();
+        assert_eq!(restored.to_unit_cube(&5.0), vec![0.5]);
     }
 
     proptest::proptest! {

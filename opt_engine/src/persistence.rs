@@ -25,18 +25,161 @@
 use crate::leaderboard::Leaderboard;
 use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Serde adapter that represents non-finite floating-point values with an
+/// explicit tagged value instead of silently turning them into JSON `null`.
+///
+/// The adapter operates recursively so scalar and structured observations use
+/// the same lossless representation. Maps containing either reserved marker
+/// are escaped, preventing user data from being mistaken for an encoded float.
+pub(crate) mod lossless_float {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+    use serde_value::Value;
+    use std::collections::BTreeMap;
+
+    const FLOAT_MARKER: &str = "$hola.float";
+    const MAP_MARKER: &str = "$hola.map";
+
+    pub fn serialize<T, S>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: Serialize,
+        S: Serializer,
+    {
+        let value = serde_value::to_value(value).map_err(serde::ser::Error::custom)?;
+        encode(value).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+    where
+        T: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        let encoded = Value::deserialize(deserializer)?;
+        let decoded = decode(encoded).map_err(D::Error::custom)?;
+        T::deserialize(decoded).map_err(D::Error::custom)
+    }
+
+    fn float_tag(name: &str) -> Value {
+        Value::Map(BTreeMap::from([(
+            Value::String(FLOAT_MARKER.to_string()),
+            Value::String(name.to_string()),
+        )]))
+    }
+
+    fn non_finite_name(value: f64, width: &str) -> String {
+        let kind = if value.is_nan() {
+            "nan"
+        } else if value.is_sign_positive() {
+            "+inf"
+        } else {
+            "-inf"
+        };
+        format!("{width}:{kind}")
+    }
+
+    fn encode(value: Value) -> Value {
+        match value {
+            Value::F32(value) if !value.is_finite() => {
+                float_tag(&non_finite_name(value as f64, "f32"))
+            }
+            Value::F64(value) if !value.is_finite() => float_tag(&non_finite_name(value, "f64")),
+            Value::Option(value) => Value::Option(value.map(|value| Box::new(encode(*value)))),
+            Value::Newtype(value) => Value::Newtype(Box::new(encode(*value))),
+            Value::Seq(values) => Value::Seq(values.into_iter().map(encode).collect()),
+            Value::Map(values) => {
+                let needs_escape = values.keys().any(|key| {
+                    matches!(key, Value::String(key) if key == FLOAT_MARKER || key == MAP_MARKER)
+                });
+                let encoded = values
+                    .into_iter()
+                    .map(|(key, value)| (encode(key), encode(value)))
+                    .collect();
+                if needs_escape {
+                    Value::Map(BTreeMap::from([(
+                        Value::String(MAP_MARKER.to_string()),
+                        Value::Map(encoded),
+                    )]))
+                } else {
+                    Value::Map(encoded)
+                }
+            }
+            value => value,
+        }
+    }
+
+    fn decode(value: Value) -> Result<Value, String> {
+        match value {
+            Value::Option(value) => Ok(Value::Option(
+                value
+                    .map(|value| decode(*value).map(Box::new))
+                    .transpose()?,
+            )),
+            Value::Newtype(value) => Ok(Value::Newtype(Box::new(decode(*value)?))),
+            Value::Seq(values) => Ok(Value::Seq(
+                values.into_iter().map(decode).collect::<Result<_, _>>()?,
+            )),
+            Value::Map(mut values) => {
+                if values.len() == 1 {
+                    if let Some(tag) = values.remove(&Value::String(FLOAT_MARKER.to_string())) {
+                        let tag = match tag {
+                            Value::String(tag) => tag,
+                            _ => return Err("invalid lossless float tag".to_string()),
+                        };
+                        return decode_float_tag(&tag);
+                    }
+                    if let Some(inner) = values.remove(&Value::String(MAP_MARKER.to_string())) {
+                        let inner = match inner {
+                            Value::Map(inner) => inner,
+                            _ => return Err("invalid escaped map value".to_string()),
+                        };
+                        return decode_map_entries(inner);
+                    }
+                }
+                decode_map_entries(values)
+            }
+            value => Ok(value),
+        }
+    }
+
+    fn decode_float_tag(tag: &str) -> Result<Value, String> {
+        let value = match tag {
+            "f32:nan" => Value::F32(f32::NAN),
+            "f32:+inf" => Value::F32(f32::INFINITY),
+            "f32:-inf" => Value::F32(f32::NEG_INFINITY),
+            "f64:nan" | "nan" => Value::F64(f64::NAN),
+            "f64:+inf" | "+inf" => Value::F64(f64::INFINITY),
+            "f64:-inf" | "-inf" => Value::F64(f64::NEG_INFINITY),
+            _ => return Err(format!("unknown lossless float tag: {tag}")),
+        };
+        Ok(value)
+    }
+
+    fn decode_map_entries(values: BTreeMap<Value, Value>) -> Result<Value, String> {
+        Ok(Value::Map(
+            values
+                .into_iter()
+                .map(|(key, value)| Ok((decode(key)?, decode(value)?)))
+                .collect::<Result<_, String>>()?,
+        ))
+    }
+}
 
 // =============================================================================
 // Load Safety Constants
 // =============================================================================
 
-/// The format version this build writes and accepts. Loads validate the
-/// checkpoint's recorded `format_version` against this and reject mismatches.
-pub const CURRENT_FORMAT_VERSION: u32 = 1;
+/// The format version this build writes.
+///
+/// Version 2 introduced the explicit lossless representation for non-finite
+/// observations and full-engine runtime state. Version 1 remains readable for
+/// migration; values that old JSON writers already collapsed to `null` cannot
+/// be reconstructed, but intact finite checkpoints migrate transparently.
+pub const CURRENT_FORMAT_VERSION: u32 = 2;
+const MIN_SUPPORTED_FORMAT_VERSION: u32 = 1;
 
 /// Maximum number of bytes accepted when loading a checkpoint.
 ///
@@ -103,7 +246,7 @@ impl CheckpointMetadata {
             created_at_iso: iso,
             n_trials,
             description,
-            format_version: 1,
+            format_version: CURRENT_FORMAT_VERSION,
         }
     }
 }
@@ -121,9 +264,13 @@ impl CheckpointMetadata {
 ///
 /// # Example
 ///
-/// ```ignore
-/// use opt_engine::persistence::Checkpoint;
-/// use opt_engine::leaderboard::Leaderboard;
+/// ```no_run
+/// use opt_engine::{Checkpoint, ContinuousSpace, Leaderboard, RandomStrategy};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut leaderboard = Leaderboard::new();
+/// leaderboard.push(0.25, 0.8);
+/// let strategy_state = RandomStrategy::<ContinuousSpace>::new(42);
 ///
 /// // Create checkpoint from current state
 /// let checkpoint = Checkpoint::new(
@@ -136,9 +283,17 @@ impl CheckpointMetadata {
 /// checkpoint.save_json("checkpoint.json")?;
 ///
 /// // Later, restore
-/// let restored = Checkpoint::load_json("checkpoint.json")?;
+/// let restored: Checkpoint<f64, f64, RandomStrategy<ContinuousSpace>> =
+///     Checkpoint::load_json("checkpoint.json")?;
+/// assert_eq!(restored.leaderboard.len(), 1);
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(
+    try_from = "CheckpointData<D, Obs, S>",
+    bound(deserialize = "D: Deserialize<'de>, Obs: Deserialize<'de>, S: Deserialize<'de>")
+)]
 pub struct Checkpoint<D, Obs, S> {
     /// The trial history.
     pub leaderboard: Leaderboard<D, Obs>,
@@ -146,6 +301,27 @@ pub struct Checkpoint<D, Obs, S> {
     pub strategy_state: S,
     /// Checkpoint metadata.
     pub metadata: CheckpointMetadata,
+}
+
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "D: Deserialize<'de>, Obs: Deserialize<'de>, S: Deserialize<'de>"))]
+struct CheckpointData<D, Obs, S> {
+    leaderboard: Leaderboard<D, Obs>,
+    strategy_state: S,
+    metadata: CheckpointMetadata,
+}
+
+impl<D, Obs, S> TryFrom<CheckpointData<D, Obs, S>> for Checkpoint<D, Obs, S> {
+    type Error = String;
+
+    fn try_from(data: CheckpointData<D, Obs, S>) -> Result<Self, Self::Error> {
+        validate_checkpoint_metadata(&data.metadata, data.leaderboard.len())?;
+        Ok(Self {
+            leaderboard: data.leaderboard,
+            strategy_state: data.strategy_state,
+            metadata: data.metadata,
+        })
+    }
 }
 
 impl<D, Obs, S> Checkpoint<D, Obs, S>
@@ -222,6 +398,10 @@ where
 /// - You want minimal storage overhead
 /// - The strategy state is not serializable
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(
+    try_from = "LeaderboardCheckpointData<D, Obs>",
+    bound(deserialize = "D: Deserialize<'de>, Obs: Deserialize<'de>")
+)]
 pub struct LeaderboardCheckpoint<D, Obs> {
     /// The trial history.
     pub leaderboard: Leaderboard<D, Obs>,
@@ -233,6 +413,42 @@ pub struct LeaderboardCheckpoint<D, Obs> {
     /// this tag existed, preserving backward compatibility.
     #[serde(default)]
     pub observation_kind: ObservationKind,
+}
+
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "D: Deserialize<'de>, Obs: Deserialize<'de>"))]
+struct LeaderboardCheckpointData<D, Obs> {
+    leaderboard: Leaderboard<D, Obs>,
+    metadata: CheckpointMetadata,
+    #[serde(default)]
+    observation_kind: ObservationKind,
+}
+
+impl<D, Obs> TryFrom<LeaderboardCheckpointData<D, Obs>> for LeaderboardCheckpoint<D, Obs> {
+    type Error = String;
+
+    fn try_from(data: LeaderboardCheckpointData<D, Obs>) -> Result<Self, Self::Error> {
+        validate_checkpoint_metadata(&data.metadata, data.leaderboard.len())?;
+        Ok(Self {
+            leaderboard: data.leaderboard,
+            metadata: data.metadata,
+            observation_kind: data.observation_kind,
+        })
+    }
+}
+
+fn validate_checkpoint_metadata(
+    metadata: &CheckpointMetadata,
+    stored_trials: usize,
+) -> Result<(), String> {
+    check_format_version_value(metadata.format_version)?;
+    if metadata.n_trials != stored_trials {
+        return Err(format!(
+            "checkpoint metadata n_trials {} does not match the {stored_trials} stored trials",
+            metadata.n_trials
+        ));
+    }
+    Ok(())
 }
 
 impl<D, Obs> LeaderboardCheckpoint<D, Obs>
@@ -397,12 +613,11 @@ fn deserialize_checked<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
     serde_json::from_slice(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Validate that a recorded format version matches the version this build
-/// understands. Returns a clear error on mismatch.
+/// Validate that a recorded format version can be migrated by this build.
 fn check_format_version_value(version: u32) -> Result<(), String> {
-    if version != CURRENT_FORMAT_VERSION {
+    if !(MIN_SUPPORTED_FORMAT_VERSION..=CURRENT_FORMAT_VERSION).contains(&version) {
         return Err(format!(
-            "unsupported checkpoint format_version {version} (expected {CURRENT_FORMAT_VERSION})"
+            "unsupported checkpoint format_version {version} (supported {MIN_SUPPORTED_FORMAT_VERSION} through {CURRENT_FORMAT_VERSION})"
         ));
     }
     Ok(())
@@ -427,26 +642,135 @@ pub fn unique_temp_path(path: &Path) -> PathBuf {
     dir.join(format!(".{base}.tmp.{pid}.{n}"))
 }
 
-/// Best-effort fsync of the directory containing `path` so a preceding rename is
-/// durable. Opening and syncing a directory is unsupported on some platforms
-/// (e.g. Windows), so failures here are ignored rather than propagated.
-pub fn sync_parent_dir(path: &Path) {
+/// Fsync the directory containing `path` so a preceding rename is durable on
+/// Unix. Platforms that do not support opening directories (notably Windows)
+/// rely on the write-through replacement primitive instead.
+pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = dir.unwrap_or_else(|| Path::new("."));
-    if let Ok(dir_file) = File::open(dir) {
-        let _ = dir_file.sync_all();
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+/// Retry an I/O operation only while its error is classified as transient.
+///
+/// `max_retries` counts retries after the initial attempt. Keeping the retry
+/// decision and wait strategy injectable makes the bounded behavior testable
+/// without sleeping.
+#[cfg(any(windows, test))]
+fn retry_transient_io<T, F, P, W>(
+    max_retries: usize,
+    mut operation: F,
+    is_transient: P,
+    mut wait: W,
+) -> io::Result<T>
+where
+    F: FnMut() -> io::Result<T>,
+    P: Fn(&io::Error) -> bool,
+    W: FnMut(usize),
+{
+    let mut retries = 0;
+    loop {
+        match operation() {
+            Err(error) if retries < max_retries && is_transient(&error) => {
+                wait(retries);
+                retries += 1;
+            }
+            result => return result,
+        }
     }
+}
+
+#[cfg(any(windows, test))]
+fn is_transient_windows_replace_error(error: &io::Error) -> bool {
+    // MoveFileExW can briefly lose a race with another replacer, an open
+    // scanner, or filesystem bookkeeping. Do not retry unrelated failures
+    // such as a missing directory, invalid path, or full disk.
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+
+    matches!(
+        error.raw_os_error(),
+        Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+    )
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::time::Duration;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    const MAX_RETRIES: usize = 7;
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    retry_transient_io(
+        MAX_RETRIES,
+        || {
+            // SAFETY: both paths are encoded as owned, NUL-terminated UTF-16
+            // buffers that remain alive for the duration of every call.
+            let replaced = unsafe {
+                MoveFileExW(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if replaced == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        },
+        is_transient_windows_replace_error,
+        |retry| {
+            // The configured exponential delays total 127 ms across all retries.
+            const DELAYS_MS: [u64; MAX_RETRIES] = [1, 2, 4, 8, 16, 32, 64];
+            std::thread::sleep(Duration::from_millis(DELAYS_MS[retry]));
+        },
+    )
 }
 
 /// Write JSON to a file atomically: write to a unique temp file, fsync, rename,
 /// then fsync the parent directory. Prevents data loss if the process crashes
 /// mid-write, and cleans up the temp file on every error path.
-fn atomic_write_json<F>(path: &Path, write_fn: F) -> io::Result<()>
+pub fn atomic_write_json<F>(path: &Path, write_fn: F) -> io::Result<()>
 where
     F: FnOnce(&mut BufWriter<File>) -> Result<(), serde_json::Error>,
 {
-    let tmp = unique_temp_path(path);
-    let file = File::create(&tmp)?;
+    let (tmp, file) = (0..100)
+        .find_map(|_| {
+            let tmp = unique_temp_path(path);
+            match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+                Ok(file) => Some(Ok((tmp, file))),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not allocate a unique checkpoint temporary file",
+            )
+        })?;
 
     // After the temp file exists, remove it on any error so a failed write never
     // leaks a leftover temp.
@@ -455,13 +779,13 @@ where
         write_fn(&mut writer).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let file = writer.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
-        std::fs::rename(&tmp, path)
+        replace_file(&tmp, path)
     })();
 
     match result {
         Ok(()) => {
             // Make the rename durable by fsyncing the parent directory.
-            sync_parent_dir(path);
+            sync_parent_dir(path)?;
             Ok(())
         }
         Err(e) => {
@@ -481,7 +805,7 @@ pub struct AutoCheckpointConfig {
     /// Directory to save checkpoints.
     pub directory: std::path::PathBuf,
     /// Checkpoint every N trials.
-    pub interval: usize,
+    interval: usize,
     /// Maximum number of checkpoints to keep (oldest are deleted).
     pub max_checkpoints: Option<usize>,
     /// Filename prefix.
@@ -500,13 +824,21 @@ impl Default for AutoCheckpointConfig {
 }
 
 impl AutoCheckpointConfig {
-    /// Create a new config with the specified directory and interval.
-    pub fn new(directory: impl Into<std::path::PathBuf>, interval: usize) -> Self {
-        Self {
+    /// Create a new config with the specified directory and non-zero interval.
+    pub fn new(directory: impl Into<std::path::PathBuf>, interval: usize) -> Result<Self, String> {
+        if interval == 0 {
+            return Err("checkpoint interval must be at least 1".to_string());
+        }
+        Ok(Self {
             directory: directory.into(),
             interval,
             ..Default::default()
-        }
+        })
+    }
+
+    /// Number of completed trials between checkpoints.
+    pub fn interval(&self) -> usize {
+        self.interval
     }
 
     /// Generate the filename for a checkpoint at the given trial count.
@@ -535,7 +867,7 @@ mod tests {
         let meta = CheckpointMetadata::new(100, Some("test".to_string()));
         assert_eq!(meta.n_trials, 100);
         assert_eq!(meta.description, Some("test".to_string()));
-        assert_eq!(meta.format_version, 1);
+        assert_eq!(meta.format_version, CURRENT_FORMAT_VERSION);
         assert!(meta.created_at > 0);
     }
 
@@ -561,6 +893,26 @@ mod tests {
     }
 
     #[test]
+    fn test_checkpoint_preserves_finite_float_bits() {
+        // These values exercise decimals that serde_json's default
+        // best-effort parser can round one ULP away from the emitted f64.
+        for value in [0.956_369_757_652_282_7, 0.402_462_840_080_261_23] {
+            let mut lb = Leaderboard::<serde_json::Value, f64>::new();
+            lb.push(serde_json::json!({ "x": value }), value);
+            let checkpoint = LeaderboardCheckpoint::new(lb, None);
+            let restored: LeaderboardCheckpoint<serde_json::Value, f64> =
+                LeaderboardCheckpoint::from_json(&checkpoint.to_json().unwrap()).unwrap();
+            let trial = &restored.leaderboard.trials()[0];
+
+            assert_eq!(
+                trial.candidate["x"].as_f64().unwrap().to_bits(),
+                value.to_bits()
+            );
+            assert_eq!(trial.observation.to_bits(), value.to_bits());
+        }
+    }
+
+    #[test]
     fn test_checkpoint_multi_objective() {
         let mut lb: Leaderboard<String, BTreeMap<String, f64>> = Leaderboard::new();
         lb.push(
@@ -577,8 +929,98 @@ mod tests {
     }
 
     #[test]
+    fn test_checkpoint_preserves_non_finite_scalar_observations() {
+        for score in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let mut lb = Leaderboard::<String, f64>::new();
+            lb.push("candidate".to_string(), score);
+            let checkpoint = LeaderboardCheckpoint::new(lb, None);
+
+            let json = checkpoint.to_json().unwrap();
+            assert!(!json.contains("\"observation\": null"));
+            assert!(json.contains("$hola.float"));
+
+            let restored: LeaderboardCheckpoint<String, f64> =
+                LeaderboardCheckpoint::from_json(&json).unwrap();
+            let actual = restored.leaderboard.trials()[0].observation;
+            assert!(
+                (score.is_nan() && actual.is_nan()) || score == actual,
+                "expected {score:?}, got {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_file_preserves_non_finite_scalar_observations() {
+        let mut lb = Leaderboard::<String, f64>::new();
+        lb.push("infeasible".to_string(), f64::INFINITY);
+        let checkpoint = LeaderboardCheckpoint::new(lb, None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("non-finite.json");
+
+        checkpoint.save_json(&path).unwrap();
+        let restored: LeaderboardCheckpoint<String, f64> =
+            LeaderboardCheckpoint::load_json(&path).unwrap();
+
+        assert!(restored.leaderboard.trials()[0].observation.is_infinite());
+    }
+
+    #[test]
+    fn test_checkpoint_preserves_non_finite_multi_objective_values() {
+        let mut lb = Leaderboard::<String, BTreeMap<String, f64>>::new();
+        lb.push(
+            "candidate".to_string(),
+            [
+                ("finite".into(), 1.0),
+                ("positive_infinity".into(), f64::INFINITY),
+                ("negative_infinity".into(), f64::NEG_INFINITY),
+                ("nan".into(), f64::NAN),
+            ]
+            .into(),
+        );
+
+        let checkpoint = LeaderboardCheckpoint::new(lb, None);
+        let restored: LeaderboardCheckpoint<String, BTreeMap<String, f64>> =
+            LeaderboardCheckpoint::from_json(&checkpoint.to_json().unwrap()).unwrap();
+        let observation = &restored.leaderboard.trials()[0].observation;
+
+        assert_eq!(observation["finite"], 1.0);
+        assert_eq!(observation["positive_infinity"], f64::INFINITY);
+        assert_eq!(observation["negative_infinity"], f64::NEG_INFINITY);
+        assert!(observation["nan"].is_nan());
+    }
+
+    #[test]
+    fn test_checkpoint_preserves_f32_and_reserved_map_keys() {
+        let mut f32_lb = Leaderboard::<String, f32>::new();
+        f32_lb.push("candidate".to_string(), f32::NEG_INFINITY);
+        let f32_checkpoint = LeaderboardCheckpoint::new(f32_lb, None);
+        let f32_restored: LeaderboardCheckpoint<String, f32> =
+            LeaderboardCheckpoint::from_json(&f32_checkpoint.to_json().unwrap()).unwrap();
+        assert_eq!(
+            f32_restored.leaderboard.trials()[0].observation,
+            f32::NEG_INFINITY
+        );
+
+        let mut map_lb = Leaderboard::<String, BTreeMap<String, String>>::new();
+        map_lb.push(
+            "candidate".to_string(),
+            [
+                ("$hola.float".to_string(), "not a tag".to_string()),
+                ("$hola.map".to_string(), "not an escape".to_string()),
+            ]
+            .into(),
+        );
+        let map_checkpoint = LeaderboardCheckpoint::new(map_lb, None);
+        let map_restored: LeaderboardCheckpoint<String, BTreeMap<String, String>> =
+            LeaderboardCheckpoint::from_json(&map_checkpoint.to_json().unwrap()).unwrap();
+        let observation = &map_restored.leaderboard.trials()[0].observation;
+        assert_eq!(observation["$hola.float"], "not a tag");
+        assert_eq!(observation["$hola.map"], "not an escape");
+    }
+
+    #[test]
     fn test_auto_checkpoint_config() {
-        let config = AutoCheckpointConfig::new("/tmp/checkpoints", 10);
+        let config = AutoCheckpointConfig::new("/tmp/checkpoints", 10).unwrap();
 
         assert!(!config.should_checkpoint(0));
         assert!(!config.should_checkpoint(5));
@@ -587,6 +1029,11 @@ mod tests {
 
         let path = config.filename(50);
         assert!(path.to_string_lossy().contains("checkpoint_000050.json"));
+    }
+
+    #[test]
+    fn test_auto_checkpoint_rejects_zero_interval() {
+        assert!(AutoCheckpointConfig::new("/tmp/checkpoints", 0).is_err());
     }
 
     #[test]
@@ -697,6 +1144,19 @@ mod tests {
     }
 
     #[test]
+    fn test_checkpoint_rejects_mismatched_trial_count() {
+        let mut lb = Leaderboard::<String, f64>::new();
+        lb.push("candidate".to_string(), 1.0);
+        let checkpoint = LeaderboardCheckpoint::new(lb, None);
+        let mut value = serde_json::to_value(&checkpoint).unwrap();
+        value["metadata"]["n_trials"] = serde_json::json!(2);
+
+        let error = LeaderboardCheckpoint::<String, f64>::from_json(&value.to_string())
+            .expect_err("mismatched metadata must be rejected");
+        assert!(error.to_string().contains("n_trials"));
+    }
+
+    #[test]
     fn test_size_cap_rejects_oversized_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oversized.json");
@@ -750,8 +1210,9 @@ mod tests {
         assert!(err.contains("format_version"));
         assert!(err.contains("99"));
 
-        // A matching version passes the probe even though the surrounding
-        // payload is not a valid checkpoint, confirming the probe ignores it.
+        // A supported legacy version passes the probe even though the
+        // surrounding payload is not a valid checkpoint, confirming the probe
+        // performs only the cheap migration/version gate.
         let ok = br#"{"leaderboard": "junk", "metadata": {"format_version": 1}}"#;
         assert!(check_format_version_bytes(ok).is_ok());
     }
@@ -778,6 +1239,89 @@ mod tests {
         let missing = br#"{"config": "anything", "checkpoint": {"leaderboard": "junk"}}"#;
         let err = check_format_version_bytes(missing).unwrap_err();
         assert!(err.contains("could not locate format_version"));
+    }
+
+    #[test]
+    fn test_retry_transient_io_retries_then_succeeds() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+
+        let result = retry_transient_io(
+            3,
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "busy"))
+                } else {
+                    Ok("done")
+                }
+            },
+            |error| error.kind() == io::ErrorKind::WouldBlock,
+            |retry| waits.push(retry),
+        )
+        .unwrap();
+
+        assert_eq!(result, "done");
+        assert_eq!(attempts, 3);
+        assert_eq!(waits, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_retry_transient_io_does_not_retry_permanent_error() {
+        let mut attempts = 0;
+        let mut waits = 0;
+
+        let error = retry_transient_io(
+            7,
+            || {
+                attempts += 1;
+                Err::<(), _>(io::Error::new(io::ErrorKind::InvalidInput, "permanent"))
+            },
+            |error| error.kind() == io::ErrorKind::WouldBlock,
+            |_| waits += 1,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(attempts, 1);
+        assert_eq!(waits, 0);
+    }
+
+    #[test]
+    fn test_retry_transient_io_stops_at_bound() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+
+        let error = retry_transient_io(
+            2,
+            || {
+                attempts += 1;
+                Err::<(), _>(io::Error::new(io::ErrorKind::WouldBlock, "still busy"))
+            },
+            |error| error.kind() == io::ErrorKind::WouldBlock,
+            |retry| waits.push(retry),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(attempts, 3, "initial attempt plus two retries");
+        assert_eq!(waits, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_windows_replace_retry_classification_is_narrow() {
+        for code in [5, 32, 33] {
+            assert!(
+                is_transient_windows_replace_error(&io::Error::from_raw_os_error(code)),
+                "Windows error {code} should be retried"
+            );
+        }
+        for code in [2, 3, 87, 112] {
+            assert!(
+                !is_transient_windows_replace_error(&io::Error::from_raw_os_error(code)),
+                "permanent Windows error {code} must not be retried"
+            );
+        }
     }
 
     #[test]

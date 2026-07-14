@@ -44,20 +44,14 @@ function check(cond, msg) {
     if (!cond) failures.push(msg);
 }
 
-// Build a self-contained HTML document: the real index.html markup but with the
-// (possibly overridden) app.js inlined and the remote uPlot <script> stripped,
-// so the page renders offline without network access. A no-op uPlot stub stands
-// in for the CDN library since the table render path does not need real charts.
+// Build a self-contained HTML document: the real index.html markup with the
+// (possibly overridden) dependency-free app.js inlined, so the page renders
+// without a server or network access.
 function buildHtml() {
     let html = readFileSync(INDEX_HTML, 'utf8');
-    // Drop the external CDN scripts/styles (uPlot); they are not needed for the
-    // table render path and must not be fetched in the sandbox.
-    html = html.replace(/<script\b[^>]*\bsrc=["']https?:\/\/[^>]*><\/script>/gi, '');
-    html = html.replace(/<link\b[^>]*\bhref=["']https?:\/\/[^>]*>/gi, '');
     // Replace the local <script src="app.js"> with the inlined app source so we
     // control exactly which app.js is executed.
     const appSrc = readFileSync(APP_JS, 'utf8');
-    const stub = 'window.uPlot = function(){ return { destroy(){}, setData(){} }; };';
     // app.js declares S and its functions with const/function at script top
     // level. function declarations become global, but `const S` does not attach
     // to window, so a bridge script (run in the same global scope) exposes the
@@ -65,14 +59,13 @@ function buildHtml() {
     // throw, so guard each with typeof.
     const bridge = `
         try { window.S = S; } catch (e) {}
-        for (const name of ['renderAll','upsertTrial','computeRanksIfMissing','discoverMetrics','renderTable']) {
+        for (const name of ['renderAll','upsertTrial','computeRanksIfMissing','discoverMetrics','renderTable','setParamNames']) {
             try { if (typeof eval(name) === 'function') window[name] = eval(name); } catch (e) {}
         }
     `;
     html = html.replace(
         /<script\b[^>]*\bsrc=["']app\.js["']><\/script>/i,
-        `<script>${stub}</script>\n`
-        + `<script>${appSrc.replace(/<\/script>/gi, '<\\/script>')}</script>\n`
+        `<script>${appSrc.replace(/<\/script>/gi, '<\\/script>')}</script>\n`
         + `<script>${bridge}</script>`,
     );
     return html;
@@ -125,6 +118,26 @@ function run() {
     check(S && typeof S === 'object', 'app.js did not expose global state object S');
     if (!S) return;
 
+    // Basic accessibility contract for controls and non-text visualizations.
+    check(document.getElementById('status-bar')?.getAttribute('aria-live') === 'polite',
+        'status updates must be exposed through an aria-live region');
+    check(!!document.querySelector('#server-url[aria-label]'),
+        'server URL control needs an accessible name');
+    check(!!document.querySelector('#api-token[aria-label]'),
+        'API token control needs an accessible name');
+    check(!!document.querySelector('#trial-table caption'),
+        'trial table needs an accessible caption');
+    check(document.querySelectorAll('canvas[role="img"][aria-label]').length >= 2,
+        'canvas charts need text alternatives');
+    check(document.querySelectorAll('script[src^="http"], link[href^="http"]').length === 0,
+        'dashboard must not depend on remote scripts, styles, or fonts');
+    const csp = document.querySelector('meta[http-equiv="Content-Security-Policy"]')
+        ?.getAttribute('content') || '';
+    check(csp.includes("default-src 'self'"), 'dashboard must declare a default-src CSP');
+    check(csp.includes("script-src 'self'"), 'dashboard CSP must restrict scripts to self');
+    check(!/script-src[^;]*(?:'unsafe-inline'|'unsafe-eval')/.test(csp),
+        'dashboard CSP must not allow inline/eval scripts');
+
     const lb = checkpoint.leaderboard;
     check(lb && Array.isArray(lb.trials) && lb.trials.length > 0,
         'checkpoint has no leaderboard trials');
@@ -149,15 +162,27 @@ function run() {
         window.computeRanksIfMissing(S.trials);
     }
     // Derive param/metric columns the way the offline loader does.
-    S.paramNames = Object.keys(trial.params);
+    if (typeof window.setParamNames === 'function') window.setParamNames(Object.keys(trial.params));
+    else S.paramNames = Object.keys(trial.params);
     S.space = S.paramNames.map((name) => ({
         name, type: 'real', min: 0, max: 1, scale: 'linear',
     }));
+    S.objectives = Array.isArray(checkpoint.config?.objectives)
+        ? checkpoint.config.objectives : [];
     if (typeof window.discoverMetrics === 'function') window.discoverMetrics();
     S.mode = 'offline';
 
     check(typeof window.renderAll === 'function', 'app.js did not expose renderAll()');
     window.renderAll();
+
+    const sortableHeaders = [...document.querySelectorAll('#trial-thead th')];
+    check(sortableHeaders.length > 0
+        && sortableHeaders.every((th) => th.querySelector('button')?.tabIndex === 0),
+        'sortable table headers must contain keyboard-focusable native buttons');
+    check(sortableHeaders.every((th) => th.getAttribute('role') === null),
+        'sortable table cells must retain their native columnheader role');
+    check(document.querySelectorAll('#trial-thead th[aria-sort]').length <= 1,
+        'aria-sort must appear on at most the actively sorted column header');
 
     // Collect the untrusted payload strings from the checkpoint.
     const payloads = [];
@@ -167,11 +192,13 @@ function run() {
             payloads.push(String(v));
         }
     }
+    for (const objective of S.objectives) payloads.push(String(objective.field));
     const htmlPayloads = payloads.filter((p) => /[<>]/.test(p));
     check(htmlPayloads.length > 0, 'fixture contained no HTML-like payloads to test');
 
     const tbody = document.getElementById('trial-tbody');
     const thead = document.getElementById('trial-thead');
+    const objectives = document.getElementById('objectives-list');
     check(!!tbody, 'trial-tbody not found in DOM');
 
     // 1) No live nodes may have been created from the payloads.
@@ -192,14 +219,12 @@ function run() {
     // The table renders param/metric *values* as cells; verify at least the
     // metric value payload "<script>alert(4)</script>" shows up as text and not
     // as a live node.
-    const renderedText = (tbody.textContent || '') + (thead.textContent || '');
-    let foundAsText = 0;
+    const renderedText = (tbody.textContent || '')
+        + (thead.textContent || '')
+        + (objectives?.textContent || '');
     for (const p of htmlPayloads) {
-        if (renderedText.includes(p)) foundAsText++;
+        check(renderedText.includes(p), `untrusted payload was not rendered as inert text: ${p}`);
     }
-    check(foundAsText > 0,
-        'no untrusted payload was rendered as literal text; render path may not '
-        + 'have produced cells (test would be vacuous)');
 
     // 3) Defensive: the table region must contain zero element nodes that came
     // from parsing a payload as HTML. Re-check by scanning innerHTML of the body

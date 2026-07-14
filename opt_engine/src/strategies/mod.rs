@@ -23,6 +23,6 @@ mod gmm;
 mod random;
 mod sobol;
 
-pub use gmm::{GaussianComponent, GmmParams, GmmRefitConfig, GmmStrategy};
+pub use gmm::{GaussianComponent, GmmError, GmmParams, GmmRefitConfig, GmmStrategy};
 pub use random::RandomStrategy;
 pub use sobol::SobolStrategy;

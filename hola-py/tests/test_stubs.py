@@ -6,6 +6,11 @@
 import hola_opt as hola
 
 EXPECTED_CLASSES = [
+    "HolaError",
+    "ConfigurationError",
+    "CheckpointError",
+    "RemoteError",
+    "ObjectiveError",
     "Real",
     "Integer",
     "Categorical",
@@ -25,6 +30,7 @@ EXPECTED_STUDY_METHODS = [
     "ask",
     "tell",
     "cancel",
+    "heartbeat",
     "top_k",
     "pareto_front",
     "trials",

@@ -20,6 +20,7 @@
 //! - `POST /api/ask` - Request the next trial
 //! - `POST /api/tell` - Report trial results
 //! - `POST /api/cancel` - Cancel a pending trial
+//! - `POST /api/heartbeat` - Renew a pending trial lease
 //! - `GET /api/top_k` - Get top-k trials by rank
 //! - `GET /api/pareto_front` - Get Pareto front trials
 //! - `GET /api/trial/{trial_id}` - Get one completed trial with scoring/ranking
@@ -34,27 +35,39 @@
 use crate::hola_engine::{CompletedTrial, HolaEngine, ObjectiveConfig};
 use axum::{
     Router,
-    extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State},
     http::{
-        HeaderMap, HeaderValue, Method, StatusCode,
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE, HOST, ORIGIN},
     },
+    middleware,
     response::{
-        Json,
-        sse::{Event, Sse},
+        IntoResponse, Json, Response,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{get, patch, post},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::error::Error;
-use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::broadcast;
+use std::future::{Future, IntoFuture};
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Semaphore, broadcast, oneshot};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::services::ServeDir;
+use tower_http::timeout::TimeoutLayer;
+use tower_http::trace::{DefaultOnResponse, TraceLayer};
+use tracing::{Instrument, Level};
 
 // =============================================================================
 // Shared state
@@ -66,22 +79,80 @@ use tower_http::services::ServeDir;
 pub enum EngineEvent {
     TrialCompleted {
         trial_id: u64,
-        /// Scalar score for dashboards. For a multi-objective study this is the
-        /// scalarized value stored under the alphabetically-first key of the
-        /// trial's `score_vector` (a `BTreeMap`, hence sorted) iteration order.
-        /// It is `None` (serialized as JSON `null`) when no finite score is
-        /// available, rather than a sentinel like infinity.
+        /// Scalar score for single-objective dashboards. Multi-objective trials
+        /// have no canonical scalar and therefore use `None` (JSON `null`).
         score: Option<f64>,
         trial: CompletedTrial,
     },
+    /// Objective topology/weights changed; clients must refresh the complete
+    /// ranked snapshot because historical ranks may all have moved.
+    ObjectivesChanged,
 }
 
 pub struct ServerState {
     pub engine: HolaEngine,
-    pub events_tx: broadcast::Sender<EngineEvent>,
+    events_tx: broadcast::Sender<SequencedEngineEvent>,
+    event_journal: StdMutex<EventJournal>,
     auth_token: Option<String>,
+    read_auth_token: Option<String>,
     require_read_auth: bool,
+    cors_allowed_origins: Vec<String>,
     checkpoint_dir: PathBuf,
+    lease_duration: Duration,
+    /// Serialize HTTP tell commit + event publication so SSE order matches
+    /// engine commit order even when post-commit ranking/refit work yields.
+    tell_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Bounds mutation tasks that outlive a timed-out/disconnected request.
+    /// Once a tell/objective mutation has started, it is detached so committed
+    /// post-processing cannot be cancelled with the HTTP response future.
+    mutation_task_slots: Arc<Semaphore>,
+    http_requests_total: AtomicU64,
+    http_failures_total: AtomicU64,
+    http_latency_micros_total: AtomicU64,
+    checkpoint_failures_total: AtomicU64,
+    checkpoint_file_sequence: AtomicU64,
+    events_published_total: AtomicU64,
+}
+
+const EVENT_HISTORY_CAPACITY: usize = 256;
+const MAX_DETACHED_MUTATIONS: usize = 256;
+
+#[derive(Clone, Debug)]
+struct SequencedEngineEvent {
+    id: u64,
+    event: EngineEvent,
+}
+
+#[derive(Debug)]
+struct EventJournal {
+    next_id: u64,
+    history: VecDeque<SequencedEngineEvent>,
+}
+
+impl EventJournal {
+    fn new() -> Self {
+        Self {
+            next_id: 1,
+            history: VecDeque::with_capacity(EVENT_HISTORY_CAPACITY),
+        }
+    }
+
+    fn record(&mut self, event: EngineEvent) -> SequencedEngineEvent {
+        let sequenced = SequencedEngineEvent {
+            id: self.next_id,
+            event,
+        };
+        self.next_id = self.next_id.saturating_add(1);
+        if self.history.len() == EVENT_HISTORY_CAPACITY {
+            self.history.pop_front();
+        }
+        self.history.push_back(sequenced.clone());
+        sequenced
+    }
+
+    fn last_id(&self) -> u64 {
+        self.next_id.saturating_sub(1)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -90,12 +161,23 @@ pub struct ServerOptions {
     pub port: u16,
     pub dashboard_dir: Option<PathBuf>,
     pub auth_token: Option<String>,
+    /// Optional read-only bearer token. It can access GET/SSE/metrics endpoints
+    /// but is never accepted by mutation endpoints.
+    pub read_auth_token: Option<String>,
     /// When `true`, read-only endpoints and the SSE stream also require the
     /// bearer token (only has an effect when `auth_token` is set). Defaults to
-    /// `false`, which keeps read access open while mutations stay protected.
+    /// `true`, so configuring a token protects the entire API by default.
     pub require_read_auth: bool,
     pub checkpoint_dir: PathBuf,
     pub cors_allowed_origins: Vec<String>,
+    /// Maximum duration for ordinary API requests. The long-lived SSE stream
+    /// is excluded from this timeout.
+    pub request_timeout: Duration,
+    /// Lifetime of a distributed trial allocation before it must be completed,
+    /// cancelled, or renewed through `/api/heartbeat`.
+    pub lease_duration: Duration,
+    /// Maximum time to drain in-flight requests after a shutdown signal.
+    pub shutdown_timeout: Duration,
 }
 
 impl ServerOptions {
@@ -105,9 +187,13 @@ impl ServerOptions {
             port,
             dashboard_dir: None,
             auth_token: None,
-            require_read_auth: false,
+            read_auth_token: None,
+            require_read_auth: true,
             checkpoint_dir: PathBuf::from("."),
             cors_allowed_origins: Vec::new(),
+            request_timeout: Duration::from_secs(30),
+            lease_duration: Duration::from_secs(2 * 60 * 60),
+            shutdown_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -124,6 +210,11 @@ struct TellRequest {
 
 #[derive(Deserialize)]
 struct CancelRequest {
+    trial_id: u64,
+}
+
+#[derive(Deserialize)]
+struct HeartbeatRequest {
     trial_id: u64,
 }
 
@@ -157,19 +248,15 @@ struct TrialQuery {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SaveCheckpointRequest {
-    #[serde(default = "default_checkpoint_path")]
-    path: String,
     #[serde(default)]
     description: Option<String>,
 }
 
-fn default_checkpoint_path() -> String {
-    "checkpoint.json".to_string()
-}
-
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct ErrorResponse {
+    code: &'static str,
     error: String,
 }
 
@@ -186,9 +273,68 @@ fn unauthorized() -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::UNAUTHORIZED,
         Json(ErrorResponse {
+            code: "unauthorized",
             error: "Missing or invalid bearer token".to_string(),
         }),
     )
+}
+
+fn forbidden_origin() -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse {
+            code: "origin_forbidden",
+            error: "Request origin is not allowed".to_string(),
+        }),
+    )
+}
+
+fn request_id(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("missing")
+}
+
+/// Reject browser requests from origins outside the configured allow-list
+/// before a handler can mutate state. CORS response headers alone are not a
+/// CSRF defense: browsers still dispatch "simple" cross-origin requests such
+/// as an empty `POST /api/ask`, even when they hide the response from script.
+///
+/// Same-origin requests are recognized by comparing the Origin authority with
+/// the request Host header. Non-browser clients normally omit Origin and remain
+/// unaffected.
+fn authorize_origin(
+    state: &ServerState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(origin) = headers.get(ORIGIN).and_then(|value| value.to_str().ok()) else {
+        return Ok(());
+    };
+
+    if state
+        .cors_allowed_origins
+        .iter()
+        .any(|allowed| allowed == origin)
+    {
+        return Ok(());
+    }
+
+    let same_origin = origin
+        .parse::<axum::http::Uri>()
+        .ok()
+        .and_then(|uri| {
+            uri.authority()
+                .map(|authority| authority.as_str().to_owned())
+        })
+        .zip(headers.get(HOST).and_then(|value| value.to_str().ok()))
+        .is_some_and(|(origin_authority, host)| origin_authority.eq_ignore_ascii_case(host));
+
+    if same_origin {
+        Ok(())
+    } else {
+        Err(forbidden_origin())
+    }
 }
 
 /// Enforce the bearer token when one is configured. Shared by the mutation and
@@ -217,11 +363,25 @@ fn check_bearer(
     }
 }
 
+fn bearer_matches(auth_token: &Option<String>, headers: &HeaderMap) -> bool {
+    let Some(token) = auth_token else {
+        return false;
+    };
+    let expected = format!("Bearer {token}");
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|actual| {
+            constant_time_eq::constant_time_eq(actual.as_bytes(), expected.as_bytes())
+        })
+}
+
 /// Mutating endpoints always require the token when one is configured.
 fn authorize_mutation(
     state: &ServerState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    authorize_origin(state, headers)?;
     check_bearer(&state.auth_token, headers)
 }
 
@@ -231,88 +391,84 @@ fn authorize_read(
     state: &ServerState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    authorize_origin(state, headers)?;
     if state.require_read_auth {
-        check_bearer(&state.auth_token, headers)
+        if (state.auth_token.is_none() && state.read_auth_token.is_none())
+            || bearer_matches(&state.auth_token, headers)
+            || bearer_matches(&state.read_auth_token, headers)
+        {
+            Ok(())
+        } else {
+            Err(unauthorized())
+        }
     } else {
         Ok(())
     }
 }
 
-fn invalid_checkpoint_path(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            error: message.into(),
-        }),
-    )
+async fn record_http_metrics(
+    State(state): State<Arc<ServerState>>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    state.http_requests_total.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let mut response = next.run(request).await;
+    let status = response.status();
+    let has_json_body = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    let framework_error = match status {
+        StatusCode::REQUEST_TIMEOUT => Some((
+            "request_timeout",
+            "request exceeded the configured server timeout",
+        )),
+        StatusCode::PAYLOAD_TOO_LARGE => {
+            Some(("payload_too_large", "request body exceeds the server limit"))
+        }
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY if !has_json_body => {
+            Some(("invalid_request", "request body or parameters are invalid"))
+        }
+        _ => None,
+    };
+    if let Some((code, error)) = framework_error {
+        let status = if status == StatusCode::UNPROCESSABLE_ENTITY {
+            StatusCode::BAD_REQUEST
+        } else {
+            status
+        };
+        response = (
+            status,
+            Json(ErrorResponse {
+                code,
+                error: error.to_string(),
+            }),
+        )
+            .into_response();
+    }
+    if response.status().is_client_error() || response.status().is_server_error() {
+        state.http_failures_total.fetch_add(1, Ordering::Relaxed);
+    }
+    let elapsed_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    state
+        .http_latency_micros_total
+        .fetch_add(elapsed_micros, Ordering::Relaxed);
+    response
 }
 
-fn resolve_checkpoint_path(
-    state: &ServerState,
-    requested: &str,
-) -> Result<PathBuf, (StatusCode, Json<ErrorResponse>)> {
-    let path = Path::new(requested);
-    if path.as_os_str().is_empty() {
-        return Err(invalid_checkpoint_path("Checkpoint path must not be empty"));
-    }
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(invalid_checkpoint_path(
-            "Checkpoint path must be relative to the configured checkpoint directory",
-        ));
-    }
-
-    let joined = state.checkpoint_dir.join(path);
-
-    // Defeat symlink escapes that survive the lexical guard: canonicalize both
-    // the configured root and the parent directory the file would land in, then
-    // require the resolved parent to stay within the root. The parent is
-    // created on demand at save time, so canonicalize the nearest existing
-    // ancestor and re-append the not-yet-created tail before comparing.
-    let canonical_root = state.checkpoint_dir.canonicalize().map_err(|_| {
-        invalid_checkpoint_path("Configured checkpoint directory is not accessible")
-    })?;
-    let parent = joined.parent().unwrap_or(&joined);
-    let canonical_parent = canonicalize_existing_ancestor(parent);
-    if !canonical_parent.starts_with(&canonical_root) {
-        return Err(invalid_checkpoint_path(
-            "Checkpoint path must be relative to the configured checkpoint directory",
-        ));
-    }
-
-    Ok(joined)
-}
-
-/// Canonicalize the nearest existing ancestor of `path` and re-append the
-/// remaining (not-yet-created) components, resolving any symlinks along the
-/// existing portion of the path.
-fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
-    let mut existing = path;
-    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
-    loop {
-        if let Ok(canonical) = existing.canonicalize() {
-            let mut resolved = canonical;
-            for component in tail.iter().rev() {
-                resolved.push(component);
-            }
-            return resolved;
-        }
-        match (existing.file_name(), existing.parent()) {
-            (Some(name), Some(parent)) => {
-                tail.push(name);
-                existing = parent;
-            }
-            // No existing ancestor could be canonicalized; fall back to the
-            // original path so the start_with check fails closed.
-            _ => return path.to_path_buf(),
-        }
-    }
+fn generated_checkpoint_path(state: &ServerState) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let sequence = state
+        .checkpoint_file_sequence
+        .fetch_add(1, Ordering::Relaxed);
+    state
+        .checkpoint_dir
+        .join(format!("checkpoint_{timestamp:013}_{sequence:06}.json"))
 }
 
 async fn handle_ask(
@@ -320,9 +476,49 @@ async fn handle_ask(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     authorize_mutation(&state, &headers)?;
-    match state.engine.ask().await {
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    code: "invalid_idempotency_key",
+                    error: "Idempotency-Key must be valid ASCII".to_string(),
+                }),
+            )
+        })?;
+    if idempotency_key
+        .as_ref()
+        .is_some_and(|key| key.is_empty() || key.len() > 128)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                code: "invalid_idempotency_key",
+                error: "Idempotency-Key must contain 1 to 128 characters".to_string(),
+            }),
+        ));
+    }
+
+    let result = if let Some(key) = idempotency_key {
+        state
+            .engine
+            .ask_idempotent_with_lease(&key, state.lease_duration)
+            .await
+    } else {
+        state.engine.ask_with_lease(state.lease_duration).await
+    };
+    match result {
         Ok(trial) => Ok(Json(serde_json::to_value(&trial).unwrap_or_default())),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e }))),
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                code: "ask_failed",
+                error: e,
+            }),
+        )),
     }
 }
 
@@ -332,36 +528,96 @@ async fn handle_tell(
     Json(req): Json<TellRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     authorize_mutation(&state, &headers)?;
-    match state.engine.tell(req.trial_id, req.metrics).await {
-        Ok(completed) => {
-            let n = state.engine.trial_count().await;
+    let permit = Arc::clone(&state.mutation_task_slots)
+        .acquire_owned()
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    code: "mutation_queue_unavailable",
+                    error: error.to_string(),
+                }),
+            )
+        })?;
+    let task = tokio::spawn(
+        async move {
+            let _permit = permit;
+            process_tell(state, req).await
+        }
+        .instrument(tracing::Span::current()),
+    );
+    task.await.map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                code: "tell_task_failed",
+                error: format!("tell task failed: {error}"),
+            }),
+        )
+    })?
+}
 
-            // Extract the scalar score for the SSE event from the score_vector.
-            // `score_vector` deserializes from a `BTreeMap`, so its JSON object
-            // keys iterate in sorted order; `values().next()` therefore yields
-            // the value of the alphabetically-first key (the multi-objective
-            // scalarized score). A missing or non-finite score becomes an
-            // explicit `None`, serialized as JSON `null`, instead of a sentinel.
+async fn process_tell(
+    state: Arc<ServerState>,
+    req: TellRequest,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let tell_guard = Arc::clone(&state.tell_lock).lock_owned().await;
+    let event_state = Arc::clone(&state);
+    match state
+        .engine
+        .tell_with_outcome_on_commit(req.trial_id, req.metrics, move |completed, _| {
+            // Only a one-component score vector is a meaningful scalar. A
+            // multi-objective vector is deliberately not collapsed by choosing
+            // an arbitrary key.
             let score = completed
                 .score_vector
                 .as_object()
+                .filter(|scores| scores.len() == 1)
                 .and_then(|m| m.values().next())
                 .and_then(|v| v.as_f64())
                 .filter(|v| v.is_finite());
-
-            let _ = state.events_tx.send(EngineEvent::TrialCompleted {
-                trial_id: req.trial_id,
+            let event = EngineEvent::TrialCompleted {
+                trial_id: completed.trial_id,
                 score,
                 trial: completed.clone(),
-            });
+            };
+            let mut journal = event_state
+                .event_journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let sequenced = journal.record(event);
+            // Publish while holding the journal lock so subscribers observe
+            // the same order as the monotonically assigned event IDs.
+            let _ = event_state.events_tx.send(sequenced);
+            event_state
+                .events_published_total
+                .fetch_add(1, Ordering::Relaxed);
+            // Commit/event ordering is now fixed. Release serialization before
+            // refit/checkpoint awaits so slow maintenance never stalls later
+            // tells or objective updates.
+            drop(tell_guard);
+        })
+        .await
+    {
+        Ok(outcome) => {
+            let post_commit_warnings = outcome.post_commit_warnings;
+            let completed = outcome.completed;
 
             Ok(Json(serde_json::json!({
                 "status": "ok",
-                "trial_count": n,
+                "trial_count": outcome.trial_count,
                 "trial": completed,
+                "post_commit_warnings": post_commit_warnings,
             })))
         }
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e }))),
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                code: "tell_failed",
+                error: e,
+            }),
+        )),
     }
 }
 
@@ -373,7 +629,39 @@ async fn handle_cancel(
     authorize_mutation(&state, &headers)?;
     match state.engine.cancel(req.trial_id).await {
         Ok(()) => Ok(Json(serde_json::json!({ "status": "ok" }))),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e }))),
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                code: "cancel_failed",
+                error: e,
+            }),
+        )),
+    }
+}
+
+async fn handle_heartbeat(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(req): Json<HeartbeatRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_mutation(&state, &headers)?;
+    match state
+        .engine
+        .heartbeat(req.trial_id, state.lease_duration)
+        .await
+    {
+        Ok(expires_at) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "trial_id": req.trial_id,
+            "lease_expires_at_ms": expires_at,
+        }))),
+        Err(error) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                code: "heartbeat_failed",
+                error,
+            }),
+        )),
     }
 }
 
@@ -429,6 +717,7 @@ async fn handle_trial(
         None => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
+                code: "trial_not_found",
                 error: format!("Trial {trial_id} not found"),
             }),
         )),
@@ -450,15 +739,75 @@ async fn handle_update_objectives(
     Json(req): Json<UpdateObjectivesRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     authorize_mutation(&state, &headers)?;
-    match state.engine.update_objectives(req.objectives).await {
+    let permit = Arc::clone(&state.mutation_task_slots)
+        .acquire_owned()
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    code: "mutation_queue_unavailable",
+                    error: error.to_string(),
+                }),
+            )
+        })?;
+    let task = tokio::spawn(
+        async move {
+            let _permit = permit;
+            process_update_objectives(state, req).await
+        }
+        .instrument(tracing::Span::current()),
+    );
+    task.await.map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                code: "objective_update_task_failed",
+                error: format!("objective update task failed: {error}"),
+            }),
+        )
+    })?
+}
+
+async fn process_update_objectives(
+    state: Arc<ServerState>,
+    req: UpdateObjectivesRequest,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let tell_guard = Arc::clone(&state.tell_lock).lock_owned().await;
+    let event_state = Arc::clone(&state);
+    let rescalarized_trials = Arc::new(AtomicUsize::new(0));
+    let committed_count = Arc::clone(&rescalarized_trials);
+    match state
+        .engine
+        .update_objectives_on_commit(req.objectives, move |_, retained| {
+            committed_count.store(retained, Ordering::Relaxed);
+            let mut journal = event_state
+                .event_journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let sequenced = journal.record(EngineEvent::ObjectivesChanged);
+            let _ = event_state.events_tx.send(sequenced);
+            event_state
+                .events_published_total
+                .fetch_add(1, Ordering::Relaxed);
+            drop(tell_guard);
+        })
+        .await
+    {
         Ok(()) => {
-            let n = state.engine.trial_count().await;
+            let n = rescalarized_trials.load(Ordering::Relaxed);
             Ok(Json(serde_json::json!({
                 "status": "ok",
                 "rescalarized_trials": n,
             })))
         }
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e }))),
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                code: "invalid_objectives",
+                error: e,
+            }),
+        )),
     }
 }
 
@@ -497,43 +846,128 @@ async fn handle_space(
     Ok(Json(serde_json::json!({ "params": params })))
 }
 
+async fn handle_health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+async fn handle_ready(State(state): State<Arc<ServerState>>) -> Json<serde_json::Value> {
+    // Readiness is intentionally unauthenticated for orchestrator probes, so it
+    // must not disclose study state such as the completed-trial count.
+    let _ = state.engine.retained_trial_count().await;
+    Json(serde_json::json!({ "status": "ready" }))
+}
+
+async fn handle_metrics(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Result<([(axum::http::HeaderName, &'static str); 1], String), (StatusCode, Json<ErrorResponse>)>
+{
+    authorize_read(&state, &headers)?;
+    let completed = state.engine.trial_count().await;
+    let retained = state.engine.retained_trial_count().await;
+    let pending = state.engine.pending_count().await;
+    let requests = state.http_requests_total.load(Ordering::Relaxed);
+    let failures = state.http_failures_total.load(Ordering::Relaxed);
+    let latency_seconds =
+        state.http_latency_micros_total.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    let checkpoint_failures = state
+        .checkpoint_failures_total
+        .load(Ordering::Relaxed)
+        .saturating_add(state.engine.checkpoint_failure_count());
+    let refit_failures = state.engine.refit_failure_count();
+    let events = state.events_published_total.load(Ordering::Relaxed);
+    let body = format!(
+        "# TYPE hola_trials_completed gauge\n\
+         hola_trials_completed {completed}\n\
+         # TYPE hola_trials_retained gauge\n\
+         hola_trials_retained {retained}\n\
+         # TYPE hola_trials_pending gauge\n\
+         hola_trials_pending {pending}\n\
+         # TYPE hola_http_requests_total counter\n\
+         hola_http_requests_total {requests}\n\
+         # TYPE hola_http_failures_total counter\n\
+         hola_http_failures_total {failures}\n\
+         # TYPE hola_http_request_duration_seconds_sum counter\n\
+         hola_http_request_duration_seconds_sum {latency_seconds}\n\
+         # TYPE hola_checkpoint_failures_total counter\n\
+         hola_checkpoint_failures_total {checkpoint_failures}\n\
+         # TYPE hola_refit_failures_total counter\n\
+         hola_refit_failures_total {refit_failures}\n\
+         # TYPE hola_events_published_total counter\n\
+         hola_events_published_total {events}\n"
+    );
+    Ok(([(CONTENT_TYPE, "text/plain; version=0.0.4")], body))
+}
+
+/// Return a replay watermark for snapshot consumers. A client reads this
+/// cursor before fetching `/api/trials`, then opens `/api/events` with it as
+/// `Last-Event-ID`; events racing the REST snapshot are replayed harmlessly.
+async fn handle_event_cursor(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_read(&state, &headers)?;
+    let last_event_id = state
+        .event_journal
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .last_id();
+    // Encode as a decimal string so JavaScript retains the full u64 cursor.
+    Ok(Json(serde_json::json!({
+        "last_event_id": last_event_id.to_string(),
+    })))
+}
+
 async fn handle_checkpoint_save(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
     Json(req): Json<SaveCheckpointRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     authorize_mutation(&state, &headers)?;
-    let path = resolve_checkpoint_path(&state, &req.path)?;
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        // Log the underlying error (which can contain filesystem paths) only
-        // server-side; return a generic message so paths do not leak to clients.
-        // (`eprintln!` matches this module's existing server-side logging; the
-        // crate does not depend on `tracing` directly.)
-        eprintln!("failed to create checkpoint directory: {e}");
-        return Err(checkpoint_save_failed());
+    let path = generated_checkpoint_path(&state);
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            // Log the underlying error (which can contain filesystem paths)
+            // only server-side; return a generic message so paths do not leak
+            // to clients.
+            state
+                .checkpoint_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                request_id = request_id(&headers),
+                error_code = "checkpoint_save_failed",
+                error = %e,
+                "failed to create checkpoint directory"
+            );
+            return Err(checkpoint_save_failed());
+        }
     }
 
     match state
         .engine
-        .save_full_checkpoint(&path, req.description.as_deref())
+        .save_full_checkpoint_with_metadata(&path, req.description.as_deref())
         .await
     {
-        Ok(()) => {
-            let n = state.engine.trial_count().await;
-            Ok(Json(serde_json::json!({
-                "status": "ok",
-                "checkpoint_type": "full",
-                // Return the resolved checkpoint path so clients can load it
-                // back (e.g. `Study.load(path)`); the directory is operator-
-                // configured and traversal is blocked by resolve_checkpoint_path.
-                "path": path.to_string_lossy(),
-                "trials_saved": n,
-            })))
-        }
+        Ok(saved) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "checkpoint_type": "full",
+            // Return the resolved checkpoint path so clients can load it
+            // back (e.g. `Study.load(path)`); the directory is operator-
+            // configured and traversal is blocked by resolve_checkpoint_path.
+            "path": path.to_string_lossy(),
+            "trials_saved": saved.n_trials,
+            "created_at": saved.created_at,
+        }))),
         Err(e) => {
-            eprintln!("failed to save checkpoint: {e}");
+            state
+                .checkpoint_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                request_id = request_id(&headers),
+                error_code = "checkpoint_save_failed",
+                error = %e,
+                "failed to save checkpoint"
+            );
             Err(checkpoint_save_failed())
         }
     }
@@ -543,6 +977,7 @@ fn checkpoint_save_failed() -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse {
+            code: "checkpoint_save_failed",
             error: "failed to save checkpoint".to_string(),
         }),
     )
@@ -557,14 +992,70 @@ async fn handle_events(
 > {
     authorize_read(&state, &headers)?;
     let rx = state.events_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
-        Ok(event) => {
-            let data = serde_json::to_string(&event).unwrap_or_default();
-            Some(Ok(Event::default().data(data)))
+    let requested_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let (replay, snapshot_last_id, replay_gap) = {
+        let journal = state
+            .event_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot_last_id = journal.last_id();
+        let oldest_id = journal.history.front().map(|event| event.id);
+        let expired_cursor = requested_id
+            .zip(oldest_id)
+            .is_some_and(|(requested, oldest)| requested.saturating_add(1) < oldest);
+        // Event IDs restart with a new server process. A client reconnecting
+        // with a cursor from the previous process must be told to replace its
+        // snapshot instead of waiting forever for an ID greater than that
+        // stale cursor.
+        let future_cursor = requested_id.is_some_and(|requested| requested > snapshot_last_id);
+        let replay_gap = expired_cursor || future_cursor;
+        let replay = requested_id.map_or_else(Vec::new, |requested| {
+            journal
+                .history
+                .iter()
+                .filter(|event| event.id > requested)
+                .cloned()
+                .collect()
+        });
+        (replay, snapshot_last_id, replay_gap)
+    };
+
+    let mut initial = Vec::with_capacity(replay.len() + usize::from(replay_gap));
+    if replay_gap {
+        let reason = if requested_id.is_some_and(|requested| requested > snapshot_last_id) {
+            "event cursor is ahead of this server"
+        } else {
+            "event history expired"
+        };
+        initial.push(Ok(Event::default()
+            .event("stream_reset")
+            .data(serde_json::json!({ "reason": reason }).to_string())));
+    }
+    initial.extend(replay.into_iter().map(|event| Ok(sse_event(&event))));
+
+    let live = BroadcastStream::new(rx).filter_map(move |result| match result {
+        Ok(event) if event.id > snapshot_last_id => Some(Ok(sse_event(&event))),
+        Ok(_) => None,
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(missed)) => {
+            Some(Ok(Event::default()
+                .event("stream_lagged")
+                .data(serde_json::json!({ "missed": missed }).to_string())))
         }
-        Err(_) => None,
     });
-    Ok(Sse::new(stream))
+    let stream = tokio_stream::iter(initial).chain(live);
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
+}
+
+fn sse_event(event: &SequencedEngineEvent) -> Event {
+    let data = serde_json::to_string(&event.event).unwrap_or_default();
+    Event::default().id(event.id.to_string()).data(data)
 }
 
 // =============================================================================
@@ -574,7 +1065,12 @@ async fn handle_events(
 fn build_cors(origins: &[String]) -> Result<CorsLayer, Box<dyn Error>> {
     let mut cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PATCH])
-        .allow_headers([CONTENT_TYPE, AUTHORIZATION]);
+        .allow_headers([
+            CONTENT_TYPE,
+            AUTHORIZATION,
+            HeaderName::from_static("last-event-id"),
+            HeaderName::from_static("idempotency-key"),
+        ]);
 
     if !origins.is_empty() {
         let parsed: Vec<HeaderValue> = origins
@@ -611,21 +1107,67 @@ pub fn create_router_with_options(
     engine: HolaEngine,
     options: ServerOptions,
 ) -> Result<Router, Box<dyn Error>> {
+    if options.lease_duration.is_zero() {
+        return Err("lease_duration must be greater than zero".into());
+    }
+    if options.request_timeout.is_zero() {
+        return Err("request_timeout must be greater than zero".into());
+    }
+    if options.shutdown_timeout.is_zero() {
+        return Err("shutdown_timeout must be greater than zero".into());
+    }
+    if options
+        .auth_token
+        .as_deref()
+        .is_some_and(|token| token.trim().is_empty())
+    {
+        return Err("auth_token must not be empty or whitespace-only".into());
+    }
+    if options
+        .read_auth_token
+        .as_deref()
+        .is_some_and(|token| token.trim().is_empty())
+    {
+        return Err("read_auth_token must not be empty or whitespace-only".into());
+    }
+    if options.read_auth_token.is_some() && options.auth_token.is_none() {
+        return Err("read_auth_token requires an auth_token for mutation endpoints".into());
+    }
+    std::fs::create_dir_all(&options.checkpoint_dir).map_err(|error| {
+        format!(
+            "failed to create checkpoint directory '{}': {error}",
+            options.checkpoint_dir.display()
+        )
+    })?;
     let (events_tx, _) = broadcast::channel(256);
     let state = Arc::new(ServerState {
         engine,
         events_tx,
+        event_journal: StdMutex::new(EventJournal::new()),
         auth_token: options.auth_token,
+        read_auth_token: options.read_auth_token,
         require_read_auth: options.require_read_auth,
+        cors_allowed_origins: options.cors_allowed_origins.clone(),
         checkpoint_dir: options.checkpoint_dir,
+        lease_duration: options.lease_duration,
+        tell_lock: Arc::new(tokio::sync::Mutex::new(())),
+        mutation_task_slots: Arc::new(Semaphore::new(MAX_DETACHED_MUTATIONS)),
+        http_requests_total: AtomicU64::new(0),
+        http_failures_total: AtomicU64::new(0),
+        http_latency_micros_total: AtomicU64::new(0),
+        checkpoint_failures_total: AtomicU64::new(0),
+        checkpoint_file_sequence: AtomicU64::new(0),
+        events_published_total: AtomicU64::new(0),
     });
+    let metrics_state = Arc::clone(&state);
 
     let cors = build_cors(&options.cors_allowed_origins)?;
 
-    Ok(Router::new()
+    let api = Router::new()
         .route("/api/ask", post(handle_ask))
         .route("/api/tell", post(handle_tell))
         .route("/api/cancel", post(handle_cancel))
+        .route("/api/heartbeat", post(handle_heartbeat))
         .route("/api/top_k", get(handle_top_k))
         .route("/api/pareto_front", get(handle_pareto_front))
         .route("/api/trial/{trial_id}", get(handle_trial))
@@ -636,9 +1178,45 @@ pub fn create_router_with_options(
             patch(handle_update_objectives).get(handle_get_objectives),
         )
         .route("/api/space", get(handle_space))
+        .route("/api/metrics", get(handle_metrics))
+        .route("/api/event_cursor", get(handle_event_cursor))
         .route("/api/checkpoint/save", post(handle_checkpoint_save))
-        .route("/api/events", get(handle_events))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            options.request_timeout,
+        ));
+
+    let request_id_header = HeaderName::from_static("x-request-id");
+    Ok(Router::new()
+        .route("/healthz", get(handle_health))
+        .route("/readyz", get(handle_ready))
+        .merge(api)
+        // SSE is deliberately outside the ordinary request timeout.
+        .route("/api/events", get(handle_events))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    let request_id = request
+                        .headers()
+                        .get("x-request-id")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("missing");
+                    tracing::info_span!(
+                        "http_request",
+                        method = %request.method(),
+                        uri = %request.uri(),
+                        request_id = %request_id,
+                    )
+                })
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        )
+        .layer(middleware::from_fn_with_state(
+            metrics_state,
+            record_http_metrics,
+        ))
+        .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
+        .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
         .layer(cors)
         .with_state(state))
 }
@@ -690,22 +1268,272 @@ pub async fn serve_with_options(
     engine: HolaEngine,
     options: ServerOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !is_loopback_host(&options.host) && options.auth_token.is_none() {
+        return Err(format!(
+            "an auth token is required when binding to non-loopback host '{}'",
+            options.host
+        )
+        .into());
+    }
     let router = match options.dashboard_dir.as_deref() {
         Some(_) => create_router_with_dashboard_and_options(engine, options.clone())?,
         None => create_router_with_options(engine, options.clone())?,
     };
-    let listener =
-        tokio::net::TcpListener::bind(format!("{}:{}", options.host, options.port)).await?;
+    let listener = tokio::net::TcpListener::bind((options.host.as_str(), options.port)).await?;
     if let Some(dir) = &options.dashboard_dir {
-        eprintln!(
-            "HOLA server listening on {}:{} (dashboard: {})",
-            options.host,
-            options.port,
-            dir.display()
+        tracing::info!(
+            host = options.host,
+            port = options.port,
+            dashboard = %dir.display(),
+            "HOLA server listening"
         );
     } else {
-        eprintln!("HOLA server listening on {}:{}", options.host, options.port);
+        tracing::info!(
+            host = options.host,
+            port = options.port,
+            "HOLA server listening"
+        );
     }
-    axum::serve(listener, router).await?;
+    serve_listener_with_shutdown(
+        listener,
+        router,
+        shutdown_signal(),
+        options.shutdown_timeout,
+    )
+    .await?;
     Ok(())
+}
+
+async fn serve_listener_with_shutdown<F>(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    shutdown: F,
+    drain_timeout: Duration,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (started_tx, started_rx) = oneshot::channel();
+    let shutdown = async move {
+        shutdown.await;
+        let _ = started_tx.send(());
+    };
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown)
+        .into_future();
+    tokio::pin!(server);
+
+    tokio::select! {
+        result = &mut server => result,
+        _ = started_rx => {
+            tracing::info!(
+                timeout_seconds = drain_timeout.as_secs_f64(),
+                "shutdown signal received; draining in-flight requests"
+            );
+            match tokio::time::timeout(drain_timeout, &mut server).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_seconds = drain_timeout.as_secs_f64(),
+                        "graceful shutdown deadline reached; closing remaining connections"
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %error, "failed to install Ctrl-C handler");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => tracing::error!(error = %error, "failed to install SIGTERM handler"),
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hola_engine::{ObjectiveConfig, ParamConfig, StudyConfig};
+    use std::collections::BTreeMap;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn bounded_shutdown_closes_a_stuck_request_after_the_drain_deadline() {
+        let handler_started = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new().route(
+            "/hang",
+            get({
+                let handler_started = Arc::clone(&handler_started);
+                move || {
+                    let handler_started = Arc::clone(&handler_started);
+                    async move {
+                        handler_started.notify_one();
+                        std::future::pending::<()>().await;
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_listener_with_shutdown(
+            listener,
+            app,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_millis(25),
+        ));
+
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET /hang HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handler_started.notified())
+            .await
+            .expect("the hanging request should reach its handler");
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("bounded graceful shutdown should finish")
+            .expect("server task should join")
+            .expect("server should close cleanly at its drain deadline");
+    }
+
+    #[tokio::test]
+    async fn cancelled_http_tell_future_does_not_cancel_commit_or_duplicate_event() {
+        let engine = HolaEngine::from_config(StudyConfig {
+            space: BTreeMap::from([(
+                "x".to_string(),
+                ParamConfig::Real {
+                    min: 0.0,
+                    max: 1.0,
+                    scale: "linear".to_string(),
+                },
+            )]),
+            objectives: vec![ObjectiveConfig {
+                field: "loss".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            }],
+            strategy: None,
+            checkpoint: None,
+            max_trials: None,
+            max_leaderboard_size: None,
+        })
+        .unwrap();
+        let trial = engine.ask().await.unwrap();
+        let (events_tx, _) = broadcast::channel(256);
+        let checkpoint_dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(ServerState {
+            engine: engine.clone(),
+            events_tx,
+            event_journal: StdMutex::new(EventJournal::new()),
+            auth_token: None,
+            read_auth_token: None,
+            require_read_auth: true,
+            cors_allowed_origins: Vec::new(),
+            checkpoint_dir: checkpoint_dir.path().to_path_buf(),
+            lease_duration: Duration::from_secs(60),
+            tell_lock: Arc::new(tokio::sync::Mutex::new(())),
+            mutation_task_slots: Arc::new(Semaphore::new(MAX_DETACHED_MUTATIONS)),
+            http_requests_total: AtomicU64::new(0),
+            http_failures_total: AtomicU64::new(0),
+            http_latency_micros_total: AtomicU64::new(0),
+            checkpoint_failures_total: AtomicU64::new(0),
+            checkpoint_file_sequence: AtomicU64::new(0),
+            events_published_total: AtomicU64::new(0),
+        });
+
+        // Hold the serialization lock so the request wrapper can spawn and
+        // detach its owned mutation task before that task commits anything.
+        let tell_guard = state.tell_lock.lock().await;
+        let request_state = Arc::clone(&state);
+        let outer = tokio::spawn(handle_tell(
+            State(request_state),
+            HeaderMap::new(),
+            Json(TellRequest {
+                trial_id: trial.trial_id,
+                metrics: serde_json::json!({"loss": 0.25}),
+            }),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.mutation_task_slots.available_permits() == MAX_DETACHED_MUTATIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handler should transfer a bounded permit to the detached task");
+        outer.abort();
+        assert!(outer.await.unwrap_err().is_cancelled());
+        drop(tell_guard);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while engine.trial_count().await != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached tell should finish after its HTTP future is cancelled");
+        assert_eq!(
+            state
+                .event_journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last_id(),
+            1
+        );
+
+        let _response = handle_tell(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(TellRequest {
+                trial_id: trial.trial_id,
+                metrics: serde_json::json!({"loss": 0.25}),
+            }),
+        )
+        .await
+        .expect("retry should replay the committed receipt");
+        assert_eq!(
+            state
+                .event_journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last_id(),
+            1,
+            "receipt replay must not publish a second completion event"
+        );
+    }
 }

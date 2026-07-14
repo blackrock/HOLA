@@ -91,9 +91,11 @@ study.tell(trial.trial_id, {"loss": 0.42})
 
 The `dashboard/` directory contains a zero-install browser UI for
 monitoring live studies or exploring saved checkpoints. Open
-`dashboard/index.html`, enter a server URL, and see convergence
-plots, Pareto scatter, parallel coordinates, and a sortable trial
-table, all updated in real time via SSE.
+`dashboard/index.html` to explore a checkpoint, or serve it from the
+same HOLA server with `hola serve config.yaml --dashboard ./dashboard`
+for live monitoring. It provides convergence plots, Pareto scatter,
+parallel coordinates, and a sortable trial table, all updated in real
+time via SSE.
 
 ## Documentation
 
@@ -103,6 +105,8 @@ table, all updated in real time via SSE.
 | [Python Guide](docs/python-guide.md) | Full Python API: spaces, objectives, strategies, `Study`, `Study.connect()` |
 | [CLI & Distributed](docs/cli-guide.md) | YAML config, `hola serve`, `hola worker`, multi-machine setup |
 | [REST API](docs/rest-api.md) | Endpoint reference with request/response schemas |
+| [Operations](docs/operations.md) | Secure deployment, probes, metrics, recovery, and shutdown |
+| [Release Verification](docs/release-checklist.md) | Hosted compatibility, browser/accessibility, scale, recovery, and artifact gates |
 | [Concepts](docs/concepts.md) | Architecture, strategies, scalarization, the unit hypercube |
 | [Dashboard](docs/dashboard.md) | Real-time visualization and checkpoint analysis |
 
@@ -110,15 +114,16 @@ table, all updated in real time via SSE.
 
 ```bash
 # Run all Rust tests
-cargo test --workspace --all-features
+cargo test --locked --workspace --all-features
 
 # Build and test Python bindings
-cd hola-py && uv sync --dev && uv run maturin develop && cd ..
-hola-py/.venv/bin/python -m pytest hola-py/tests/ -v
+uv sync --directory hola-py --locked --dev --group benchmarks
+uv run --directory hola-py maturin develop
+uv run --directory hola-py pytest tests/ -v
 
 # Lint
-cargo clippy --workspace --all-features -- -D warnings
-uv run --project hola-py ruff check .
+cargo clippy --locked --workspace --all-features -- -D warnings
+uv run --directory hola-py ruff check .
 ```
 
 ## License

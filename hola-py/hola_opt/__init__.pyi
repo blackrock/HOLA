@@ -6,6 +6,25 @@ from typing import Any
 
 __all__: list[str]
 
+class HolaError(ValueError):
+    """Base exception for HOLA errors.
+
+    This subclasses ``ValueError`` for compatibility with releases that raised
+    ``ValueError`` for every binding-level failure.
+    """
+
+class ConfigurationError(HolaError):
+    """Invalid study, strategy, space, objective, or client configuration."""
+
+class CheckpointError(HolaError):
+    """Checkpoint loading or saving failed."""
+
+class RemoteError(HolaError):
+    """A remote request, response, or protocol operation failed."""
+
+class ObjectiveError(HolaError):
+    """An objective result violated its contract or could not be reported."""
+
 class Real:
     """Real-valued parameter with configurable scale.
 
@@ -16,7 +35,7 @@ class Real:
             ``"ln"`` (alias for ``"log"``), or ``"log10"``.
 
     Raises:
-        ValueError: If ``scale`` is not one of ``"linear"``, ``"log"``,
+        ConfigurationError: If ``scale`` is not one of ``"linear"``, ``"log"``,
             ``"ln"``, or ``"log10"``.
     """
 
@@ -120,7 +139,7 @@ class Gmm:
             the number of dimensions.
 
     Raises:
-        ValueError: If ``elite_fraction`` is non-finite or outside the range
+        ConfigurationError: If ``elite_fraction`` is non-finite or outside the range
             ``(0.0, 1.0]``, or if ``refit_interval`` is ``0``.
     """
 
@@ -159,7 +178,7 @@ class Space:
         Space(lr=Real(1e-4, 0.1, scale="log10"), layers=Integer(1, 10))
 
     Raises:
-        ValueError: If any keyword value is not a ``Real``, ``Integer``, or
+        ConfigurationError: If any keyword value is not a ``Real``, ``Integer``, or
             ``Categorical`` instance.
     """
 
@@ -168,12 +187,15 @@ class Space:
 class Trial:
     """A trial returned by ``Study.ask()``.
 
-    ``params`` is normally a ``dict``. On the remote (``Study.connect``) path it
-    may be ``None`` if the server response omits the field.
+    Both local and remote studies guarantee that ``params`` is a dictionary;
+    malformed remote responses raise ``RemoteError`` instead of changing the
+    public object shape.
     """
 
-    trial_id: int
-    params: dict[str, Any]
+    @property
+    def trial_id(self) -> int: ...
+    @property
+    def params(self) -> dict[str, Any]: ...
     def __repr__(self) -> str: ...
 
 class CompletedTrial:
@@ -189,14 +211,22 @@ class CompletedTrial:
     ``float('inf')``.
     """
 
-    trial_id: int
-    params: dict[str, Any]
-    metrics: dict[str, Any]
-    scores: dict[str, Any]
-    score_vector: dict[str, Any]
-    rank: int
-    pareto_front: int
-    completed_at: int
+    @property
+    def trial_id(self) -> int: ...
+    @property
+    def params(self) -> dict[str, Any]: ...
+    @property
+    def metrics(self) -> dict[str, Any]: ...
+    @property
+    def scores(self) -> dict[str, Any]: ...
+    @property
+    def score_vector(self) -> dict[str, Any]: ...
+    @property
+    def rank(self) -> int: ...
+    @property
+    def pareto_front(self) -> int: ...
+    @property
+    def completed_at(self) -> int: ...
     def __repr__(self) -> str: ...
 
 class Study:
@@ -213,7 +243,7 @@ class Study:
         top = study.top_k(3)
 
     Raises:
-        ValueError: If ``objectives`` is empty, if ``strategy`` is an unknown
+        ConfigurationError: If ``objectives`` is empty, if ``strategy`` is an unknown
             string, if ``max_leaderboard_size`` is ``0``, or if the resulting
             configuration is otherwise invalid.
     """
@@ -228,30 +258,60 @@ class Study:
         max_leaderboard_size: int | None = None,
     ) -> None: ...
     @staticmethod
-    def connect(url: str, token: str | None = None) -> Study:
+    def connect(
+        url: str,
+        token: str | None = None,
+        *,
+        connect_timeout: float = 10.0,
+        request_timeout: float = 30.0,
+    ) -> Study:
         """Connect to an existing HOLA server.
 
         The connection is established lazily on the first ``ask``/``tell``; this
         call only validates and stores the URL (no network request is made
-        here).
+        here). The optional bearer token is attached to every endpoint. Connect
+        and whole-request timeouts are measured in seconds and must be positive
+        finite numbers.
 
         Raises:
-            ValueError: If ``url`` is malformed or does not use the ``http`` or
-                ``https`` scheme.
+            ConfigurationError: If ``url`` is malformed or does not use the ``http`` or
+                ``https`` scheme, or if either timeout is invalid.
         """
         ...
     @staticmethod
     def load(path: str) -> Study:
-        """Load a study from a saved checkpoint."""
+        """Load a study from a saved checkpoint.
+
+        Raises:
+            CheckpointError: If the checkpoint cannot be read or restored.
+        """
         ...
     def ask(self) -> Trial:
-        """Request the next trial to evaluate."""
+        """Request the next trial to evaluate.
+
+        Raises:
+            RemoteError: If a remote request or response fails.
+            HolaError: If the local engine cannot issue a trial.
+        """
         ...
     def tell(self, trial_id: int, metrics: dict[str, Any]) -> CompletedTrial:
-        """Report the result of a trial."""
+        """Report the result of a trial.
+
+        Raises:
+            ObjectiveError: If local metrics violate the objective contract.
+            RemoteError: If a remote request or response fails.
+        """
         ...
     def cancel(self, trial_id: int) -> None:
         """Cancel a pending trial."""
+        ...
+    def heartbeat(self, trial_id: int) -> int:
+        """Renew a remote trial lease and return its Unix-millisecond deadline.
+
+        Raises:
+            ConfigurationError: If called on a local study.
+            RemoteError: If renewal fails or the server response is malformed.
+        """
         ...
     def top_k(self, k: int, include_infeasible: bool = False) -> list[CompletedTrial]:
         """Get the top-k trials by rank."""
@@ -273,7 +333,11 @@ class Study:
         """Update objectives mid-run, re-scalarizing all trials."""
         ...
     def save(self, path: str) -> None:
-        """Save a checkpoint to disk."""
+        """Save a checkpoint to disk.
+
+        Raises:
+            CheckpointError: If the checkpoint cannot be written.
+        """
         ...
     def run(
         self,
@@ -283,7 +347,10 @@ class Study:
     ) -> Study:
         """Run an objective function for n_trials, automating the ask/tell loop.
 
-        Returns self so you can chain: ``study.run(func, 100).top_k(3)``
+        Returns self so you can chain: ``study.run(func, 100).top_k(3)``.
+
+        A Python exception raised by ``func`` is propagated unchanged. An
+        invalid return value raises ``ObjectiveError``.
         """
         ...
     def serve(

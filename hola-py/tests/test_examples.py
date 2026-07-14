@@ -22,10 +22,11 @@ EXAMPLE_SCRIPTS = sorted(s for s in EXAMPLES_DIR.glob("*.py") if s.name not in I
     EXAMPLE_SCRIPTS,
     ids=[s.stem for s in EXAMPLE_SCRIPTS],
 )
-def test_example_runs(script):
+def test_example_runs(script, isolated_benchmarks_path, isolated_benchmarks_env):
     result = subprocess.run(
         [sys.executable, str(script)],
-        cwd=str(EXAMPLES_DIR.parent),  # hola-py/, so benchmarks imports resolve
+        cwd=str(isolated_benchmarks_path),
+        env=isolated_benchmarks_env,
         capture_output=True,
         text=True,
         timeout=300,  # ml_hyperparameters trains real sklearn models

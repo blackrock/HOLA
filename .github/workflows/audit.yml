@@ -9,52 +9,50 @@ on:
       - "Cargo.lock"
       - "hola-py/pyproject.toml"
       - "hola-py/uv.lock"
+      - "dashboard/tests/package.json"
+      - "dashboard/tests/package-lock.json"
   pull_request:
     paths:
       - "**/Cargo.toml"
       - "Cargo.lock"
       - "hola-py/pyproject.toml"
       - "hola-py/uv.lock"
+      - "dashboard/tests/package.json"
+      - "dashboard/tests/package-lock.json"
 
 permissions:
   contents: read
 
+concurrency:
+  group: audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   audit:
     name: Cargo audit
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
-      checks: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  scheduled-audit:
-    name: Scheduled cargo audit
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write
-      issues: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92.0
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Audit Rust dependencies
+        run: cargo audit
 
   python-audit:
     name: Python dependency audit (pip-audit)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v8.2.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.24"
       - name: pip-audit (hola-py)
         working-directory: hola-py
         run: |
@@ -64,5 +62,24 @@ jobs:
           # the dev/docs/benchmarks groups too, so lockfile-only vulnerabilities
           # in transitive deps (e.g. docs tooling) are caught, matching what
           # GitHub's native Dependabot scan sees.
-          uv export --all-groups --format requirements-txt --no-emit-project --no-hashes -o /tmp/hola-py-requirements.txt
-          uvx pip-audit --requirement /tmp/hola-py-requirements.txt
+          uv export --locked --all-groups --format requirements-txt --no-emit-project --no-hashes -o /tmp/hola-py-requirements.txt
+          uvx --from pip-audit==2.10.1 pip-audit --requirement /tmp/hola-py-requirements.txt
+
+  dashboard-audit:
+    name: Dashboard dependency audit (npm)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: dashboard/tests
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22.22.2"
+          cache: npm
+          cache-dependency-path: dashboard/tests/package-lock.json
+      - run: npm ci
+      - run: npm audit --audit-level=high

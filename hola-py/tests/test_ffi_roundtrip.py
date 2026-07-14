@@ -12,9 +12,9 @@
 """
 FFI round-trip tests for the HOLA Python <-> JSON conversion layer.
 
-Covers non-finite float (inf/-inf/nan) and large-u64 round-tripping through
-tell()/CompletedTrial.metrics, Study.connect() URL validation, and the "ln"
-natural-log scale alias on Real.
+Covers non-finite score decoding without retyping literal raw JSON strings,
+large-u64 round-tripping through tell()/CompletedTrial.metrics, Study.connect()
+URL validation, and the "ln" natural-log scale alias on Real.
 """
 
 import math
@@ -22,7 +22,7 @@ import math
 import pytest
 
 # ==========================================================================
-# Non-finite float round-trip through tell() / CompletedTrial.metrics
+# Raw JSON preservation and non-finite numeric score decoding
 # ==========================================================================
 
 
@@ -35,19 +35,75 @@ def _completed_trial(metrics):
     return study.tell(t.trial_id, metrics)
 
 
-def test_metrics_inf_roundtrip():
+def test_raw_metrics_inf_uses_json_sentinel_without_retyping_literal_strings():
     ct = _completed_trial({"loss": 0.5, "extra": float("inf")})
-    assert ct.metrics["extra"] == float("inf")
+    assert ct.metrics["extra"] == "inf"
 
 
-def test_metrics_neg_inf_roundtrip():
+def test_raw_metrics_neg_inf_uses_json_sentinel():
     ct = _completed_trial({"loss": 0.5, "extra": float("-inf")})
-    assert ct.metrics["extra"] == float("-inf")
+    assert ct.metrics["extra"] == "-inf"
 
 
-def test_metrics_nan_roundtrip():
+def test_raw_metrics_nan_uses_json_sentinel():
     ct = _completed_trial({"loss": 0.5, "extra": float("nan")})
-    assert math.isnan(ct.metrics["extra"])
+    assert ct.metrics["extra"] == "nan"
+
+
+def test_literal_nonfinite_sentinel_strings_are_preserved_in_raw_metrics():
+    ct = _completed_trial(
+        {
+            "loss": 0.5,
+            "positive": "inf",
+            "negative": "-inf",
+            "not_a_number": "nan",
+        }
+    )
+    assert ct.metrics["positive"] == "inf"
+    assert ct.metrics["negative"] == "-inf"
+    assert ct.metrics["not_a_number"] == "nan"
+
+
+def test_literal_nonfinite_sentinel_categorical_params_remain_strings():
+    from hola_opt import Categorical, Minimize, Space, Study
+
+    for choice in ("inf", "-inf", "nan"):
+        study = Study(
+            space=Space(label=Categorical([choice])),
+            objectives=[Minimize("loss")],
+            strategy="random",
+            seed=7,
+        )
+        trial = study.ask()
+        assert trial.params["label"] == choice
+        assert isinstance(trial.params["label"], str)
+        completed = study.tell(trial.trial_id, {"loss": 0.5})
+        assert completed.params["label"] == choice
+        assert isinstance(completed.params["label"], str)
+
+
+def test_nonfinite_score_sentinels_decode_only_in_numeric_score_fields():
+    ct = _completed_trial({"loss": float("inf")})
+    assert ct.metrics["loss"] == "inf"
+    assert math.isinf(ct.scores["loss"])
+    assert math.isinf(ct.score_vector["loss"])
+
+
+def test_nonfinite_objective_metrics_keep_sign_and_direction_during_scoring():
+    negative = _completed_trial({"loss": float("-inf")})
+    assert negative.scores["loss"] == float("-inf")
+    assert negative.score_vector["loss"] == float("-inf")
+
+    nan = _completed_trial({"loss": float("nan")})
+    assert math.isnan(nan.scores["loss"])
+    assert math.isnan(nan.score_vector["loss"])
+
+    from hola_opt import Maximize, Real, Space, Study
+
+    study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Maximize("reward")])
+    trial = study.ask()
+    positive_reward = study.tell(trial.trial_id, {"reward": float("inf")})
+    assert positive_reward.scores["reward"] == float("-inf")
 
 
 def test_metrics_large_u64_roundtrip():
@@ -80,6 +136,21 @@ def test_connect_rejects_non_http_scheme():
 
     with pytest.raises(ValueError):
         Study.connect("ftp://example.com")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com?tenant=one",
+        "https://example.com/#dashboard",
+        "https://user:password@example.com",
+    ],
+)
+def test_connect_rejects_ambiguous_base_url_components(url):
+    from hola_opt import ConfigurationError, Study
+
+    with pytest.raises(ConfigurationError):
+        Study.connect(url)
 
 
 def test_connect_valid_http_no_network():

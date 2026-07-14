@@ -12,7 +12,8 @@
 //! Categorical parameter space (pick one of N string labels).
 
 use crate::traits::{SampleSpace, StandardizedSpace};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
+use std::collections::HashSet;
 
 /// Categorical space representing a choice among named options.
 ///
@@ -23,20 +24,36 @@ use serde::{Deserialize, Serialize};
 /// - "adam"    ↔ bucket [0, 1/3),    center at 1/6
 /// - "sgd"     ↔ bucket [1/3, 2/3),  center at 1/2
 /// - "rmsprop" ↔ bucket [2/3, 1],    center at 5/6
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CategoricalSpace {
-    pub choices: Vec<String>,
+    choices: Vec<String>,
 }
 
 impl CategoricalSpace {
+    /// Ordered, unique labels in this space.
+    pub fn choices(&self) -> &[String] {
+        &self.choices
+    }
+
+    /// Construct a categorical space with a one-to-one label mapping.
+    pub fn try_new(choices: Vec<String>) -> Result<Self, String> {
+        if choices.is_empty() {
+            return Err("choices must not be empty".to_string());
+        }
+
+        let mut seen = HashSet::with_capacity(choices.len());
+        if let Some(duplicate) = choices.iter().find(|choice| !seen.insert(choice.as_str())) {
+            return Err(format!("duplicate choice '{duplicate}'"));
+        }
+
+        Ok(Self { choices })
+    }
+
     /// # Panics
-    /// Panics if `choices` is empty.
+    /// Panics if `choices` is empty or contains duplicate labels. Prefer
+    /// [`Self::try_new`] for user-provided configuration.
     pub fn new(choices: Vec<String>) -> Self {
-        assert!(
-            !choices.is_empty(),
-            "CategoricalSpace: choices must not be empty"
-        );
-        Self { choices }
+        Self::try_new(choices).unwrap_or_else(|error| panic!("CategoricalSpace: {error}"))
     }
 
     /// Convenience constructor from string slices.
@@ -46,6 +63,21 @@ impl CategoricalSpace {
 
     pub fn cardinality(&self) -> usize {
         self.choices.len()
+    }
+}
+
+impl<'de> Deserialize<'de> for CategoricalSpace {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct CategoricalSpaceSerde {
+            choices: Vec<String>,
+        }
+
+        let raw = CategoricalSpaceSerde::deserialize(deserializer)?;
+        Self::try_new(raw.choices).map_err(de::Error::custom)
     }
 }
 
@@ -185,5 +217,20 @@ mod tests {
         assert!(space.contains(&"a".to_string()));
         assert!(space.contains(&"b".to_string()));
         assert!(space.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_try_new_rejects_duplicate_choices() {
+        let error = CategoricalSpace::try_new(vec!["adam".into(), "adam".into()]).unwrap_err();
+        assert!(error.contains("duplicate choice 'adam'"));
+    }
+
+    #[test]
+    fn test_deserialization_validates_choices() {
+        assert!(serde_json::from_str::<CategoricalSpace>(r#"{"choices":[]}"#).is_err());
+        assert!(
+            serde_json::from_str::<CategoricalSpace>(r#"{"choices":["adam","sgd","adam"]}"#)
+                .is_err()
+        );
     }
 }

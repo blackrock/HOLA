@@ -2,7 +2,15 @@
 name = "hola-py"
 version = "1.0.1-rc7"
 edition = "2024"
-license = "Apache-2.0"
+description = "Python bindings for the HOLA hyperparameter optimization engine"
+documentation = "https://github.com/blackrock/HOLA/blob/main/docs/python-guide.md"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
 rust-version.workspace = true
 
 [lib]
@@ -12,7 +20,9 @@ crate-type = ["cdylib"]
 [dependencies]
 hola_engine = { package = "hola", version = "1.0.1-rc7", path = "../hola", features = ["server"] }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
+serde = "1"
 serde_json = "1"
-# Python bindings construct Tokio runtimes for local engine calls and remote HTTP.
+# All Python studies share one process-wide Tokio runtime for engine and HTTP work.
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+uuid = { version = "1", features = ["v4"] }

@@ -17,9 +17,10 @@
 use opt_engine::leaderboard::Leaderboard;
 use std::collections::BTreeMap;
 use std::hint::black_box;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-const REPRESENTATIVE_SIZES: &[usize] = &[1_000, 10_000, 50_000];
+const REPRESENTATIVE_SIZES: &[usize] = &[1_000, 10_000, 100_000];
+const DEBUG_OPERATION_BUDGET: Duration = Duration::from_secs(5);
 
 fn benchmark_sizes() -> Vec<usize> {
     if std::env::var_os("RUN_EXPENSIVE_BENCHMARKS").is_some() {
@@ -52,7 +53,12 @@ fn vector_leaderboard(n: usize) -> Leaderboard<usize, BTreeMap<String, f64>> {
 fn time_it<T>(label: &str, f: impl FnOnce() -> T) -> T {
     let start = Instant::now();
     let result = f();
-    eprintln!("{label}: {:?}", start.elapsed());
+    let elapsed = start.elapsed();
+    eprintln!("{label}: {elapsed:?}");
+    assert!(
+        elapsed < DEBUG_OPERATION_BUDGET,
+        "{label} exceeded the {DEBUG_OPERATION_BUDGET:?} debug-build budget: {elapsed:?}"
+    );
     result
 }
 

@@ -12,7 +12,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # Install uv (https://docs.astral.sh/uv/getting-started/installation/)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-uv sync --dev
+uv sync --directory hola-py --locked --dev --group benchmarks
 ```
 
 ## Running tests
@@ -20,16 +20,16 @@ uv sync --dev
 ```bash
 # Rust tests (unit + integration)
 # --all-features compiles the server integration tests
-cargo test --workspace --all-features
+cargo test --locked --workspace --all-features
 
 # Build and test Python bindings
-cd hola-py && uv run maturin develop && cd ..
-hola-py/.venv/bin/python -m pytest hola-py/tests/ -v
+uv run --directory hola-py maturin develop
+uv run --directory hola-py pytest tests/ -v
 
 # Linting
-uv run --project hola-py ruff check .
-uv run --project hola-py ruff format --check .
-uv run --project hola-py ty check .
+uv run --directory hola-py ruff check .
+uv run --directory hola-py ruff format --check .
+uv run --directory hola-py ty check .
 ```
 
 ## Feature flags
@@ -51,33 +51,35 @@ from an existing file of the same type.
 ## Code style
 
 - **Rust.** Run `cargo fmt --all` before committing. Lint with
-  `cargo clippy --workspace --all-features -- -D warnings`. We
+  `cargo clippy --locked --workspace --all-features -- -D warnings`. We
   enforce a maximum line width of 100 characters (`rustfmt.toml`).
-- **Python.** Lint with `uv run --project hola-py ruff check .`
-  and format with `uv run --project hola-py ruff format --check .`.
-  Type-check with `uv run --project hola-py ty check .`.
+- **Python.** Lint with `uv run --directory hola-py ruff check .`
+  and format with `uv run --directory hola-py ruff format --check .`.
+  Type-check with `uv run --directory hola-py ty check .`.
 
 ## Dashboard
 
 The `dashboard/` directory contains a standalone browser UI with
 no build step.
 
-To test locally, start the server, open `dashboard/index.html` in
-a browser, and enter `http://localhost:8000` as the server URL.
+To test locally, have the HOLA server host the dashboard so browser
+requests stay on the same origin, then open `http://localhost:8000/`.
 
 ```bash
-cargo run -p hola-cli -- serve hola-cli/examples/example_study.yaml
+cargo run -p hola-cli -- serve hola-cli/examples/example_study.yaml --dashboard ./dashboard
 ```
 
-The dashboard connects via `fetch` and `EventSource` (SSE). CORS
-is permissive by default on the server.
+The dashboard uses authenticated `fetch` requests, including an incrementally
+parsed SSE response. Cross-origin browser access is disabled by default; when
+hosting the UI elsewhere, pass its exact origin with `--cors-origin` (repeat
+the flag for multiple origins).
 
 ## Pull request guidelines
 
 1. Create a feature branch from `main`
 2. Add tests for new functionality
-3. Ensure `cargo test --workspace --all-features` and
-   `hola-py/.venv/bin/python -m pytest hola-py/tests/` pass
+3. Ensure `cargo test --locked --workspace --all-features` and
+   `uv run --directory hola-py pytest tests/` pass
 4. Run linters before pushing (`cargo clippy`, `cargo fmt`,
    `ruff check`, `ruff format`)
 5. Keep PRs focused. One feature or fix per PR.

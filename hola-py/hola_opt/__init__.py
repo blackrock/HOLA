@@ -14,13 +14,18 @@ import pathlib
 from .hola_opt import *  # noqa: F403
 from .hola_opt import (
     Categorical,
+    CheckpointError,
     CompletedTrial,
+    ConfigurationError,
     Gmm,
+    HolaError,
     Integer,
     Maximize,
     Minimize,
+    ObjectiveError,
     Random,
     Real,
+    RemoteError,
     Sobol,
     Space,
     Study,
@@ -28,6 +33,11 @@ from .hola_opt import (
 )
 
 __all__ = [
+    "HolaError",
+    "ConfigurationError",
+    "CheckpointError",
+    "RemoteError",
+    "ObjectiveError",
     "Real",
     "Integer",
     "Categorical",
@@ -48,7 +58,7 @@ def dashboard_dir() -> pathlib.Path:
     """Return the path to the bundled dashboard static files.
 
     Useful for passing to ``Study.serve(dashboard_path=str(dashboard_dir()))``.
-    Returns a ``pathlib.Path`` even if the directory does not exist (the dashboard
-    is only bundled in release wheels, not editable installs from source).
+    The same versioned assets are included in editable source trees, wheels, and
+    source distributions.
     """
     return pathlib.Path(__file__).parent / "dashboard"

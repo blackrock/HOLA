@@ -18,7 +18,18 @@ variants, multi-param spaces, objectives, Trial repr, Study.connect(),
 categorical parameters, and study.run().
 """
 
+import os
+
 import pytest
+
+
+def test_dashboard_dir_contains_versioned_static_bundle():
+    from hola_opt import dashboard_dir
+
+    bundle = dashboard_dir()
+    assert bundle.is_dir()
+    assert {path.name for path in bundle.iterdir()} >= {"index.html", "styles.css", "app.js"}
+
 
 # ==========================================================================
 # 1. Parameter Types & Spaces
@@ -357,6 +368,49 @@ def test_study_save_load_resume_uses_fresh_trial_id(tmp_path):
     assert [trial.trial_id for trial in restored.trials()] == [0, 1, 2]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="named-pipe checkpoint test requires POSIX")
+@pytest.mark.timeout(10)
+def test_study_load_releases_gil_while_checkpoint_read_blocks(tmp_path):
+    """The main Python thread must be able to feed a blocking checkpoint read."""
+    import threading
+    import time
+
+    from hola_opt import Minimize, Real, Space, Study
+
+    source = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
+    trial = source.ask()
+    source.tell(trial.trial_id, {"loss": 0.5})
+    regular = tmp_path / "regular.json"
+    source.save(str(regular))
+    checkpoint_bytes = regular.read_bytes()
+
+    fifo = tmp_path / "checkpoint.fifo"
+    os.mkfifo(fifo)
+    entered = threading.Event()
+    loaded = []
+    failures = []
+
+    def load_from_fifo():
+        entered.set()
+        try:
+            loaded.append(Study.load(str(fifo)))
+        except BaseException as error:  # surfaced in the parent thread below
+            failures.append(error)
+
+    loader = threading.Thread(target=load_from_fifo, daemon=True)
+    loader.start()
+    assert entered.wait(timeout=2)
+    # Give the loader time to enter Rust and block in the FIFO read. Without
+    # py.detach(), it holds the GIL here and this thread cannot wake to write.
+    time.sleep(0.1)
+    fifo.write_bytes(checkpoint_bytes)
+    loader.join(timeout=5)
+
+    assert not loader.is_alive()
+    assert not failures
+    assert loaded[0].trial_count() == 1
+
+
 def test_study_save_load_resume_uses_fresh_vector_trial_id(tmp_path):
     from hola_opt import Minimize, Real, Space, Study
 
@@ -507,6 +561,42 @@ def test_study_run_parallel_integrity():
     seen_x = sorted(c["x"] for c in recorded_calls)
     stored_x = sorted(t.params["x"] for t in completed)
     assert seen_x == pytest.approx(stored_x, rel=0, abs=0.0)
+
+
+def test_study_run_parallel_refills_after_first_completion():
+    """A fast worker must trigger a new ask without waiting for a slow peer.
+
+    The first objective invocation waits until the third starts. With two
+    workers, fixed-batch or submission-order collection cannot start that third
+    invocation and times out. Completion-driven scheduling observes the other
+    worker's result, tells it, refills the open slot, and releases the waiter.
+    """
+    import threading
+
+    from hola_opt import Minimize, Real, Space, Study
+
+    study = Study(space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")])
+    third_started = threading.Event()
+    counter_lock = threading.Lock()
+    invocation_count = 0
+
+    def objective(params):
+        nonlocal invocation_count
+        with counter_lock:
+            invocation = invocation_count
+            invocation_count += 1
+        if invocation == 0:
+            if not third_started.wait(timeout=3):
+                raise RuntimeError("third evaluation was not adaptively scheduled")
+        elif invocation == 2:
+            third_started.set()
+        return {"loss": params["x"]}
+
+    study.run(objective, n_trials=3, n_workers=2)
+
+    assert third_started.is_set()
+    assert invocation_count == 3
+    assert study.trial_count() == 3
 
 
 def test_study_run_parallel_default_workers():
@@ -792,8 +882,12 @@ def test_max_leaderboard_size_caps_retained_trials():
             # eviction victim and tell() always succeeds.
             study.tell(trial.trial_id, {"loss": float(n - i)})
 
-    assert bounded.trial_count() == cap
+    # trial_count is the monotonic completed-work total, independent of
+    # retention. trials() is the retained leaderboard view.
+    assert bounded.trial_count() == n
     assert unbounded.trial_count() == n
+    assert len(bounded.trials()) == cap
+    assert len(unbounded.trials()) == n
 
 
 def test_max_leaderboard_size_rejects_zero():

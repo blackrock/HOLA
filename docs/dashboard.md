@@ -6,9 +6,17 @@ loads checkpoint files directly.
 
 ## Opening the dashboard
 
-We serve the dashboard as a static HTML/CSS/JS application. Open
-`dashboard/index.html` in any modern browser. No build step or
-server is required.
+The dashboard is a static HTML/CSS/JS application with no build step.
+For live monitoring, have HOLA serve the files so the UI and API share
+an origin:
+
+```bash
+hola serve config.yaml --dashboard ./dashboard
+```
+
+Then open `http://localhost:8000/`. To analyze a saved checkpoint
+without a live server, you can instead open `dashboard/index.html`
+directly in a modern browser.
 
 When running a study from Python with `study.serve()`, we can
 serve the dashboard automatically by passing the `dashboard_path`
@@ -20,6 +28,10 @@ repository's `dashboard/` directory.
 1. Enter the server URL in the top bar
    (e.g., `http://localhost:8000`)
 2. Click **Connect**
+
+If the dashboard is hosted on a different origin, add that exact
+origin to the server with `--cors-origin`. Cross-origin browser access
+is disabled by default.
 
 The dashboard connects to the server's `/api/events` SSE endpoint
 and loads the current state from `/api/trials`, `/api/space`, and

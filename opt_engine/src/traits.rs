@@ -124,21 +124,18 @@ pub trait Strategy: Send + Sync + 'static {
 ///
 /// # Example
 ///
-/// ```ignore
-/// use opt_engine::traits::{RefittableStrategy, StandardizedSpace};
+/// ```no_run
+/// use opt_engine::{ContinuousSpace, GmmStrategy, RefittableStrategy};
 ///
-/// impl<S: StandardizedSpace> RefittableStrategy for GmmStrategy<S> {
-///     fn refit(&mut self, space: &Self::Space, trials: &[(S::Domain, Self::Observation)]) {
-///         // Convert candidates to unit cube
-///         let samples: Vec<Vec<f64>> = trials
-///             .iter()
-///             .map(|(c, _)| space.to_unit_cube(c))
-///             .collect();
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let space = ContinuousSpace::new(0.0, 1.0);
+/// let mut strategy = GmmStrategy::<ContinuousSpace>::uniform_prior(42, 1, 0.1)?;
+/// let completed_trials = vec![(0.2, 0.8), (0.4, 0.3), (0.7, 0.5)];
 ///
-///         // Fit GMM to the samples
-///         self.fit_from_samples(&samples, 3, 100, 1e-6, 1e-4);
-///     }
-/// }
+/// // Each tuple contains a domain-space candidate and its observation.
+/// strategy.refit(&space, &completed_trials);
+/// # Ok(())
+/// # }
 /// ```
 pub trait RefittableStrategy: Strategy {
     /// Rebuild the strategy's internal model from selected trials.
@@ -180,10 +177,10 @@ pub trait RefittableStrategy: Strategy {
 /// [`RefittableStrategy::refit`].
 #[derive(Clone, Debug)]
 pub struct RefitConfig {
-    pub min_trials: usize,
-    pub refit_interval: usize,
-    pub top_k: Option<usize>,
-    pub top_quantile: Option<f64>,
+    min_trials: usize,
+    refit_interval: usize,
+    top_k: Option<usize>,
+    top_quantile: Option<f64>,
 }
 
 impl Default for RefitConfig {
@@ -198,37 +195,111 @@ impl Default for RefitConfig {
 }
 
 impl RefitConfig {
-    pub fn with_top_k(min_trials: usize, refit_interval: usize, top_k: usize) -> Self {
-        Self {
+    /// Minimum completed-trial count before refitting can begin.
+    pub fn min_trials(&self) -> usize {
+        self.min_trials
+    }
+
+    /// Number of completed trials between refits.
+    pub fn refit_interval(&self) -> usize {
+        self.refit_interval
+    }
+
+    /// Fixed number of elite trials selected, when configured.
+    pub fn top_k(&self) -> Option<usize> {
+        self.top_k
+    }
+
+    /// Elite quantile selected, when configured.
+    pub fn top_quantile(&self) -> Option<f64> {
+        self.top_quantile
+    }
+
+    /// Validate this refit configuration.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.refit_interval == 0 {
+            return Err("refit_interval must be at least 1".to_string());
+        }
+        if self.top_k == Some(0) {
+            return Err("top_k must be at least 1".to_string());
+        }
+        if let Some(quantile) = self.top_quantile {
+            if !quantile.is_finite() || quantile <= 0.0 || quantile > 1.0 {
+                return Err(format!(
+                    "top_quantile must be finite and in (0, 1], got {quantile}"
+                ));
+            }
+        }
+        if self.top_k.is_some() && self.top_quantile.is_some() {
+            return Err("top_k and top_quantile are mutually exclusive".to_string());
+        }
+        Ok(())
+    }
+
+    /// Construct a validated top-k refit policy.
+    pub fn try_with_top_k(
+        min_trials: usize,
+        refit_interval: usize,
+        top_k: usize,
+    ) -> Result<Self, String> {
+        let config = Self {
             min_trials,
             refit_interval,
             top_k: Some(top_k),
             top_quantile: None,
-        }
+        };
+        config.validate()?;
+        Ok(config)
     }
 
-    pub fn with_quantile(min_trials: usize, refit_interval: usize, quantile: f64) -> Self {
-        assert!(
-            quantile > 0.0 && quantile <= 1.0,
-            "RefitConfig::with_quantile: quantile must be in (0, 1], got {quantile}"
-        );
-        Self {
+    pub fn with_top_k(min_trials: usize, refit_interval: usize, top_k: usize) -> Self {
+        Self::try_with_top_k(min_trials, refit_interval, top_k)
+            .unwrap_or_else(|error| panic!("RefitConfig::with_top_k: {error}"))
+    }
+
+    /// Construct a validated top-quantile refit policy.
+    pub fn try_with_quantile(
+        min_trials: usize,
+        refit_interval: usize,
+        quantile: f64,
+    ) -> Result<Self, String> {
+        let config = Self {
             min_trials,
             refit_interval,
             top_k: None,
             top_quantile: Some(quantile),
-        }
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn with_quantile(min_trials: usize, refit_interval: usize, quantile: f64) -> Self {
+        Self::try_with_quantile(min_trials, refit_interval, quantile)
+            .unwrap_or_else(|error| panic!("RefitConfig::with_quantile: {error}"))
     }
 
     pub fn should_refit(&self, n_trials: usize) -> bool {
+        // Defend against corrupt in-memory state as well as constructor input.
+        if self.validate().is_err() {
+            return false;
+        }
         n_trials >= self.min_trials
             && (n_trials - self.min_trials).is_multiple_of(self.refit_interval)
     }
 
     pub fn selection_count(&self, n_trials: usize) -> usize {
         if let Some(k) = self.top_k {
-            k.min(n_trials)
+            if n_trials == 0 {
+                0
+            } else {
+                k.max(1).min(n_trials)
+            }
         } else if let Some(q) = self.top_quantile {
+            let q = if q.is_finite() && q > 0.0 && q <= 1.0 {
+                q
+            } else {
+                1.0
+            };
             let count = ((n_trials as f64) * q).ceil() as usize;
             // Ensure at least one trial is selected when there are trials to
             // select from, so a tiny quantile never yields an empty refit set.
@@ -289,13 +360,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "quantile must be in (0, 1]")]
+    #[should_panic(expected = "top_quantile must be finite and in (0, 1]")]
     fn test_with_quantile_rejects_zero() {
         RefitConfig::with_quantile(5, 3, 0.0);
     }
 
     #[test]
-    #[should_panic(expected = "quantile must be in (0, 1]")]
+    #[should_panic(expected = "top_quantile must be finite and in (0, 1]")]
     fn test_with_quantile_rejects_above_one() {
         RefitConfig::with_quantile(5, 3, 1.5);
     }
@@ -309,5 +380,44 @@ mod tests {
         assert_eq!(config.selection_count(1), 1);
         // With no trials, the count is zero (nothing to floor to).
         assert_eq!(config.selection_count(0), 0);
+    }
+
+    #[test]
+    fn test_try_constructors_reject_invalid_values() {
+        assert!(RefitConfig::try_with_top_k(5, 0, 2).is_err());
+        assert!(RefitConfig::try_with_top_k(5, 1, 0).is_err());
+        assert!(RefitConfig::try_with_quantile(5, 0, 0.25).is_err());
+        for quantile in [0.0, -0.1, 1.1, f64::NAN, f64::INFINITY] {
+            assert!(RefitConfig::try_with_quantile(5, 1, quantile).is_err());
+        }
+    }
+
+    #[test]
+    fn test_defensive_handling_of_invalid_internal_values_never_panics() {
+        let zero_interval = RefitConfig {
+            min_trials: 0,
+            refit_interval: 0,
+            top_k: Some(1),
+            top_quantile: None,
+        };
+        assert!(!zero_interval.should_refit(1));
+
+        let zero_top_k = RefitConfig {
+            min_trials: 0,
+            refit_interval: 1,
+            top_k: Some(0),
+            top_quantile: None,
+        };
+        assert!(!zero_top_k.should_refit(1));
+        assert_eq!(zero_top_k.selection_count(10), 1);
+
+        let nan_quantile = RefitConfig {
+            min_trials: 0,
+            refit_interval: 1,
+            top_k: None,
+            top_quantile: Some(f64::NAN),
+        };
+        assert!(!nan_quantile.should_refit(1));
+        assert_eq!(nan_quantile.selection_count(10), 10);
     }
 }

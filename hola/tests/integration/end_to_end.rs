@@ -66,6 +66,66 @@ async fn test_e2e_hola_engine_yaml_config() {
     assert!(top[0].rank == 0);
 }
 
+#[tokio::test]
+async fn test_seeded_gmm_meets_sphere_quality_baseline() {
+    use hola::hola_engine::StrategyConfig;
+
+    for (dimensions, seed) in [(1usize, 7u64), (2, 7), (2, 17), (3, 42)] {
+        let space = (0..dimensions)
+            .map(|index| {
+                (
+                    format!("x{index}"),
+                    ParamConfig::Real {
+                        min: -5.0,
+                        max: 5.0,
+                        scale: "linear".to_string(),
+                    },
+                )
+            })
+            .collect();
+        let config = StudyConfig {
+            space,
+            objectives: vec![ObjectiveConfig {
+                field: "loss".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            }],
+            strategy: Some(StrategyConfig {
+                strategy_type: "gmm".to_string(),
+                refit_interval: 20,
+                total_budget: Some(500),
+                exploration_budget: None,
+                seed: Some(seed),
+                elite_fraction: None,
+            }),
+            checkpoint: None,
+            max_trials: Some(500),
+            max_leaderboard_size: None,
+        };
+        let engine = HolaEngine::from_config(config).unwrap();
+        for _ in 0..500 {
+            let trial = engine.ask().await.unwrap();
+            let loss: f64 = (0..dimensions)
+                .map(|index| trial.params[format!("x{index}")].as_f64().unwrap().powi(2))
+                .sum();
+            engine
+                .tell(trial.trial_id, json!({"loss": loss}))
+                .await
+                .unwrap();
+        }
+
+        let best = engine.top_k(1, false).await;
+        let score = best[0].score_vector["loss"].as_f64().unwrap();
+        assert!(
+            score < 0.1,
+            "{dimensions}D seeded GMM sphere score {score} missed < 0.1 for seed {seed}"
+        );
+    }
+}
+
 // ==========================================================================
 // Checkpoint resume
 // ==========================================================================

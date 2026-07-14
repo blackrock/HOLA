@@ -1,4 +1,13 @@
 {
+  "config": {
+    "objectives": [
+      {
+        "field": "<img src=x onerror=alert(5)>",
+        "obj_type": "minimize",
+        "priority": 1
+      }
+    ]
+  },
   "leaderboard": {
     "trials": [
       {
