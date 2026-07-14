@@ -170,10 +170,11 @@ def yaml_config(tmp_path):
 # ==========================================================================
 
 
-def http_json(url, method="GET", body=None):
+def http_json(url, method="GET", body=None, timeout=5):
     """Make an HTTP request and return (status_code, json_body).
 
-    Uses urllib only — no extra dependencies.
+    Uses urllib only — no extra dependencies. The bounded timeout keeps a
+    wedged child server from hanging the integration suite indefinitely.
     """
     data = None
     if body is not None:
@@ -183,7 +184,7 @@ def http_json(url, method="GET", body=None):
     req.add_header("Content-Type", "application/json")
 
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
             return resp.status, json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:

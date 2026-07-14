@@ -488,7 +488,7 @@ following this table.
 | DOC-001 | README/contributor/CLI paths and flags match canonical HOLA; root links are checked and the README optimization executes. | 40 doc-block/link/command tests (4 intentional pseudo-code skips) and 14 CLI smoke tests pass. |
 | DOC-002 | Broken links/target collisions are removed; eight Rust examples compile and Rustdoc warnings are fatal in CI. | Eight doctests and strict workspace Rustdoc pass with zero ignored doctests. |
 | OPS-001 | Structured request spans carry request IDs; typed errors, health/readiness, completed/retained gauges, `hola_checkpoint_failures_total`, `hola_refit_failures_total`, bounded mutation detachment/timeouts/leases/drain, and warning propagation are documented. | Metrics/error, forced maintenance failure, cancellation, stuck-shutdown, operations, and release-recovery gates. |
-| TEST-001 | Every numerical/concurrency fix has focused unit/property coverage; objective/refit races now start from deterministic barriers. | 461 non-doc Rust tests plus explicit boundary/race/quality probes. |
+| TEST-001 | Every numerical/concurrency fix has focused unit/property coverage; objective/refit races now start from deterministic barriers. | 465 non-doc Rust tests plus explicit boundary/race/quality probes. |
 | TEST-002 | Recovery coverage includes concurrent/failing writes, format-1 migration, retry receipts, leases, auth/CORS, real workers, SSE replay/reset/lag, and bounded shutdown. | Rust/Python/CLI suites and platform/manual fault gates. |
 | TEST-003 | Dashboard, packaging, performance, offline/accessibility, and release-platform checks are automated where deterministic and otherwise fail-closed in a recorded release checklist. | Twelve dashboard state tests + XSS, wheel/sdist/rebuilt-wheel inspection, gated 100k probes, and `docs/release-checklist.md`. |
 
@@ -504,7 +504,7 @@ are gates, not waivers.
 
 | Check | Final local result |
 | --- | --- |
-| Full Rust workspace | Passed: 461 non-doc tests and 8 doctests. Five performance probes are ignored by default and all passed when run explicitly. |
+| Full Rust workspace | Passed: 465 non-doc tests and 8 doctests. Five performance probes are ignored by default and all passed when run explicitly. |
 | Rust format, strict Clippy, warnings, and Rustdoc | Passed with warnings denied across the all-feature workspace. |
 | MSRV and minimal features | Passed on Rust 1.87.0; `opt_engine` and `hola` also pass their no-default/minimal-feature checks. |
 | Rust quality and performance probes | GMM quality passed; at 100k trials scalar tell was ~3.8 ms, two-objective tell ~370 ms, and bounded refit selection ~8.3 ms; 100k GMM samples took ~111 ms and a 2k fit ~352 ms. |

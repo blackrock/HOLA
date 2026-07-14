@@ -660,12 +660,59 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
     std::fs::rename(source, destination)
 }
 
+/// Retry an I/O operation only while its error is classified as transient.
+///
+/// `max_retries` counts retries after the initial attempt. Keeping the retry
+/// decision and wait strategy injectable makes the bounded behavior testable
+/// without sleeping.
+#[cfg(any(windows, test))]
+fn retry_transient_io<T, F, P, W>(
+    max_retries: usize,
+    mut operation: F,
+    is_transient: P,
+    mut wait: W,
+) -> io::Result<T>
+where
+    F: FnMut() -> io::Result<T>,
+    P: Fn(&io::Error) -> bool,
+    W: FnMut(usize),
+{
+    let mut retries = 0;
+    loop {
+        match operation() {
+            Err(error) if retries < max_retries && is_transient(&error) => {
+                wait(retries);
+                retries += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn is_transient_windows_replace_error(error: &io::Error) -> bool {
+    // MoveFileExW can briefly lose a race with another replacer, an open
+    // scanner, or filesystem bookkeeping. Do not retry unrelated failures
+    // such as a missing directory, invalid path, or full disk.
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+
+    matches!(
+        error.raw_os_error(),
+        Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+    )
+}
+
 #[cfg(windows)]
 fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use std::time::Duration;
     use windows_sys::Win32::Storage::FileSystem::{
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
+
+    const MAX_RETRIES: usize = 7;
 
     let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
     let destination: Vec<u16> = destination
@@ -673,20 +720,32 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
         .encode_wide()
         .chain(Some(0))
         .collect();
-    // SAFETY: both paths are encoded as owned, NUL-terminated UTF-16 buffers
-    // that remain alive for the duration of the call.
-    let replaced = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if replaced == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+
+    retry_transient_io(
+        MAX_RETRIES,
+        || {
+            // SAFETY: both paths are encoded as owned, NUL-terminated UTF-16
+            // buffers that remain alive for the duration of every call.
+            let replaced = unsafe {
+                MoveFileExW(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if replaced == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        },
+        is_transient_windows_replace_error,
+        |retry| {
+            // The configured exponential delays total 127 ms across all retries.
+            const DELAYS_MS: [u64; MAX_RETRIES] = [1, 2, 4, 8, 16, 32, 64];
+            std::thread::sleep(Duration::from_millis(DELAYS_MS[retry]));
+        },
+    )
 }
 
 /// Write JSON to a file atomically: write to a unique temp file, fsync, rename,
@@ -1180,6 +1239,89 @@ mod tests {
         let missing = br#"{"config": "anything", "checkpoint": {"leaderboard": "junk"}}"#;
         let err = check_format_version_bytes(missing).unwrap_err();
         assert!(err.contains("could not locate format_version"));
+    }
+
+    #[test]
+    fn test_retry_transient_io_retries_then_succeeds() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+
+        let result = retry_transient_io(
+            3,
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "busy"))
+                } else {
+                    Ok("done")
+                }
+            },
+            |error| error.kind() == io::ErrorKind::WouldBlock,
+            |retry| waits.push(retry),
+        )
+        .unwrap();
+
+        assert_eq!(result, "done");
+        assert_eq!(attempts, 3);
+        assert_eq!(waits, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_retry_transient_io_does_not_retry_permanent_error() {
+        let mut attempts = 0;
+        let mut waits = 0;
+
+        let error = retry_transient_io(
+            7,
+            || {
+                attempts += 1;
+                Err::<(), _>(io::Error::new(io::ErrorKind::InvalidInput, "permanent"))
+            },
+            |error| error.kind() == io::ErrorKind::WouldBlock,
+            |_| waits += 1,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(attempts, 1);
+        assert_eq!(waits, 0);
+    }
+
+    #[test]
+    fn test_retry_transient_io_stops_at_bound() {
+        let mut attempts = 0;
+        let mut waits = Vec::new();
+
+        let error = retry_transient_io(
+            2,
+            || {
+                attempts += 1;
+                Err::<(), _>(io::Error::new(io::ErrorKind::WouldBlock, "still busy"))
+            },
+            |error| error.kind() == io::ErrorKind::WouldBlock,
+            |retry| waits.push(retry),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(attempts, 3, "initial attempt plus two retries");
+        assert_eq!(waits, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_windows_replace_retry_classification_is_narrow() {
+        for code in [5, 32, 33] {
+            assert!(
+                is_transient_windows_replace_error(&io::Error::from_raw_os_error(code)),
+                "Windows error {code} should be retried"
+            );
+        }
+        for code in [2, 3, 87, 112] {
+            assert!(
+                !is_transient_windows_replace_error(&io::Error::from_raw_os_error(code)),
+                "permanent Windows error {code} must not be retried"
+            );
+        }
     }
 
     #[test]

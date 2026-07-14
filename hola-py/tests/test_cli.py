@@ -182,8 +182,8 @@ def test_worker_completes_trials(cli_binary, tmp_path):
 
     server = subprocess.Popen(
         [cli_binary, "serve", str(config_path), "--port", str(port)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     try:
         assert _wait_for_server(url), "Server did not start"
@@ -204,8 +204,8 @@ def test_worker_completes_trials(cli_binary, tmp_path):
                 "--exec",
                 exec_cmd,
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         try:
             # Wait for the worker to complete some trials
@@ -233,8 +233,8 @@ def test_worker_receives_params_env(cli_binary, tmp_path):
 
     server = subprocess.Popen(
         [cli_binary, "serve", str(config_path), "--port", str(port)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     try:
         assert _wait_for_server(url), "Server did not start"
@@ -250,8 +250,8 @@ def test_worker_receives_params_env(cli_binary, tmp_path):
 
         worker = subprocess.Popen(
             [cli_binary, "worker", "--server", url, "--mode", "exec", "--exec", exec_cmd],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         try:
             deadline = time.monotonic() + 15
@@ -294,8 +294,8 @@ def test_worker_heartbeats_through_command_longer_than_server_lease(cli_binary, 
             "--lease-seconds",
             "1",
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     try:
         assert _wait_for_server(url), "Server did not start"
@@ -346,8 +346,8 @@ def test_callback_worker_heartbeats_through_command_longer_than_lease(cli_binary
             "--lease-seconds",
             "1",
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     try:
         assert _wait_for_server(url), "Server did not start"
@@ -399,8 +399,8 @@ def test_worker_exec_failure_cancels_not_reports(cli_binary, tmp_path):
 
     server = subprocess.Popen(
         [cli_binary, "serve", str(config_path), "--port", str(port)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     try:
         assert _wait_for_server(url), "Server did not start"
@@ -421,8 +421,8 @@ def test_worker_exec_failure_cancels_not_reports(cli_binary, tmp_path):
                 "--exec",
                 exec_cmd,
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         try:
             # Give the worker time to pull and fail several trials.
@@ -453,8 +453,8 @@ def test_worker_exec_invalid_json_cancels(cli_binary, tmp_path):
 
     server = subprocess.Popen(
         [cli_binary, "serve", str(config_path), "--port", str(port)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     try:
         assert _wait_for_server(url), "Server did not start"
@@ -475,8 +475,8 @@ def test_worker_exec_invalid_json_cancels(cli_binary, tmp_path):
                 "--exec",
                 exec_cmd,
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         try:
             time.sleep(5)
