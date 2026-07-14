@@ -55,14 +55,16 @@ use std::error::Error;
 use std::future::{Future, IntoFuture};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{
     Arc, Mutex as StdMutex,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Semaphore, broadcast, oneshot};
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio::sync::{Semaphore, broadcast, oneshot, watch};
+use tokio_stream::wrappers::{BroadcastStream, WatchStream};
+use tokio_stream::{Stream, StreamExt};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::services::ServeDir;
@@ -93,6 +95,10 @@ pub enum EngineEvent {
 pub struct ServerState {
     pub engine: HolaEngine,
     events_tx: broadcast::Sender<SequencedEngineEvent>,
+    /// Retained shutdown state lets long-lived SSE responses close as soon as
+    /// graceful shutdown begins, including when they subscribe concurrently
+    /// with the signal.
+    shutdown: watch::Sender<bool>,
     event_journal: StdMutex<EventJournal>,
     auth_token: Option<String>,
     read_auth_token: Option<String>,
@@ -122,6 +128,27 @@ const MAX_DETACHED_MUTATIONS: usize = 256;
 struct SequencedEngineEvent {
     id: u64,
     event: EngineEvent,
+}
+
+struct CloseOnShutdown<S> {
+    inner: S,
+    shutdown: WatchStream<bool>,
+    _shutdown_guard: watch::Sender<bool>,
+}
+
+impl<S: Stream + Unpin> Stream for CloseOnShutdown<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match Pin::new(&mut self.shutdown).poll_next(cx) {
+                Poll::Ready(Some(true) | None) => return Poll::Ready(None),
+                Poll::Ready(Some(false)) => {}
+                Poll::Pending => break,
+            }
+        }
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
 }
 
 #[derive(Debug)]
@@ -1011,6 +1038,7 @@ async fn handle_events(
 > {
     authorize_read(&state, &headers)?;
     let rx = state.events_tx.subscribe();
+    let shutdown = state.shutdown.subscribe();
     let requested_id = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
@@ -1064,7 +1092,11 @@ async fn handle_events(
                 .data(serde_json::json!({ "missed": missed }).to_string())))
         }
     });
-    let stream = tokio_stream::iter(initial).chain(live);
+    let stream = CloseOnShutdown {
+        inner: tokio_stream::iter(initial).chain(live),
+        shutdown: WatchStream::new(shutdown),
+        _shutdown_guard: state.shutdown.clone(),
+    };
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -1126,6 +1158,13 @@ pub fn create_router_with_options(
     engine: HolaEngine,
     options: ServerOptions,
 ) -> Result<Router, Box<dyn Error>> {
+    create_router_with_options_and_shutdown(engine, options).map(|(router, _)| router)
+}
+
+fn create_router_with_options_and_shutdown(
+    engine: HolaEngine,
+    options: ServerOptions,
+) -> Result<(Router, watch::Sender<bool>), Box<dyn Error>> {
     if options.lease_duration.is_zero() {
         return Err("lease_duration must be greater than zero".into());
     }
@@ -1159,9 +1198,11 @@ pub fn create_router_with_options(
         )
     })?;
     let (events_tx, _) = broadcast::channel(256);
+    let (shutdown, _) = watch::channel(false);
     let state = Arc::new(ServerState {
         engine,
         events_tx,
+        shutdown: shutdown.clone(),
         event_journal: StdMutex::new(EventJournal::new()),
         auth_token: options.auth_token,
         read_auth_token: options.read_auth_token,
@@ -1208,7 +1249,7 @@ pub fn create_router_with_options(
         ));
 
     let request_id_header = HeaderName::from_static("x-request-id");
-    Ok(Router::new()
+    let router = Router::new()
         .route("/healthz", get(handle_health))
         .route("/readyz", get(handle_ready))
         .merge(api)
@@ -1238,7 +1279,8 @@ pub fn create_router_with_options(
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
         .layer(cors)
-        .with_state(state))
+        .with_state(state);
+    Ok((router, shutdown))
 }
 
 /// Create the Axum router with the dashboard served from a local directory.
@@ -1295,9 +1337,11 @@ pub async fn serve_with_options(
         )
         .into());
     }
-    let router = match options.dashboard_dir.as_deref() {
-        Some(_) => create_router_with_dashboard_and_options(engine, options.clone())?,
-        None => create_router_with_options(engine, options.clone())?,
+    let dashboard_dir = options.dashboard_dir.clone();
+    let (router, sse_shutdown) = create_router_with_options_and_shutdown(engine, options.clone())?;
+    let router = match dashboard_dir {
+        Some(dir) => router.fallback_service(ServeDir::new(dir)),
+        None => router,
     };
     let listener = tokio::net::TcpListener::bind((options.host.as_str(), options.port)).await?;
     if let Some(dir) = &options.dashboard_dir {
@@ -1314,13 +1358,11 @@ pub async fn serve_with_options(
             "HOLA server listening"
         );
     }
-    serve_listener_with_shutdown(
-        listener,
-        router,
-        shutdown_signal(),
-        options.shutdown_timeout,
-    )
-    .await?;
+    let shutdown = async move {
+        shutdown_signal().await;
+        sse_shutdown.send_replace(true);
+    };
+    serve_listener_with_shutdown(listener, router, shutdown, options.shutdown_timeout).await?;
     Ok(())
 }
 
@@ -1401,7 +1443,83 @@ mod tests {
     use super::*;
     use crate::hola_engine::{ObjectiveConfig, ParamConfig, StudyConfig};
     use std::collections::BTreeMap;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn shutdown_signal_closes_live_sse_without_waiting_for_drain_deadline() {
+        let engine = HolaEngine::from_config(StudyConfig {
+            space: BTreeMap::from([(
+                "x".to_string(),
+                ParamConfig::Real {
+                    min: 0.0,
+                    max: 1.0,
+                    scale: "linear".to_string(),
+                },
+            )]),
+            objectives: vec![ObjectiveConfig {
+                field: "loss".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            }],
+            strategy: None,
+            checkpoint: None,
+            max_trials: None,
+            max_leaderboard_size: None,
+        })
+        .unwrap();
+        let checkpoint_dir = tempfile::tempdir().unwrap();
+        let mut options = ServerOptions::new(0);
+        options.checkpoint_dir = checkpoint_dir.path().to_path_buf();
+        let (app, sse_shutdown) = create_router_with_options_and_shutdown(engine, options).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_listener_with_shutdown(
+            listener,
+            app,
+            async move {
+                let _ = shutdown_rx.await;
+                sse_shutdown.send_replace(true);
+            },
+            Duration::from_secs(2),
+        ));
+
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET /api/events HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut chunk = [0u8; 1024];
+            while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = client.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "SSE response closed before sending headers");
+                response.extend_from_slice(&chunk[..read]);
+            }
+        })
+        .await
+        .expect("SSE response headers should arrive");
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+
+        let started = Instant::now();
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("SSE should not consume the two-second fallback drain deadline")
+            .expect("server task should join")
+            .expect("server should close cleanly after ending SSE streams");
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let mut trailing = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut trailing))
+            .await
+            .expect("the SSE socket should close promptly")
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn bounded_shutdown_closes_a_stuck_request_after_the_drain_deadline() {
@@ -1480,6 +1598,7 @@ mod tests {
         let state = Arc::new(ServerState {
             engine: engine.clone(),
             events_tx,
+            shutdown: watch::channel(false).0,
             event_journal: StdMutex::new(EventJournal::new()),
             auth_token: None,
             read_auth_token: None,

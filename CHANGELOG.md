@@ -25,6 +25,8 @@
   Cross-origin requests are rejected before dispatch and shutdown drain time is
   bounded even for long-lived connections. Committed tell/objective maintenance
   is cancellation-shielded, warning-producing, and separately counted.
+- Live SSE connections now close as soon as shutdown begins, while the bounded
+  drain deadline remains a fallback for other stuck requests.
 - Space, refit, leaderboard, and GMM state now validate invariants at every
   construction/deserialization boundary. Two-objective ranking uses an
   O(N log N) sweep and GMM hot paths reuse allocations and cached distributions.

@@ -106,12 +106,13 @@ changes.
 ## Graceful shutdown
 
 Send `SIGTERM` (or Ctrl-C interactively). The server stops accepting new
-connections and drains its Axum shutdown path for up to ten seconds, then closes
-any remaining long-lived connection so shutdown cannot hang indefinitely. HOLA
-does not invent a checkpoint destination during shutdown; for planned
-maintenance, complete the checkpoint request above before sending the signal.
-For an unexpected termination, resume from the latest successful periodic or
-manual checkpoint and restart workers with their original outbox directories.
+connections, closes SSE event streams when shutdown begins, and drains its Axum
+shutdown path for up to ten seconds. The bounded deadline closes any other
+remaining long-lived connection so shutdown cannot hang indefinitely. HOLA does
+not invent a checkpoint destination during shutdown; for planned maintenance,
+complete the checkpoint request above before sending the signal. For an
+unexpected termination, resume from the latest successful periodic or manual
+checkpoint and restart workers with their original outbox directories.
 
 ## Incident checklist
 
