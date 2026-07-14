@@ -14,7 +14,10 @@
 - Distributed asks and tells are idempotent; workers use bounded request and
   command timeouts, durable result outboxes, and process-tree termination.
   Bounded completion receipts preserve exact tell retries after leaderboard
-  eviction and restart without emitting duplicate completion events.
+  eviction and restart without emitting duplicate completion events. Callback
+  workers reconcile rejected heartbeats and command failures against the
+  server's exact trial lifecycle, so a successful tell remains authoritative
+  and cannot be followed by a spurious cancellation.
 - Servers expose health, readiness, Prometheus metrics, request IDs, graceful
   shutdown, replayable SSE, configurable leases, and a separate read-only role.
   Cross-origin requests are rejected before dispatch and shutdown drain time is

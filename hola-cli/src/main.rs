@@ -78,7 +78,8 @@ enum Commands {
     /// HOLA_TRIAL_ID, and HOLA_PARAMS environment variables, then runs
     /// your --exec command. The command is responsible for calling
     /// POST /api/tell to report results. If the command exits with
-    /// non-zero status, the worker cancels the trial.
+    /// non-zero status, the worker cancels the trial only if the server
+    /// still reports it as pending; a completed tell is authoritative.
     ///
     /// In "exec" mode, the worker runs the command, parses its stdout
     /// as a JSON metrics object, and reports the result on the
@@ -214,6 +215,10 @@ async fn http_error(operation: &str, response: reqwest::Response) -> String {
         .text()
         .await
         .unwrap_or_else(|error| format!("unable to read error response: {error}"));
+    format_http_error(operation, status, &body)
+}
+
+fn format_http_error(operation: &str, status: reqwest::StatusCode, body: &str) -> String {
     let detail: String = body.trim().chars().take(HTTP_ERROR_SNIPPET_CHARS).collect();
     let detail = if detail.is_empty() {
         "empty response body"
@@ -631,55 +636,109 @@ fn ask_request(
         .header("Idempotency-Key", idempotency_key)
 }
 
+#[derive(Debug)]
+enum CancelTrialError {
+    NotPending(String),
+    Other(String),
+}
+
+impl std::fmt::Display for CancelTrialError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotPending(message) | Self::Other(message) => formatter.write_str(message),
+        }
+    }
+}
+
+async fn cancel_trial_classified(
+    client: &reqwest::Client,
+    server: &str,
+    token: Option<&str>,
+    trial_id: u64,
+) -> Result<(), CancelTrialError> {
+    let operation = format!("cancel for trial {trial_id}");
+    let response = with_bearer_auth(client.post(format!("{server}/api/cancel")), token)
+        .json(&serde_json::json!({"trial_id": trial_id}))
+        .send()
+        .await
+        .map_err(|error| CancelTrialError::Other(request_error(&operation, error)))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("unable to read cancel error response: {error}"));
+        let message = format_http_error(&operation, status, &body);
+        let error_body = serde_json::from_str::<serde_json::Value>(&body).ok();
+        let legacy_not_pending =
+            format!("Trial {trial_id} is not pending (may be completed or unknown)");
+        let canonical_not_pending = status == reqwest::StatusCode::BAD_REQUEST
+            && error_body.as_ref().is_some_and(|body| {
+                body.get("code").and_then(serde_json::Value::as_str) == Some("cancel_failed")
+                    || body.get("error").and_then(serde_json::Value::as_str)
+                        == Some(legacy_not_pending.as_str())
+            });
+        return Err(if canonical_not_pending {
+            CancelTrialError::NotPending(message)
+        } else {
+            CancelTrialError::Other(message)
+        });
+    }
+    let acknowledgement: serde_json::Value = response.json().await.map_err(|error| {
+        CancelTrialError::Other(format!(
+            "{operation} returned invalid acknowledgement JSON: {error}"
+        ))
+    })?;
+    if acknowledgement
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("ok")
+    {
+        return Err(CancelTrialError::Other(format!(
+            "{operation} acknowledgement is missing canonical status 'ok'"
+        )));
+    }
+    if let Some(value) = acknowledgement.get("trial_id") {
+        let acknowledged_id = value.as_u64().ok_or_else(|| {
+            CancelTrialError::Other(format!(
+                "{operation} acknowledgement has a non-integer trial_id"
+            ))
+        })?;
+        if acknowledged_id != trial_id {
+            return Err(CancelTrialError::Other(format!(
+                "{operation} acknowledged trial_id {acknowledged_id} instead"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn cancel_trial(
     client: &reqwest::Client,
     server: &str,
     token: Option<&str>,
     trial_id: u64,
 ) -> Result<(), String> {
-    let operation = format!("cancel for trial {trial_id}");
-    let response = send_checked(
-        &operation,
-        with_bearer_auth(client.post(format!("{server}/api/cancel")), token)
-            .json(&serde_json::json!({"trial_id": trial_id})),
-    )
-    .await?;
-    let acknowledgement: serde_json::Value = response
-        .json()
+    cancel_trial_classified(client, server, token, trial_id)
         .await
-        .map_err(|error| format!("{operation} returned invalid acknowledgement JSON: {error}"))?;
-    if acknowledgement
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        != Some("ok")
-    {
-        return Err(format!(
-            "{operation} acknowledgement is missing canonical status 'ok'"
-        ));
-    }
-    if let Some(value) = acknowledgement.get("trial_id") {
-        let acknowledged_id = value
-            .as_u64()
-            .ok_or_else(|| format!("{operation} acknowledgement has a non-integer trial_id"))?;
-        if acknowledged_id != trial_id {
-            return Err(format!(
-                "{operation} acknowledged trial_id {acknowledged_id} instead"
-            ));
-        }
-    }
-    Ok(())
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug)]
 enum HeartbeatError {
     Retryable(String),
+    Terminal(String),
+    Unsupported(String),
     Rejected(String),
 }
 
 impl std::fmt::Display for HeartbeatError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Retryable(message) | Self::Rejected(message) => formatter.write_str(message),
+            Self::Retryable(message)
+            | Self::Terminal(message)
+            | Self::Unsupported(message)
+            | Self::Rejected(message) => formatter.write_str(message),
         }
     }
 }
@@ -698,9 +757,27 @@ async fn heartbeat_trial(
         .map_err(|error| HeartbeatError::Retryable(request_error(&operation, error)))?;
     if !response.status().is_success() {
         let status = response.status();
-        let message = http_error(&operation, response).await;
-        return Err(if retryable_http_status(status) {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("unable to read heartbeat error response: {error}"));
+        let message = format_http_error(&operation, status, &body);
+        let error_code = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        return Err(if status == reqwest::StatusCode::NOT_FOUND {
+            HeartbeatError::Unsupported(message)
+        } else if retryable_http_status(status) {
             HeartbeatError::Retryable(message)
+        } else if status == reqwest::StatusCode::BAD_REQUEST
+            && error_code.as_deref() == Some("heartbeat_failed")
+        {
+            HeartbeatError::Terminal(message)
         } else {
             HeartbeatError::Rejected(message)
         });
@@ -786,7 +863,11 @@ async fn maintain_trial_lease(
                     deadline_ms = new_deadline_ms;
                     break;
                 }
-                Ok(Err(HeartbeatError::Rejected(error))) => return Err(error),
+                Ok(Err(
+                    HeartbeatError::Terminal(error)
+                    | HeartbeatError::Unsupported(error)
+                    | HeartbeatError::Rejected(error),
+                )) => return Err(error),
                 Ok(Err(HeartbeatError::Retryable(error))) => {
                     let remaining_ms = deadline_ms.saturating_sub(unix_time_millis()?);
                     if remaining_ms == 0 {
@@ -810,13 +891,25 @@ async fn maintain_trial_lease(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandLeaseMode {
+    Strict,
+    Callback,
+}
+
+struct CommandRun<T> {
+    result: std::io::Result<T>,
+    callback_completion_confirmed: bool,
+}
+
 async fn run_command_with_heartbeat<T, Run>(
     client: &reqwest::Client,
     server: &str,
     token: Option<&str>,
     trial_id: u64,
+    lease_mode: CommandLeaseMode,
     run: Run,
-) -> std::io::Result<T>
+) -> CommandRun<T>
 where
     T: Send + 'static,
     Run: FnOnce(Arc<AtomicBool>) -> std::io::Result<T> + Send + 'static,
@@ -824,16 +917,46 @@ where
     // Confirm renewal before starting expensive work. This both verifies that
     // the endpoint/token are usable and obtains the configured server deadline
     // without hard-coding the server's lease duration in the worker.
-    let initial_deadline = heartbeat_trial(client, server, token, trial_id)
-        .await
-        .map_err(|error| {
-            std::io::Error::other(format!("initial lease heartbeat failed: {error}"))
-        })?;
-    heartbeat_renewal_delay(initial_deadline).map_err(std::io::Error::other)?;
+    let initial_deadline = match heartbeat_trial(client, server, token, trial_id).await {
+        Ok(deadline) => Some(deadline),
+        Err(HeartbeatError::Unsupported(error)) => {
+            eprintln!(
+                "Trial {trial_id}: server has no heartbeat endpoint; running with the command timeout for legacy compatibility ({error})"
+            );
+            None
+        }
+        Err(error) => {
+            return CommandRun {
+                result: Err(std::io::Error::other(format!(
+                    "initial lease heartbeat failed: {error}"
+                ))),
+                callback_completion_confirmed: false,
+            };
+        }
+    };
+    if let Some(deadline) = initial_deadline {
+        if let Err(error) = heartbeat_renewal_delay(deadline) {
+            return CommandRun {
+                result: Err(std::io::Error::other(error)),
+                callback_completion_confirmed: false,
+            };
+        }
+    }
 
     let cancellation = Arc::new(AtomicBool::new(false));
     let command_cancellation = Arc::clone(&cancellation);
     let mut command_task = tokio::task::spawn_blocking(move || run(command_cancellation));
+    let Some(initial_deadline) = initial_deadline else {
+        return CommandRun {
+            result: command_task
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!("command runner task failed: {error}"))
+                })
+                .and_then(std::convert::identity),
+            callback_completion_confirmed: false,
+        };
+    };
     let lease_task = maintain_trial_lease(client, server, token, trial_id, initial_deadline);
     tokio::pin!(lease_task);
 
@@ -843,6 +966,41 @@ where
             let error = lease_result
                 .err()
                 .unwrap_or_else(|| "lease heartbeat task stopped unexpectedly".to_string());
+
+            if lease_mode == CommandLeaseMode::Callback {
+                match callback_trial_state(client, server, token, trial_id).await {
+                    Ok(CallbackTrialState::Completed) => {
+                        eprintln!(
+                            "Trial {trial_id}: callback completion confirmed by server after lease heartbeat stopped; waiting for callback cleanup"
+                        );
+                        let result = command_task.await.map_err(|join_error| {
+                            std::io::Error::other(format!(
+                                "command runner task failed: {join_error}"
+                            ))
+                        }).and_then(std::convert::identity);
+                        return CommandRun {
+                            result,
+                            callback_completion_confirmed: true,
+                        };
+                    }
+                    Ok(CallbackTrialState::Pending | CallbackTrialState::NotPending) => {}
+                    Err(verification_error) => {
+                        eprintln!(
+                            "Trial {trial_id}: lease heartbeat failed ({error}), but callback completion verification was inconclusive ({verification_error}); waiting for the callback before retrying verification"
+                        );
+                        let result = command_task.await.map_err(|join_error| {
+                            std::io::Error::other(format!(
+                                "command runner task failed: {join_error}"
+                            ))
+                        }).and_then(std::convert::identity);
+                        return CommandRun {
+                            result,
+                            callback_completion_confirmed: false,
+                        };
+                    }
+                }
+            }
+
             cancellation.store(true, Ordering::Release);
             // The blocking runner observes cancellation within its 20 ms poll,
             // kills the entire process tree, drains capture pipes, and reaps it.
@@ -852,25 +1010,85 @@ where
                 Ok(Err(cleanup_error)) => format!("; command cleanup: {cleanup_error}"),
                 Err(join_error) => format!("; command cleanup task failed: {join_error}"),
             };
-            Err(std::io::Error::other(format!(
-                "lease heartbeat failed: {error}{cleanup_detail}"
-            )))
+            CommandRun {
+                result: Err(std::io::Error::other(format!(
+                    "lease heartbeat failed: {error}{cleanup_detail}"
+                ))),
+                callback_completion_confirmed: false,
+            }
         }
         command_result = &mut command_task => {
-            command_result.map_err(|error| {
-                std::io::Error::other(format!("command runner task failed: {error}"))
-            })?
+            CommandRun {
+                result: command_result.map_err(|error| {
+                    std::io::Error::other(format!("command runner task failed: {error}"))
+                }).and_then(std::convert::identity),
+                callback_completion_confirmed: false,
+            }
         }
     }
 }
 
-async fn callback_completed_trial(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallbackTrialState {
+    Completed,
+    Pending,
+    NotPending,
+}
+
+async fn callback_trial_state(
     client: &reqwest::Client,
     server: &str,
     token: Option<&str>,
     trial_id: u64,
-) -> Result<bool, String> {
+) -> Result<CallbackTrialState, String> {
     let operation = format!("callback verification for trial {trial_id}");
+    let response = with_bearer_auth(
+        client.get(format!("{server}/api/trial/{trial_id}/status")),
+        token,
+    )
+    .send()
+    .await
+    .map_err(|error| request_error(&operation, error))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return legacy_callback_trial_state(client, server, token, trial_id).await;
+    }
+    if !response.status().is_success() {
+        return Err(http_error(&operation, response).await);
+    }
+    let status: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("{operation} returned invalid JSON: {error}"))?;
+    if status.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+        return Err(format!(
+            "{operation} response is missing canonical status 'ok'"
+        ));
+    }
+    match status.get("trial_id").and_then(serde_json::Value::as_u64) {
+        Some(status_id) if status_id == trial_id => {}
+        Some(status_id) => {
+            return Err(format!("{operation} returned trial_id {status_id} instead"));
+        }
+        None => return Err(format!("{operation} response is missing trial_id")),
+    }
+    match status.get("state").and_then(serde_json::Value::as_str) {
+        Some("completed") => Ok(CallbackTrialState::Completed),
+        Some("pending") => Ok(CallbackTrialState::Pending),
+        Some("not_pending") => Ok(CallbackTrialState::NotPending),
+        Some(state) => Err(format!(
+            "{operation} returned unsupported trial state '{state}'"
+        )),
+        None => Err(format!("{operation} response is missing trial state")),
+    }
+}
+
+async fn legacy_callback_trial_state(
+    client: &reqwest::Client,
+    server: &str,
+    token: Option<&str>,
+    trial_id: u64,
+) -> Result<CallbackTrialState, String> {
+    let operation = format!("legacy callback verification for trial {trial_id}");
     let response = with_bearer_auth(
         client.get(format!(
             "{server}/api/trial/{trial_id}?include_infeasible=true"
@@ -880,25 +1098,104 @@ async fn callback_completed_trial(
     .send()
     .await
     .map_err(|error| request_error(&operation, error))?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(false);
+    if response.status().is_success() {
+        let completed: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| format!("{operation} returned invalid JSON: {error}"))?;
+        return match completed
+            .get("trial_id")
+            .and_then(serde_json::Value::as_u64)
+        {
+            Some(completed_id) if completed_id == trial_id => Ok(CallbackTrialState::Completed),
+            Some(completed_id) => Err(format!(
+                "{operation} returned trial_id {completed_id} instead"
+            )),
+            None => Err(format!("{operation} response is missing trial_id")),
+        };
     }
-    if !response.status().is_success() {
+    if response.status() != reqwest::StatusCode::NOT_FOUND {
         return Err(http_error(&operation, response).await);
     }
-    let completed: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|error| format!("{operation} returned invalid JSON: {error}"))?;
-    match completed
-        .get("trial_id")
-        .and_then(serde_json::Value::as_u64)
-    {
-        Some(completed_id) if completed_id == trial_id => Ok(true),
-        Some(completed_id) => Err(format!(
-            "{operation} returned trial_id {completed_id} instead"
+
+    // Older servers have no lifecycle endpoint, and their ranked trial lookup
+    // can return 404 after bounded-leaderboard eviction. A successful heartbeat
+    // is therefore the only safe evidence that cancellation is still allowed;
+    // any definitive rejection means the id is terminal on that server.
+    match heartbeat_trial(client, server, token, trial_id).await {
+        Ok(_) => Ok(CallbackTrialState::Pending),
+        Err(HeartbeatError::Terminal(_)) => Ok(CallbackTrialState::NotPending),
+        Err(HeartbeatError::Unsupported(_)) => Ok(CallbackTrialState::Pending),
+        Err(HeartbeatError::Retryable(error)) => Err(format!(
+            "{operation} could not distinguish pending from terminal state: {error}"
         )),
-        None => Err(format!("{operation} response is missing trial_id")),
+        Err(HeartbeatError::Rejected(error)) => Err(format!(
+            "{operation} received an untrusted heartbeat rejection: {error}"
+        )),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CallbackDisposition {
+    Completed,
+    Cancel(String),
+    NotPending,
+}
+
+async fn callback_disposition(
+    client: &reqwest::Client,
+    server: &str,
+    token: Option<&str>,
+    trial_id: u64,
+    command_failure: Option<&str>,
+) -> Result<CallbackDisposition, String> {
+    match callback_trial_state(client, server, token, trial_id).await? {
+        CallbackTrialState::Completed => Ok(CallbackDisposition::Completed),
+        CallbackTrialState::Pending => {
+            Ok(CallbackDisposition::Cancel(command_failure.map_or_else(
+                || "script exited successfully without completing its trial".to_string(),
+                str::to_string,
+            )))
+        }
+        CallbackTrialState::NotPending => Ok(CallbackDisposition::NotPending),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallbackCancelOutcome {
+    Cancelled,
+    Completed,
+    NotPending,
+}
+
+async fn cancel_callback_trial(
+    client: &reqwest::Client,
+    server: &str,
+    token: Option<&str>,
+    trial_id: u64,
+) -> Result<CallbackCancelOutcome, String> {
+    match cancel_trial_classified(client, server, token, trial_id).await {
+        Ok(()) => Ok(CallbackCancelOutcome::Cancelled),
+        Err(CancelTrialError::NotPending(_)) => {
+            match callback_trial_state(client, server, token, trial_id).await {
+                Ok(CallbackTrialState::Completed) => Ok(CallbackCancelOutcome::Completed),
+                Ok(CallbackTrialState::Pending | CallbackTrialState::NotPending) | Err(_) => {
+                    Ok(CallbackCancelOutcome::NotPending)
+                }
+            }
+        }
+        Err(CancelTrialError::Other(cancel_error)) => {
+            match callback_trial_state(client, server, token, trial_id).await {
+                Ok(CallbackTrialState::Completed) => Ok(CallbackCancelOutcome::Completed),
+                Ok(CallbackTrialState::NotPending) => Ok(CallbackCancelOutcome::NotPending),
+                Ok(CallbackTrialState::Pending) => Err(format!(
+                    "{cancel_error}; trial remains pending after the rejected cancellation"
+                )),
+                Err(verification_error) => Err(format!(
+                    "{cancel_error}; cancellation outcome could not be verified: {verification_error}"
+                )),
+            }
+        }
     }
 }
 
@@ -1379,6 +1676,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &server,
                         token.as_deref(),
                         trial_id,
+                        CommandLeaseMode::Strict,
                         move |cancellation| {
                             run_capped_cancellable(
                                 &mut command,
@@ -1387,7 +1685,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             )
                         },
                     )
-                    .await;
+                    .await
+                    .result;
                     match command_result {
                         Ok(output) => match decide_exec_outcome(&output) {
                             ExecOutcome::Tell(metrics) => {
@@ -1455,11 +1754,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(token) = &token {
                         command.env("HOLA_API_TOKEN", token);
                     }
-                    let command_result = run_command_with_heartbeat(
+                    let command_run = run_command_with_heartbeat(
                         &client,
                         &server,
                         token.as_deref(),
                         trial_id,
+                        CommandLeaseMode::Callback,
                         move |cancellation| {
                             run_timed_cancellable(
                                 &mut command,
@@ -1469,7 +1769,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                     )
                     .await;
-                    let failure = match command_result {
+                    let failure = match command_run.result {
                         Ok(result) if result.timed_out => Some("command timed out".to_string()),
                         Ok(result) if !result.status.success() => Some(format!(
                             "script failed (exit {})",
@@ -1479,37 +1779,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Err(error) => Some(format!("failed to run command ({error})")),
                     };
 
-                    if let Some(reason) = failure {
-                        eprintln!("Trial {trial_id}: {reason}, canceling");
-                        if let Err(error) =
-                            cancel_trial(&client, &server, token.as_deref(), trial_id).await
-                        {
-                            eprintln!("Failed to cancel trial {trial_id}: {error}");
+                    if command_run.callback_completion_confirmed {
+                        if let Some(reason) = failure {
+                            eprintln!(
+                                "Trial {trial_id}: callback completion remains authoritative after {reason}; not canceling"
+                            );
+                        } else {
+                            eprintln!(
+                                "Trial {trial_id}: callback exited after its server-confirmed completion"
+                            );
                         }
-                        tokio::time::sleep(COMMAND_FAILURE_DELAY).await;
                         continue;
                     }
 
                     loop {
-                        match callback_completed_trial(&client, &server, token.as_deref(), trial_id)
-                            .await
+                        match callback_disposition(
+                            &client,
+                            &server,
+                            token.as_deref(),
+                            trial_id,
+                            failure.as_deref(),
+                        )
+                        .await
                         {
-                            Ok(true) => {
-                                eprintln!(
-                                    "Trial {trial_id}: callback completion confirmed by server"
-                                );
+                            Ok(CallbackDisposition::Completed) => {
+                                if let Some(reason) = &failure {
+                                    eprintln!(
+                                        "Trial {trial_id}: callback completion confirmed by server after {reason}"
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "Trial {trial_id}: callback completion confirmed by server"
+                                    );
+                                }
                                 break;
                             }
-                            Ok(false) => {
-                                eprintln!(
-                                    "Trial {trial_id}: script exited successfully without completing its trial; canceling"
-                                );
-                                if let Err(error) =
-                                    cancel_trial(&client, &server, token.as_deref(), trial_id).await
+                            Ok(CallbackDisposition::Cancel(reason)) => {
+                                eprintln!("Trial {trial_id}: {reason}, canceling");
+                                match cancel_callback_trial(
+                                    &client,
+                                    &server,
+                                    token.as_deref(),
+                                    trial_id,
+                                )
+                                .await
                                 {
-                                    eprintln!("Failed to cancel trial {trial_id}: {error}");
+                                    Ok(CallbackCancelOutcome::Cancelled) => {
+                                        tokio::time::sleep(COMMAND_FAILURE_DELAY).await;
+                                        break;
+                                    }
+                                    Ok(CallbackCancelOutcome::Completed) => {
+                                        eprintln!(
+                                            "Trial {trial_id}: callback completion won the cancellation race and is authoritative"
+                                        );
+                                        break;
+                                    }
+                                    Ok(CallbackCancelOutcome::NotPending) => {
+                                        eprintln!(
+                                            "Trial {trial_id}: cancellation was unnecessary because the trial is no longer pending"
+                                        );
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        eprintln!(
+                                            "Failed to reconcile cancellation for trial {trial_id}: {error}. Retrying in 5s..."
+                                        );
+                                        tokio::time::sleep(RETRY_DELAY).await;
+                                    }
                                 }
-                                tokio::time::sleep(COMMAND_FAILURE_DELAY).await;
+                            }
+                            Ok(CallbackDisposition::NotPending) => {
+                                if let Some(reason) = &failure {
+                                    eprintln!(
+                                        "Trial {trial_id}: {reason}, but the trial is no longer pending; leaving terminal server state unchanged"
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "Trial {trial_id}: callback exited without a retained completion, but the trial is no longer pending"
+                                    );
+                                }
                                 break;
                             }
                             Err(error) => {
@@ -2136,29 +2484,259 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_success_requires_the_server_to_confirm_the_same_trial() {
+    async fn heartbeat_distinguishes_terminal_unsupported_and_untrusted_rejections() {
         let (server, server_thread) = mock_http_server(vec![
-            MockReply::response(200, r#"{"trial_id":11}"#),
-            MockReply::response(404, r#"{"error":"not found"}"#),
-            MockReply::response(200, r#"{"trial_id":99}"#),
+            MockReply::response(
+                400,
+                r#"{"code":"heartbeat_failed","error":"Trial 7 is not pending"}"#,
+            ),
+            MockReply::response(404, r#"{"error":"route not found"}"#),
+            MockReply::response(401, r#"{"code":"unauthorized","error":"bad token"}"#),
         ]);
         let client = build_http_client(Duration::from_secs(2)).expect("client should build");
 
-        assert!(
-            callback_completed_trial(&client, &server, None, 11)
-                .await
-                .expect("matching completion should verify")
-        );
-        assert!(
-            !callback_completed_trial(&client, &server, None, 12)
-                .await
-                .expect("404 means callback did not tell")
-        );
-        let error = callback_completed_trial(&client, &server, None, 13)
-            .await
-            .expect_err("wrong completed id must fail verification");
-        assert!(error.contains("trial_id 99 instead"));
+        assert!(matches!(
+            heartbeat_trial(&client, &server, None, 7).await,
+            Err(HeartbeatError::Terminal(_))
+        ));
+        assert!(matches!(
+            heartbeat_trial(&client, &server, None, 8).await,
+            Err(HeartbeatError::Unsupported(_))
+        ));
+        assert!(matches!(
+            heartbeat_trial(&client, &server, None, 9).await,
+            Err(HeartbeatError::Rejected(_))
+        ));
         server_thread.join().expect("mock server should finish");
+    }
+
+    #[tokio::test]
+    async fn missing_legacy_heartbeat_endpoint_does_not_prevent_command_execution() {
+        let (server, server_thread) = mock_http_server(vec![MockReply::response(
+            404,
+            r#"{"error":"route not found"}"#,
+        )]);
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+
+        let command_run =
+            run_command_with_heartbeat(&client, &server, None, 7, CommandLeaseMode::Strict, |_| {
+                Ok(42_u64)
+            })
+            .await;
+        assert_eq!(command_run.result.expect("legacy command should run"), 42);
+        assert!(!command_run.callback_completion_confirmed);
+        let requests = server_thread.join().expect("mock server should finish");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /api/heartbeat "));
+    }
+
+    #[tokio::test]
+    async fn callback_status_requires_canonical_state_for_the_same_trial() {
+        let (server, server_thread) = mock_http_server(vec![
+            MockReply::response(200, r#"{"status":"ok","trial_id":11,"state":"completed"}"#),
+            MockReply::response(200, r#"{"status":"ok","trial_id":12,"state":"pending"}"#),
+            MockReply::response(
+                200,
+                r#"{"status":"ok","trial_id":13,"state":"not_pending"}"#,
+            ),
+            MockReply::response(200, r#"{"status":"ok","trial_id":99,"state":"completed"}"#),
+        ]);
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+
+        assert_eq!(
+            callback_trial_state(&client, &server, None, 11)
+                .await
+                .expect("matching completion should verify"),
+            CallbackTrialState::Completed
+        );
+        assert_eq!(
+            callback_trial_state(&client, &server, None, 12)
+                .await
+                .expect("pending state should verify"),
+            CallbackTrialState::Pending
+        );
+        assert_eq!(
+            callback_trial_state(&client, &server, None, 13)
+                .await
+                .expect("terminal state should verify"),
+            CallbackTrialState::NotPending
+        );
+        let error = callback_trial_state(&client, &server, None, 14)
+            .await
+            .expect_err("wrong status id must fail verification");
+        assert!(error.contains("trial_id 99 instead"));
+        let requests = server_thread.join().expect("mock server should finish");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.starts_with("GET /api/trial/")
+                    && request.contains("/status "))
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_status_falls_back_safely_for_legacy_servers() {
+        let (server, server_thread) = mock_http_server(vec![
+            MockReply::response(404, r#"{"error":"route not found"}"#),
+            MockReply::response(200, r#"{"trial_id":21}"#),
+            MockReply::response(404, r#"{"error":"route not found"}"#),
+            MockReply::response(
+                404,
+                r#"{"code":"trial_not_found","error":"Trial 22 not found"}"#,
+            ),
+            MockReply::response(
+                200,
+                r#"{"status":"ok","trial_id":22,"lease_expires_at_ms":4000000000000}"#,
+            ),
+            MockReply::response(404, r#"{"error":"route not found"}"#),
+            MockReply::response(
+                404,
+                r#"{"code":"trial_not_found","error":"Trial 23 not found"}"#,
+            ),
+            MockReply::response(
+                400,
+                r#"{"code":"heartbeat_failed","error":"Trial 23 is not pending"}"#,
+            ),
+            MockReply::response(404, r#"{"error":"route not found"}"#),
+            MockReply::response(
+                404,
+                r#"{"code":"trial_not_found","error":"Trial 24 not found"}"#,
+            ),
+            MockReply::response(404, r#"{"error":"route not found"}"#),
+            MockReply::response(404, r#"{"error":"route not found"}"#),
+            MockReply::response(
+                404,
+                r#"{"code":"trial_not_found","error":"Trial 25 not found"}"#,
+            ),
+            MockReply::response(401, r#"{"code":"unauthorized","error":"bad token"}"#),
+        ]);
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+
+        assert_eq!(
+            callback_trial_state(&client, &server, None, 21)
+                .await
+                .expect("legacy exact completion should remain authoritative"),
+            CallbackTrialState::Completed
+        );
+        assert_eq!(
+            callback_trial_state(&client, &server, None, 22)
+                .await
+                .expect("legacy heartbeat should prove the trial remains pending"),
+            CallbackTrialState::Pending
+        );
+        assert_eq!(
+            callback_trial_state(&client, &server, None, 23)
+                .await
+                .expect("legacy heartbeat rejection should prove the trial is terminal"),
+            CallbackTrialState::NotPending
+        );
+        assert_eq!(
+            callback_trial_state(&client, &server, None, 24)
+                .await
+                .expect("a missing legacy heartbeat route must preserve old-server operation"),
+            CallbackTrialState::Pending
+        );
+        let error = callback_trial_state(&client, &server, None, 25)
+            .await
+            .expect_err("an authentication rejection is not terminal-state proof");
+        assert!(error.contains("untrusted heartbeat rejection"));
+
+        let requests = server_thread.join().expect("mock server should finish");
+        assert!(requests[0].starts_with("GET /api/trial/21/status "));
+        assert!(requests[1].starts_with("GET /api/trial/21?include_infeasible=true "));
+        assert!(requests[2].starts_with("GET /api/trial/22/status "));
+        assert!(requests[3].starts_with("GET /api/trial/22?include_infeasible=true "));
+        assert!(requests[4].starts_with("POST /api/heartbeat "));
+        assert!(requests[5].starts_with("GET /api/trial/23/status "));
+        assert!(requests[6].starts_with("GET /api/trial/23?include_infeasible=true "));
+        assert!(requests[7].starts_with("POST /api/heartbeat "));
+        assert!(requests[8].starts_with("GET /api/trial/24/status "));
+        assert!(requests[9].starts_with("GET /api/trial/24?include_infeasible=true "));
+        assert!(requests[10].starts_with("POST /api/heartbeat "));
+        assert!(requests[11].starts_with("GET /api/trial/25/status "));
+        assert!(requests[12].starts_with("GET /api/trial/25?include_infeasible=true "));
+        assert!(requests[13].starts_with("POST /api/heartbeat "));
+    }
+
+    #[tokio::test]
+    async fn callback_command_failure_defers_to_exact_server_completion() {
+        let (server, server_thread) = mock_http_server(vec![
+            MockReply::response(200, r#"{"status":"ok","trial_id":7,"state":"completed"}"#),
+            MockReply::response(200, r#"{"status":"ok","trial_id":8,"state":"pending"}"#),
+            MockReply::response(200, r#"{"status":"ok","trial_id":9,"state":"not_pending"}"#),
+            MockReply::response(503, r#"{"error":"unavailable"}"#),
+        ]);
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+        let failure = "failed to run command (lease heartbeat failed)";
+
+        assert_eq!(
+            callback_disposition(&client, &server, None, 7, Some(failure))
+                .await
+                .expect("matching completed trial should be authoritative"),
+            CallbackDisposition::Completed
+        );
+        assert_eq!(
+            callback_disposition(&client, &server, None, 8, Some(failure))
+                .await
+                .expect("pending state should preserve command failure"),
+            CallbackDisposition::Cancel(failure.to_string())
+        );
+        assert_eq!(
+            callback_disposition(&client, &server, None, 9, Some(failure))
+                .await
+                .expect("terminal state must not choose cancellation"),
+            CallbackDisposition::NotPending
+        );
+        let error = callback_disposition(&client, &server, None, 10, Some(failure))
+            .await
+            .expect_err("uncertain verification must not choose cancellation");
+        assert!(error.contains("HTTP 503 Service Unavailable"));
+        server_thread.join().expect("mock server should finish");
+    }
+
+    #[tokio::test]
+    async fn callback_cancel_rejection_reconciles_a_late_completion() {
+        let (server, server_thread) = mock_http_server(vec![
+            MockReply::response(400, r#"{"code":"cancel_failed","error":"not pending"}"#),
+            MockReply::response(200, r#"{"status":"ok","trial_id":7,"state":"completed"}"#),
+        ]);
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+
+        assert_eq!(
+            cancel_callback_trial(&client, &server, None, 7)
+                .await
+                .expect("late completion should reconcile the rejected cancel"),
+            CallbackCancelOutcome::Completed
+        );
+        let requests = server_thread.join().expect("mock server should finish");
+        assert!(requests[0].starts_with("POST /api/cancel "));
+        assert!(requests[1].starts_with("GET /api/trial/7/status "));
+    }
+
+    #[tokio::test]
+    async fn legacy_cancel_rejection_terminates_after_completion_receipt_eviction() {
+        let (server, server_thread) = mock_http_server(vec![
+            MockReply::response(
+                400,
+                r#"{"error":"Trial 7 is not pending (may be completed or unknown)"}"#,
+            ),
+            MockReply::response(404, r#"{"error":"route not found"}"#),
+            MockReply::response(404, r#"{"error":"Trial 7 not found"}"#),
+            MockReply::response(404, r#"{"error":"route not found"}"#),
+        ]);
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+
+        assert_eq!(
+            cancel_callback_trial(&client, &server, None, 7)
+                .await
+                .expect("canonical legacy cancel rejection is terminal proof"),
+            CallbackCancelOutcome::NotPending
+        );
+        let requests = server_thread.join().expect("mock server should finish");
+        assert!(requests[0].starts_with("POST /api/cancel "));
+        assert!(requests[1].starts_with("GET /api/trial/7/status "));
+        assert!(requests[2].starts_with("GET /api/trial/7?include_infeasible=true "));
+        assert!(requests[3].starts_with("POST /api/heartbeat "));
     }
 
     #[tokio::test]

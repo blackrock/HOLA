@@ -18,8 +18,9 @@ UI from a local directory with the `--dashboard` flag.
 executes your command for each one, and handles trial
 lifecycle. By default it uses callback mode, where the script
 is responsible for reporting results back to the server via
-`POST /api/tell`. If the script exits with non-zero status,
-the worker cancels the trial automatically.
+`POST /api/tell`. If the script exits with non-zero status, the worker cancels
+the trial only when the server still confirms it is pending; an
+already-completed tell is authoritative.
 
 ## YAML Configuration
 
@@ -253,12 +254,18 @@ In callback mode, the worker loop works as follows.
      require authorization on a token-protected server.
 3. The script is responsible for calling `POST /api/tell` to
    report results back to the server
-4. If the script exits with non-zero status, the worker
-   cancels the trial via `POST /api/cancel`
+4. Reconcile the exact trial lifecycle with the server. A completed tell stays
+   authoritative even if a later heartbeat is rejected or the script exits
+   non-zero. The worker calls `POST /api/cancel` only if the trial is still
+   pending and the script failed or exited without completing it.
 5. Repeat
 
 If the server is unreachable, the worker retries with the same ask
 idempotency key, so a lost response cannot allocate duplicate work.
+Workers also remain compatible with servers that predate the lifecycle-status
+and heartbeat endpoints: they fall back to the exact completed-trial lookup,
+use a validated heartbeat when available, and rely on the older server's atomic
+cancel operation when no lease protocol exists.
 
 ### Exec mode
 

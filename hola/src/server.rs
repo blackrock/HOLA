@@ -24,6 +24,7 @@
 //! - `GET /api/top_k` - Get top-k trials by rank
 //! - `GET /api/pareto_front` - Get Pareto front trials
 //! - `GET /api/trial/{trial_id}` - Get one completed trial with scoring/ranking
+//! - `GET /api/trial/{trial_id}/status` - Reconcile a distributed trial lifecycle
 //! - `GET /api/trials` - Get all trials with scoring/ranking
 //! - `GET /api/trial_count` - Get number of completed trials
 //! - `PATCH /api/objectives` - Update objectives mid-run
@@ -32,7 +33,7 @@
 //! - `POST /api/checkpoint/save` - Save a full checkpoint
 //! - `GET /api/events` - SSE stream of engine events
 
-use crate::hola_engine::{CompletedTrial, HolaEngine, ObjectiveConfig};
+use crate::hola_engine::{CompletedTrial, HolaEngine, ObjectiveConfig, TrialLifecycle};
 use axum::{
     Router,
     extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State},
@@ -724,6 +725,24 @@ async fn handle_trial(
     }
 }
 
+async fn handle_trial_status(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    AxumPath(trial_id): AxumPath<u64>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    authorize_read(&state, &headers)?;
+    let lifecycle = match state.engine.trial_lifecycle(trial_id).await {
+        TrialLifecycle::Completed => "completed",
+        TrialLifecycle::Pending => "pending",
+        TrialLifecycle::NotPending => "not_pending",
+    };
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "trial_id": trial_id,
+        "state": lifecycle,
+    })))
+}
+
 async fn handle_trial_count(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -1170,6 +1189,7 @@ pub fn create_router_with_options(
         .route("/api/heartbeat", post(handle_heartbeat))
         .route("/api/top_k", get(handle_top_k))
         .route("/api/pareto_front", get(handle_pareto_front))
+        .route("/api/trial/{trial_id}/status", get(handle_trial_status))
         .route("/api/trial/{trial_id}", get(handle_trial))
         .route("/api/trials", get(handle_trials))
         .route("/api/trial_count", get(handle_trial_count))
