@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version to verify from the exact main commit (without a leading v)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -33,23 +39,44 @@ jobs:
 
       - name: Validate tag and package versions
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
           TAG_NAME: ${{ github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
 
-          version="${TAG_NAME#v}"
-          if [[ "${TAG_NAME}" != v* || -z "${version}" || "${version}" == "${TAG_NAME}" ]]; then
-            echo "Release tags must be named v<version>; got ${TAG_NAME}" >&2
-            exit 1
-          fi
-
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           main_sha="$(git rev-parse origin/main)"
-          tag_sha="$(git rev-list -n 1 "${TAG_NAME}")"
-          if [[ "${tag_sha}" != "${main_sha}" ]]; then
-            echo "Release tag ${TAG_NAME} points to ${tag_sha}, but origin/main is ${main_sha}" >&2
-            exit 1
+
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            version="${TAG_NAME#v}"
+            if [[ "${TAG_NAME}" != v* || -z "${version}" || "${version}" == "${TAG_NAME}" ]]; then
+              echo "Release tags must be named v<version>; got ${TAG_NAME}" >&2
+              exit 1
+            fi
+
+            tag_sha="$(git rev-list -n 1 "${TAG_NAME}")"
+            if [[ "${tag_sha}" != "${main_sha}" ]]; then
+              echo "Release tag ${TAG_NAME} points to ${tag_sha}, but origin/main is ${main_sha}" >&2
+              exit 1
+            fi
+          else
+            version="${INPUT_VERSION}"
+            if [[ -z "${version}" || "${version}" == v* ]]; then
+              echo "The dry-run version must be a package version without a leading v; got ${version:-<empty>}" >&2
+              exit 1
+            fi
+            if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+              echo "Release dry runs must be dispatched from main; got ${GITHUB_REF}" >&2
+              exit 1
+            fi
+
+            checkout_sha="$(git rev-parse HEAD)"
+            if [[ "${checkout_sha}" != "${main_sha}" ]]; then
+              echo "Release dry run checked out ${checkout_sha}, but origin/main is ${main_sha}" >&2
+              exit 1
+            fi
           fi
 
           TAG_VERSION="${version}" python <<'PY'
@@ -276,6 +303,64 @@ jobs:
             *.tar.gz
             *.zip
 
+  # Download and execute every packaged CLI on its native architecture. This
+  # runs during the non-publishing dry run as well as the tagged release.
+  test-cli:
+    name: Test CLI archive (${{ matrix.target }})
+    needs: [build-cli]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: cli-hola-linux-x86_64
+            archive: hola-linux-x86_64.tar.gz
+            binary: hola-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: cli-hola-linux-aarch64
+            archive: hola-linux-aarch64.tar.gz
+            binary: hola-linux-aarch64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            artifact: cli-hola-macos-x86_64
+            archive: hola-macos-x86_64.tar.gz
+            binary: hola-macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: cli-hola-macos-aarch64
+            archive: hola-macos-aarch64.tar.gz
+            binary: hola-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: cli-hola-windows-x86_64.exe
+            archive: hola-windows-x86_64.exe.zip
+            binary: hola-windows-x86_64.exe
+    steps:
+      - name: Download CLI archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+
+      - name: Extract and smoke CLI archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf "dist/${{ matrix.archive }}" -C dist
+          "dist/${{ matrix.binary }}" --help
+
+      - name: Extract and smoke CLI archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Expand-Archive -LiteralPath "dist/${{ matrix.archive }}" -DestinationPath dist/unpacked
+          & "dist/unpacked/${{ matrix.binary }}" --help
+
   # ── Wheel smoke test ────────────────────────────────────
   test-wheels:
     name: Test wheel (${{ matrix.os }}, Python ${{ matrix.python-version }})
@@ -333,7 +418,8 @@ jobs:
   # ── Create GitHub Release ───────────────────────────────
   release:
     name: GitHub Release
-    needs: [build-wheels, build-sdist, build-cli, test-wheels]
+    if: github.event_name == 'push'
+    needs: [build-wheels, build-sdist, build-cli, test-cli, test-wheels]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
