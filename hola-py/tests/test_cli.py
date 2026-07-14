@@ -386,6 +386,86 @@ def test_callback_worker_heartbeats_through_command_longer_than_lease(cli_binary
         server.wait(timeout=5)
 
 
+def test_callback_completion_wins_post_tell_heartbeat_rejection(cli_binary, tmp_path):
+    """A completed callback must not be canceled by its next heartbeat."""
+    port = _find_free_port()
+    config_path = write_yaml_config(tmp_path)
+    with open(config_path, "a") as config:
+        config.write("max_trials: 1\n")
+    url = f"http://localhost:{port}"
+    told_marker = tmp_path / "callback-told"
+    survived_marker = tmp_path / "callback-survived-heartbeat"
+
+    server = subprocess.Popen(
+        [
+            cli_binary,
+            "serve",
+            str(config_path),
+            "--port",
+            str(port),
+            "--lease-seconds",
+            "1",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert _wait_for_server(url), "Server did not start"
+        exec_cmd = _python_command(
+            tmp_path,
+            "tell_then_wait.py",
+            "import json, os, pathlib, time, urllib.request\n"
+            "payload = json.dumps({'trial_id': int(os.environ['HOLA_TRIAL_ID']), "
+            "'metrics': {'loss': 0.25}}).encode()\n"
+            "request = urllib.request.Request(os.environ['HOLA_SERVER'] + '/api/tell', "
+            "data=payload, headers={'Content-Type': 'application/json'})\n"
+            "urllib.request.urlopen(request, timeout=5).read()\n"
+            f"pathlib.Path({str(told_marker)!r}).write_text('told')\n"
+            # Keep the callback alive until the next heartbeat observes that
+            # tell() removed the trial from the pending set.
+            "time.sleep(1.5)\n"
+            f"pathlib.Path({str(survived_marker)!r}).write_text('survived')\n",
+        )
+        worker_log_path = tmp_path / "callback-worker.log"
+        with open(worker_log_path, "wb") as worker_log:
+            worker = subprocess.Popen(
+                [cli_binary, "worker", "--server", url, "--exec", exec_cmd],
+                stdout=subprocess.DEVNULL,
+                stderr=worker_log,
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not survived_marker.exists():
+                    time.sleep(0.05)
+                assert told_marker.exists(), "Callback did not complete tell()"
+                assert survived_marker.exists(), (
+                    "Callback was terminated after tell() when its next heartbeat was rejected"
+                )
+                _, body = http_json(f"{url}/api/trial_count")
+                assert body["trial_count"] == 1
+
+                expected_log = "callback exited after its server-confirmed completion"
+                deadline = time.monotonic() + 5
+                logs = ""
+                while time.monotonic() < deadline:
+                    logs = worker_log_path.read_text(errors="replace").lower()
+                    if expected_log in logs:
+                        break
+                    time.sleep(0.05)
+                assert expected_log in logs, "Worker did not finish callback reconciliation"
+            finally:
+                worker.kill()
+                worker.wait(timeout=5)
+
+        logs = worker_log_path.read_text(errors="replace").lower()
+        assert "callback completion confirmed by server after lease heartbeat stopped" in logs
+        assert "callback exited after its server-confirmed completion" in logs
+        assert "canceling" not in logs
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+
+
 def test_worker_exec_failure_cancels_not_reports(cli_binary, tmp_path):
     """A non-zero exit must cancel the trial, not POST a fake result.
 

@@ -449,6 +449,38 @@ curl http://localhost:8000/api/trial/17
 
 ---
 
+### GET /api/trial/{trial_id}/status
+
+Get the authoritative lifecycle state used to reconcile a distributed worker.
+This read follows the server's read-authentication policy. Unlike the ranked
+single-trial endpoint, `completed` also recognizes a retained completion
+receipt after `max_leaderboard_size` has evicted the trial from the leaderboard.
+
+**Response (200)**
+
+```json
+{"status":"ok","trial_id":17,"state":"completed"}
+```
+
+`state` is one of the following.
+
+| State | Meaning |
+|-------|---------|
+| `completed` | The exact trial is in the leaderboard or its recent completion receipt is retained. |
+| `pending` | The exact trial is still live and may be cancelled. |
+| `not_pending` | The trial is expired, cancelled, unknown, or no longer has a retained completion receipt; it must not be cancelled again. |
+
+The response always echoes the requested `trial_id`, so clients can reject a
+mismatched or malformed acknowledgement before taking lifecycle action.
+
+**Example**
+
+```bash
+curl http://localhost:8000/api/trial/17/status
+```
+
+---
+
 ### GET /api/objectives
 
 Get the current objective configuration.

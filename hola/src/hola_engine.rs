@@ -1243,6 +1243,20 @@ pub struct TellOutcome {
     pub post_commit_warnings: Vec<String>,
 }
 
+/// Internal lifecycle view used to reconcile distributed callback workers.
+///
+/// `NotPending` deliberately combines expired, cancelled, and unknown trials:
+/// none of those states should trigger another cancellation attempt. A recent
+/// completion remains distinguishable after bounded-leaderboard eviction via
+/// the engine's completion-receipt ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "server")]
+pub(crate) enum TrialLifecycle {
+    Completed,
+    Pending,
+    NotPending,
+}
+
 /// Kind of checkpoint loaded by [`HolaEngine::load_checkpoint_with_fallback`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckpointLoadKind {
@@ -3273,6 +3287,28 @@ impl HolaEngine {
         let mut state = self.state.write().await;
         state.expire_leases(unix_time_millis());
         state.pending.len()
+    }
+
+    /// Return the current lifecycle of one distributed trial atomically.
+    ///
+    /// Completion receipts make this a stronger completion oracle than the
+    /// ranked single-trial view: a bounded leaderboard may evict a completed
+    /// trial while its exact retry receipt is still retained. Expired,
+    /// cancelled, and unknown trials intentionally share `NotPending`, because
+    /// none should be cancelled again.
+    #[cfg(feature = "server")]
+    pub(crate) async fn trial_lifecycle(&self, trial_id: u64) -> TrialLifecycle {
+        let mut state = self.state.write().await;
+        state.expire_leases(unix_time_millis());
+        if state.completion_receipt(trial_id).is_some()
+            || state.leaderboard.contains_trial_id(trial_id)
+        {
+            TrialLifecycle::Completed
+        } else if state.pending.contains_key(&trial_id) {
+            TrialLifecycle::Pending
+        } else {
+            TrialLifecycle::NotPending
+        }
     }
 
     /// Get trials on a specific Pareto front.
@@ -6212,6 +6248,55 @@ mod tests {
             unbounded.retained_trial_count().await,
             n,
             "default (unbounded) study must retain every trial"
+        );
+    }
+
+    #[tokio::test]
+    async fn trial_lifecycle_uses_receipts_after_leaderboard_eviction() {
+        let mut config = single_objective_config("random");
+        config.max_leaderboard_size = Some(1);
+        let engine = HolaEngine::from_config(config).unwrap();
+
+        let evicted = engine.ask().await.unwrap();
+        engine
+            .tell(evicted.trial_id, serde_json::json!({"loss": 2.0}))
+            .await
+            .unwrap();
+        let retained = engine.ask().await.unwrap();
+        engine
+            .tell(retained.trial_id, serde_json::json!({"loss": 1.0}))
+            .await
+            .unwrap();
+
+        assert!(
+            engine
+                .completed_trial(evicted.trial_id, true)
+                .await
+                .is_none(),
+            "the stronger lifecycle result must come from the receipt, not the bounded leaderboard"
+        );
+        assert_eq!(
+            engine.trial_lifecycle(evicted.trial_id).await,
+            TrialLifecycle::Completed
+        );
+        assert_eq!(
+            engine.trial_lifecycle(retained.trial_id).await,
+            TrialLifecycle::Completed
+        );
+
+        let pending = engine.ask().await.unwrap();
+        assert_eq!(
+            engine.trial_lifecycle(pending.trial_id).await,
+            TrialLifecycle::Pending
+        );
+        engine.cancel(pending.trial_id).await.unwrap();
+        assert_eq!(
+            engine.trial_lifecycle(pending.trial_id).await,
+            TrialLifecycle::NotPending
+        );
+        assert_eq!(
+            engine.trial_lifecycle(u64::MAX).await,
+            TrialLifecycle::NotPending
         );
     }
 

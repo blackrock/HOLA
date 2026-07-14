@@ -409,6 +409,97 @@ async fn test_server_completed_count_remains_monotonic_when_history_is_bounded()
     assert_eq!(trials.as_array().unwrap().len(), 1);
 }
 
+#[tokio::test]
+async fn test_trial_status_survives_bounded_leaderboard_eviction() {
+    let mut config = minimal_config();
+    config.max_leaderboard_size = Some(1);
+    let engine = HolaEngine::from_config(config).unwrap();
+    let app = create_router(engine).unwrap();
+
+    let (_, evicted) = json_request(app.clone(), "POST", "/api/ask", None).await;
+    let evicted_id = evicted["trial_id"].as_u64().unwrap();
+    let (status, _) = json_request(
+        app.clone(),
+        "POST",
+        "/api/tell",
+        Some(json!({"trial_id": evicted_id, "metrics": {"loss": 2.0}})),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (_, retained) = json_request(app.clone(), "POST", "/api/ask", None).await;
+    let retained_id = retained["trial_id"].as_u64().unwrap();
+    let (status, _) = json_request(
+        app.clone(),
+        "POST",
+        "/api/tell",
+        Some(json!({"trial_id": retained_id, "metrics": {"loss": 1.0}})),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (_, trials) = json_request(
+        app.clone(),
+        "GET",
+        "/api/trials?sorted_by=index&include_infeasible=true",
+        None,
+    )
+    .await;
+    assert_eq!(trials.as_array().unwrap().len(), 1);
+    assert!(
+        trials
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|trial| trial["trial_id"] != evicted_id),
+        "the completed status must come from the receipt after leaderboard eviction"
+    );
+
+    let (status, lifecycle) = json_request(
+        app.clone(),
+        "GET",
+        &format!("/api/trial/{evicted_id}/status"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        lifecycle,
+        json!({"status": "ok", "trial_id": evicted_id, "state": "completed"})
+    );
+
+    let (_, pending) = json_request(app.clone(), "POST", "/api/ask", None).await;
+    let pending_id = pending["trial_id"].as_u64().unwrap();
+    let (status, lifecycle) = json_request(
+        app.clone(),
+        "GET",
+        &format!("/api/trial/{pending_id}/status"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        lifecycle,
+        json!({"status": "ok", "trial_id": pending_id, "state": "pending"})
+    );
+
+    let (status, _) = json_request(
+        app.clone(),
+        "POST",
+        "/api/cancel",
+        Some(json!({"trial_id": pending_id})),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, lifecycle) =
+        json_request(app, "GET", &format!("/api/trial/{pending_id}/status"), None).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        lifecycle,
+        json!({"status": "ok", "trial_id": pending_id, "state": "not_pending"})
+    );
+}
+
 // ==========================================================================
 // Security options: auth and CORS
 // ==========================================================================
@@ -522,6 +613,8 @@ async fn test_server_token_protects_reads_and_sse_by_default() {
 
     let (status, _) = json_request(app.clone(), "GET", "/api/trial_count", None).await;
     assert_eq!(status, 401, "reads must be protected by default");
+    let (status, _) = json_request(app.clone(), "GET", "/api/trial/0/status", None).await;
+    assert_eq!(status, 401, "trial lifecycle reads must be protected");
 
     let (status, _) = json_request_with_headers(
         app.clone(),
@@ -532,6 +625,19 @@ async fn test_server_token_protects_reads_and_sse_by_default() {
     )
     .await;
     assert_eq!(status, 200);
+    let (status, lifecycle) = json_request_with_headers(
+        app.clone(),
+        "GET",
+        "/api/trial/0/status",
+        None,
+        &[("authorization", "Bearer secret")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        lifecycle,
+        json!({"status": "ok", "trial_id": 0, "state": "not_pending"})
+    );
 
     // SSE stream is open too. Check the initial response status only; the body
     // is a long-lived stream, so don't consume it.
