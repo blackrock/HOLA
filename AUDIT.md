@@ -18,12 +18,13 @@ each finding to the canonical implementation and verification evidence.
 | Original audit repository/commit | `epicycloids/robopt` @ `3ca4169` |
 | Canonical remediation repository | `blackrock/HOLA` |
 | Canonical baseline | `cbd17256cf950fccc4d7828ab6475002b4c22747` (`hola-upstream/main`) |
-| Remediation branch | `wip` |
-| Remediation form | Local worktree; commit/PR pending |
+| Remediation branch | `agent/audit-remediation` |
+| Remediation form | [Draft pull request #35](https://github.com/blackrock/HOLA/pull/35) |
 | Local Rust toolchain | `rustc 1.92.0`, `cargo 1.92.0` |
 | MSRV verified | Rust 1.87.0 |
 | Local Python | CPython 3.14 |
-| Closure date | 2026-07-10 |
+| Local closure date | 2026-07-10 |
+| Hosted CI verification date | 2026-07-14 |
 
 | Severity | Original findings | Open after remediation |
 | --- | ---: | ---: |
@@ -42,10 +43,10 @@ accessibility, and test quality.
 ## Tracking Conventions
 
 - `[ ]` means open.
-- `[x]` means fixed and verified locally, with any unavailable platform/browser
-  verification encoded as a required hosted or release gate.
-- Do not delete closed findings. The closure matrix below is the fixing and
-  verification record until the worktree is committed and a PR exists.
+- `[x]` means fixed and verified, with any unavailable browser or release
+  verification encoded as a required release gate.
+- Do not delete closed findings. The closure matrix below is the durable fixing
+  and verification record.
 - If a fix intentionally changes scope, record the decision under the finding.
 - Severity reflects the reviewed deployment model, including a network-reachable
   distributed server. A strictly local-only deployment may lower some security
@@ -428,9 +429,10 @@ accessibility, and test quality.
 
 ## Closure Matrix
 
-All resolutions below are in the local remediation worktree based on canonical
-commit `cbd1725`. “Full suite” refers to the verification snapshot immediately
-following this table.
+All resolutions below are on `agent/audit-remediation`, based on canonical
+commit `cbd1725` and published as
+[draft pull request #35](https://github.com/blackrock/HOLA/pull/35). “Full
+suite” refers to the verification snapshot immediately following this table.
 
 | ID | Resolution | Focused evidence |
 | --- | --- | --- |
@@ -477,9 +479,9 @@ following this table.
 | WEB-003 | SSE has IDs, replay/reset/lag/keepalive; clients take a cursor before snapshots, upsert replays, generation-guard live/offline transitions, and fully resync on `ObjectivesChanged`. | Snapshot-gap, objective-change, reconnect, stale-resync, history-expiry, lag, and replay tests pass. |
 | WEB-004 | Export is explicitly a versioned dashboard analysis export, not mislabeled as an engine checkpoint; imports accept supported engine/dashboard shapes. | Export/import schema tests and documentation label the scope. |
 | WEB-005 | Dashboard is dependency-free/offline, CSP-compatible, keyboard/ARIA labeled, responsive, reduced-motion aware, and canvas text alternatives are present. | Static accessibility/XSS tests plus the required real-browser release checklist. |
-| CI-001 | The exact format, strict Clippy, warnings-as-errors tests, and Rustdoc commands are green; CI runs Rust on Linux/macOS/Windows. | Local exact commands pass; hosted matrix is mandatory on push/PR. |
-| CI-002 | CI builds a wheel for every supported Python minor, installs that exact artifact, then runs isolated tests outside the source tree; Ruff/ty/wheel/sdist contents are also gated. | Local maturin build, 241 Python tests, and 146 tests from a clean installed wheel pass. |
-| CI-003 | Rust/Python/npm audit jobs use current pinned tooling and trigger on every relevant lockfile. | `cargo audit`, pinned pip-audit, and `npm audit --audit-level=high` are clean. |
+| CI-001 | The exact format, strict Clippy, warnings-as-errors tests, and Rustdoc commands are green; CI runs Rust on Linux/macOS/Windows. | Local exact commands and the [hosted OS/MSRV matrix](https://github.com/blackrock/HOLA/actions/runs/29355345220) pass. |
+| CI-002 | CI builds a wheel for every supported Python minor, installs that exact artifact, then runs isolated tests outside the source tree; Ruff/ty/wheel/sdist contents are also gated. | Local maturin build, 241 Python tests, 146 tests from a clean installed wheel, and the [Python 3.10–3.14 hosted matrix](https://github.com/blackrock/HOLA/actions/runs/29355345220) pass. |
+| CI-003 | Rust/Python/npm audit jobs use current pinned tooling and trigger on every relevant lockfile. | `cargo audit`, pinned pip-audit, and `npm audit --audit-level=high` are clean locally and in the [hosted security workflow](https://github.com/blackrock/HOLA/actions/runs/29355344663). |
 | CI-004 | Rust, uv, Node, pip-audit, actions, and lockfiles are pinned; jobs have timeouts/concurrency cancellation. Python minor selectors intentionally track the latest security patch. | Workflow parse, 45-action SHA policy, and locked local commands pass. |
 | CI-005 | CI covers three Rust OSes, Python 3.10–3.14, MSRV/minimal features, real CLI workers, docs, dashboard, audits, artifacts, and gated performance probes. | Workflow/release matrices plus the release verification checklist. |
 | PKG-001 | Canonical HOLA's Apache-2.0-only policy is reflected in complete Cargo/PEP metadata with README/license files in every artifact. | Cargo package and wheel/sdist inspection script passes. |
@@ -492,15 +494,17 @@ following this table.
 | TEST-002 | Recovery coverage includes concurrent/failing writes, format-1 migration, retry receipts, leases, auth/CORS, real workers, SSE replay/reset/lag, and bounded shutdown. | Rust/Python/CLI suites and platform/manual fault gates. |
 | TEST-003 | Dashboard, packaging, performance, offline/accessibility, and release-platform checks are automated where deterministic and otherwise fail-closed in a recorded release checklist. | Twelve dashboard state tests + XSS, wheel/sdist/rebuilt-wheel inspection, gated 100k probes, and `docs/release-checklist.md`. |
 
-Hosted jobs and the manual browser/platform checklist cannot run until this
-local worktree is committed and pushed. The first PR must attach those results;
-the workflow and release gates are part of this remediation and fail closed.
+The hosted CI and security jobs pass on
+[pull request #35](https://github.com/blackrock/HOLA/pull/35). The real-browser,
+accessibility, mobile, offline, signal-recovery, and release-artifact items in
+`docs/release-checklist.md` remain fail-closed release gates.
 
 ## Verification Snapshot
 
-These are the final local remediation results on 2026-07-10. Hosted OS,
-architecture, and real-browser results remain required PR/release evidence; they
-are gates, not waivers.
+These are the final local remediation results on 2026-07-10. Hosted CI results
+for the published remediation are recorded below. Real-browser and release
+architecture results remain required release evidence; they are gates, not
+waivers.
 
 | Check | Final local result |
 | --- | --- |
@@ -518,9 +522,18 @@ are gates, not waivers.
 | Workflow policy | All 3 workflows parse; all 45 external action references are pinned to full commit SHAs. |
 | Checkpoint determinism | The exact finite-float pending replay regression passed 50 consecutive runs. |
 
-## Commit and Hosted Follow-up
+### Hosted Verification (2026-07-14)
 
-The remediation remains an uncommitted local worktree. After committing and
-pushing it to `blackrock/HOLA`, attach the hosted CI matrix and the completed
-browser, accessibility, mobile, offline, signal-recovery, and package-install
-items from `docs/release-checklist.md` to the first pull request.
+| Check | Hosted result |
+| --- | --- |
+| CI matrix | [Run 29355345220](https://github.com/blackrock/HOLA/actions/runs/29355345220) passed: Rust on Ubuntu, macOS, and Windows; Rust 1.87 MSRV; Python 3.10–3.14 exact-wheel tests; and real CLI workers on Ubuntu, macOS, and Windows. |
+| Security audit | [Run 29355344663](https://github.com/blackrock/HOLA/actions/runs/29355344663) passed `cargo audit`, pinned `pip-audit`, and `npm audit --audit-level=high`. |
+
+## Commit and Release Follow-up
+
+The remediation is committed and published in
+[draft pull request #35](https://github.com/blackrock/HOLA/pull/35), whose
+automated checks are green. Before release, complete the browser,
+accessibility, mobile, offline, signal-recovery, architecture, and package-install
+items from `docs/release-checklist.md`, then record their evidence with the
+release.
