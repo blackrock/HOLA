@@ -5,40 +5,50 @@
 
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
-HOLA_PY_DIR = Path(__file__).parent.parent
+BENCHMARK_MODULES = (
+    "benchmarks.adapters.base",
+    "benchmarks.adapters.hola_adapter",
+    "benchmarks.adapters.igr_adapter",
+    "benchmarks.adapters.optuna_adapter",
+    "benchmarks.adapters.pymoo_multi",
+    "benchmarks.adapters.pymoo_single",
+    "benchmarks.data.normalize",
+    "benchmarks.functions.dtlz",
+    "benchmarks.functions.grouped_tlp",
+    "benchmarks.functions.single_objective",
+    "benchmarks.functions.wfg",
+    "benchmarks.functions.zdt",
+    "benchmarks.problems.grouped_tlp",
+    "benchmarks.problems.multi_objective",
+    "benchmarks.problems.single_objective",
+    "benchmarks.runner.executor",
+)
 
 
 @pytest.mark.benchmarks
-def test_benchmark_imports():
+def test_benchmark_imports(isolated_benchmarks_path, isolated_benchmarks_env):
     """All benchmark subpackages import successfully."""
-    import benchmarks.adapters.base  # noqa: F401
-    import benchmarks.adapters.hola_adapter  # noqa: F401
-    import benchmarks.adapters.igr_adapter  # noqa: F401
-    import benchmarks.adapters.optuna_adapter  # noqa: F401
-    import benchmarks.adapters.pymoo_multi  # noqa: F401
-    import benchmarks.adapters.pymoo_single  # noqa: F401
-    import benchmarks.data.normalize  # noqa: F401
-    import benchmarks.functions.dtlz  # noqa: F401
-    import benchmarks.functions.grouped_tlp  # noqa: F401
-    import benchmarks.functions.single_objective  # noqa: F401
-    import benchmarks.functions.wfg  # noqa: F401
-    import benchmarks.functions.zdt  # noqa: F401
-    import benchmarks.problems.grouped_tlp  # noqa: F401
-    import benchmarks.problems.multi_objective  # noqa: F401
-    import benchmarks.problems.single_objective  # noqa: F401
-    import benchmarks.runner.executor  # noqa: F401
+    result = subprocess.run(
+        [sys.executable, "-c", ";".join(f"import {module}" for module in BENCHMARK_MODULES)],
+        cwd=str(isolated_benchmarks_path),
+        env=isolated_benchmarks_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, f"Benchmark imports failed:\n{result.stderr[-2000:]}"
 
 
 @pytest.mark.benchmarks
-def test_benchmark_cli_help():
+def test_benchmark_cli_help(isolated_benchmarks_path, isolated_benchmarks_env):
     """Benchmark CLI parses --help without error."""
     result = subprocess.run(
         [sys.executable, "-m", "benchmarks", "--help"],
-        cwd=str(HOLA_PY_DIR),
+        cwd=str(isolated_benchmarks_path),
+        env=isolated_benchmarks_env,
         capture_output=True,
         text=True,
         timeout=10,
@@ -48,7 +58,7 @@ def test_benchmark_cli_help():
 
 
 @pytest.mark.benchmarks
-def test_benchmark_mini_run(tmp_path):
+def test_benchmark_mini_run(tmp_path, isolated_benchmarks_path, isolated_benchmarks_env):
     """Run a minimal single-objective benchmark to verify pipeline."""
     result = subprocess.run(
         [
@@ -67,7 +77,8 @@ def test_benchmark_mini_run(tmp_path):
             "--n-workers",
             "1",
         ],
-        cwd=str(HOLA_PY_DIR),
+        cwd=str(isolated_benchmarks_path),
+        env=isolated_benchmarks_env,
         capture_output=True,
         text=True,
         timeout=60,

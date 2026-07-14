@@ -18,13 +18,47 @@ All server/CLI fixtures use only stdlib (no requests/pyyaml dependencies).
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
+
+HOLA_PY_DIR = Path(__file__).resolve().parent.parent
+BENCHMARKS_DIR = HOLA_PY_DIR / "benchmarks"
+
+
+@pytest.fixture(scope="session")
+def isolated_benchmarks_path(tmp_path_factory):
+    """Copy repository-only benchmark helpers into an isolated import root.
+
+    Wheel tests need the benchmark package used by examples and smoke tests,
+    but adding ``hola-py`` itself to ``PYTHONPATH`` would shadow the installed
+    ``hola_opt`` wheel. Copying only ``benchmarks`` avoids that ambiguity and
+    is portable to Windows, where symlinks may require extra privileges.
+    """
+    import_root = tmp_path_factory.mktemp("benchmark-imports")
+    shutil.copytree(
+        BENCHMARKS_DIR,
+        import_root / "benchmarks",
+        ignore=shutil.ignore_patterns("__pycache__", "*.py[co]"),
+    )
+    return import_root
+
+
+@pytest.fixture
+def isolated_benchmarks_env(isolated_benchmarks_path):
+    """Return a subprocess environment exposing only copied benchmarks."""
+    env = os.environ.copy()
+    # Replace, rather than extend, inherited state so a caller-provided source
+    # path cannot make the repository's hola_opt shadow the installed wheel.
+    env["PYTHONPATH"] = str(isolated_benchmarks_path)
+    return env
+
 
 # ==========================================================================
 # Reusable spaces

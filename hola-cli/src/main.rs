@@ -1007,9 +1007,17 @@ fn shell_command(script: &str) -> Command {
 
 #[cfg(windows)]
 fn shell_command(script: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+
     let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
     let mut command = Command::new(shell);
-    command.arg("/D").arg("/S").arg("/C").arg(script);
+    command.arg("/D").arg("/S").arg("/C");
+    // `cmd.exe` does not use the C argv quoting rules applied by
+    // `Command::arg`. With `/S /C`, it strips the first and last quotes from
+    // the command string, so supply that outer pair explicitly and leave the
+    // user's shell command otherwise untouched. This preserves commands that
+    // begin with a quoted executable, such as `"python.exe" "script.py"`.
+    command.raw_arg(format!("\"{script}\""));
     command
 }
 
@@ -2249,6 +2257,23 @@ mod tests {
             .expect("platform shell should execute");
         assert!(!result.timed_out);
         assert_eq!(result.status.code(), Some(7));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn platform_shell_runs_leading_quoted_executable() {
+        let test_binary = std::env::current_exe().expect("test binary path should be available");
+        let script = format!("\"{}\" \"--list\"", test_binary.display());
+
+        let output = run_capped(shell_command(&script), Duration::from_secs(10))
+            .expect("platform shell should launch a quoted executable");
+        assert!(output.status.success(), "stderr: {}", output.stderr);
+        assert!(
+            output
+                .stdout
+                .contains("platform_shell_runs_leading_quoted_executable"),
+            "the quoted test executable should have listed its tests"
+        );
     }
 
     #[test]
