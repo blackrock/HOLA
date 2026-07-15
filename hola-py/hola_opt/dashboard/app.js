@@ -1232,7 +1232,7 @@ function renderConvergence() {
     const sy = value => pad.top + ph - (transformY(value) - yMin) / (yMax - yMin) * ph;
 
     ctx.font = '11px system-ui, sans-serif';
-    ctx.fillStyle = '#7070a0';
+    ctx.fillStyle = '#8c8cbc';
     ctx.strokeStyle = 'rgba(255,255,255,0.06)';
     ctx.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
@@ -1351,7 +1351,7 @@ function renderPareto() {
     }
 
     // Axis labels
-    ctx.fillStyle = '#7070a0';
+    ctx.fillStyle = '#8c8cbc';
     ctx.font = '11px Inter';
     ctx.textAlign = 'center';
     ctx.fillText(xField, pad.left + pw / 2, h - 5);
@@ -1362,7 +1362,7 @@ function renderPareto() {
     ctx.restore();
 
     // Axis tick labels
-    ctx.fillStyle = '#555';
+    ctx.fillStyle = '#8c8cbc';
     ctx.font = '10px JetBrains Mono, monospace';
     ctx.textAlign = 'center';
     for (let i = 0; i <= 4; i++) {
@@ -1639,7 +1639,7 @@ function renderParallel() {
     ctx.strokeStyle = 'rgba(255,255,255,0.1)';
     ctx.lineWidth = 1;
     ctx.font = '10px Inter';
-    ctx.fillStyle = '#7070a0';
+    ctx.fillStyle = '#8c8cbc';
     ctx.textAlign = 'center';
     for (let i = 0; i < n; i++) {
         const x = pad.left + i * gap;
@@ -1649,7 +1649,7 @@ function renderParallel() {
         ctx.stroke();
         ctx.fillText(names[i], x, h - 8);
         // Min/max labels (show choice labels for categorical)
-        ctx.fillStyle = '#555';
+        ctx.fillStyle = '#8c8cbc';
         if (ranges[i].categorical && ranges[i].choices) {
             const choices = ranges[i].choices;
             ctx.fillText(choices[choices.length - 1], x, pad.top - 6);
@@ -1658,7 +1658,7 @@ function renderParallel() {
             ctx.fillText(fmt(ranges[i].max), x, pad.top - 6);
             ctx.fillText(fmt(ranges[i].min), x, pad.top + ph + 14);
         }
-        ctx.fillStyle = '#7070a0';
+        ctx.fillStyle = '#8c8cbc';
     }
 
     // Resolve a param value to a numeric value for the axis
