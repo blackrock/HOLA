@@ -22,6 +22,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const DASHBOARD_DIR = resolve(HERE, '..');
 const APP_JS = resolve(DASHBOARD_DIR, 'app.js');
 const INDEX_HTML = resolve(DASHBOARD_DIR, 'index.html');
+const STYLES_CSS = resolve(DASHBOARD_DIR, 'styles.css');
 
 function buildHtml() {
     const appSrc = readFileSync(APP_JS, 'utf8');
@@ -77,7 +78,9 @@ function createDom(fetchImpl = () => new Promise(() => {})) {
         beginPath() {},
         clearRect() {},
         fill() {},
-        fillText(text, x, y) { canvasCalls.push({ op: 'fillText', text, x, y }); },
+        fillText(text, x, y) {
+            canvasCalls.push({ op: 'fillText', text, x, y, fillStyle: this.fillStyle });
+        },
         lineTo(x, y) { canvasCalls.push({ op: 'lineTo', x, y }); },
         moveTo(x, y) { canvasCalls.push({ op: 'moveTo', x, y }); },
         restore() {},
@@ -257,6 +260,159 @@ test('mixed-space rendering and sorting preserve declared categorical order', ()
     } finally {
         dom.window.close();
     }
+});
+
+test('long Pareto axis names can wrap and shrink on narrow viewports', () => {
+    const { dom, window } = createDom();
+    try {
+        const style = window.document.createElement('style');
+        style.textContent = readFileSync(STYLES_CSS, 'utf8');
+        window.document.head.appendChild(style);
+        window.applyCheckpointData({
+            format: 'hola-dashboard-export',
+            space: [],
+            objectives: [
+                { field: 'validation_cross_entropy_loss', obj_type: 'minimize' },
+                { field: 'inference_latency_milliseconds', obj_type: 'minimize' },
+            ],
+            trials: [{
+                trial_id: 0,
+                metrics: {
+                    validation_cross_entropy_loss: 0.25,
+                    inference_latency_milliseconds: 12,
+                },
+                score_vector: {
+                    validation_cross_entropy_loss: 0.25,
+                    inference_latency_milliseconds: 12,
+                },
+                rank: 0,
+                pareto_front: 0,
+            }],
+        });
+
+        const selectors = window.document.querySelector('.axis-selectors');
+        assert.equal(window.getComputedStyle(selectors).flexWrap, 'wrap');
+        for (const label of selectors.querySelectorAll('label')) {
+            const labelStyle = window.getComputedStyle(label);
+            assert.equal(labelStyle.minWidth, '0');
+            assert.equal(labelStyle.maxWidth, '100%');
+        }
+        for (const select of selectors.querySelectorAll('select')) {
+            const selectStyle = window.getComputedStyle(select);
+            assert.equal(selectStyle.minWidth, '0');
+            assert.equal(selectStyle.maxWidth, '100%');
+        }
+    } finally {
+        dom.window.close();
+    }
+});
+
+test('objective actions can wrap and shrink under zoom', () => {
+    const { dom, window } = createDom();
+    try {
+        const style = window.document.createElement('style');
+        style.textContent = readFileSync(STYLES_CSS, 'utf8');
+        window.document.head.appendChild(style);
+        const actions = window.document.querySelector('#objectives-card .card-header > div');
+        const actionsStyle = window.getComputedStyle(actions);
+        assert.equal(actionsStyle.flexWrap, 'wrap');
+        assert.equal(actionsStyle.minWidth, '0');
+        assert.equal(actionsStyle.maxWidth, '100%');
+        for (const input of window.document.querySelectorAll(
+            '#connect-panel input[type="text"], #connect-panel input[type="password"]',
+        )) {
+            const inputStyle = window.getComputedStyle(input);
+            assert.equal(inputStyle.minWidth, '0');
+        }
+    } finally {
+        dom.window.close();
+    }
+});
+
+test('secondary and canvas text retain WCAG AA contrast with safety margin', () => {
+    const css = readFileSync(STYLES_CSS, 'utf8');
+    const app = readFileSync(APP_JS, 'utf8');
+    const token = name => {
+        const match = css.match(new RegExp(`${name}:\\s*(#[0-9a-f]{6})`, 'i'));
+        assert.ok(match, `missing ${name} color token`);
+        return match[1];
+    };
+    const luminance = hex => {
+        const channels = hex.match(/[0-9a-f]{2}/gi).map(channel => {
+            const value = Number.parseInt(channel, 16) / 255;
+            return value <= 0.04045
+                ? value / 12.92
+                : ((value + 0.055) / 1.055) ** 2.4;
+        });
+        return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+    };
+    const contrast = (foreground, background) => {
+        const values = [luminance(foreground), luminance(background)]
+            .sort((left, right) => right - left);
+        return (values[0] + 0.05) / (values[1] + 0.05);
+    };
+
+    const backgrounds = ['--bg-0', '--bg-1', '--bg-2', '--bg-3'];
+    const assertReadable = (foreground, context) => {
+        for (const background of backgrounds) {
+            const ratio = contrast(foreground, token(background));
+            assert.ok(
+                ratio >= 4.75,
+                `${context} ${foreground} on ${background} is only ${ratio}:1`,
+            );
+        }
+    };
+
+    assertReadable(token('--text-2'), 'secondary text');
+
+    // Canvas text does not inherit CSS variables. Exercise every chart renderer
+    // and capture the effective fillStyle at each real fillText call so dynamic
+    // or refactored color assignments cannot silently evade this regression.
+    const { dom, window, canvasCalls } = createDom();
+    try {
+        for (const canvas of window.document.querySelectorAll('canvas')) {
+            Object.defineProperty(canvas.parentElement, 'clientWidth', {
+                configurable: true,
+                value: 640,
+            });
+        }
+        window.applyCheckpointData({
+            format: 'hola-dashboard-export',
+            space: [
+                { name: 'learning_rate', type: 'real', min: 0.001, max: 0.1 },
+                { name: 'optimizer', type: 'categorical', choices: ['adam', 'sgd'] },
+            ],
+            objectives: [
+                { field: 'loss', obj_type: 'minimize' },
+                { field: 'latency', obj_type: 'minimize' },
+            ],
+            trials: [{
+                trial_id: 0,
+                params: { learning_rate: 0.01, optimizer: 'adam' },
+                metrics: { loss: 0.25, latency: 12 },
+                score_vector: { loss: 0.25, latency: 12 },
+                rank: 0,
+                pareto_front: 0,
+            }],
+        });
+        window.renderConvergence();
+        window.renderPareto();
+        window.renderParallel();
+
+        const textCalls = canvasCalls.filter(call => call.op === 'fillText');
+        assert.ok(textCalls.length > 0, 'expected rendered canvas text');
+        for (const call of textCalls) {
+            assert.match(
+                call.fillStyle,
+                /^#[0-9a-f]{6}$/i,
+                `canvas text ${JSON.stringify(call.text)} must use an auditable hex color`,
+            );
+            assertReadable(call.fillStyle, `canvas text ${JSON.stringify(call.text)}`);
+        }
+    } finally {
+        dom.window.close();
+    }
+    assert.doesNotMatch(app, /#(?:555(?:555)?|7070a0)\b/i);
 });
 
 test('live appends replace scalar best and demote dominated Pareto-front trials', () => {

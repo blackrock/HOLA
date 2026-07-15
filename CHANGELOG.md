@@ -35,7 +35,8 @@
   the versioned dashboard in editable trees, wheels, and source distributions.
 - The dashboard is dependency-free/offline-capable, renders untrusted data as
   inert text, preserves categorical checkpoint metadata, closes snapshot/SSE
-  races with replay cursors, and uses indexed incremental caches for bounded
+  races with replay cursors, keeps controls reachable at narrow viewports,
+  meets AA text contrast, and uses indexed incremental caches for bounded
   six-figure rendering.
 - CI pins toolchains and actions, tests the supported OS/Python/MSRV surfaces,
   audits dependencies, builds release artifacts for supported platforms, and

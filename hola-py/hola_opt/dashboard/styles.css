@@ -23,7 +23,7 @@ limitations under the License.
   --border-glow: #3a3a5e;
   --text-0: #e8e8f0;
   --text-1: #b0b0c8;
-  --text-2: #7070a0;
+  --text-2: #8c8cbc;
   --accent: #6c5ce7;
   --accent-bright: #a29bfe;
   --accent-dim: #4834d4;
@@ -100,6 +100,11 @@ body {
   letter-spacing: 0.08em;
   color: var(--text-2);
 }
+#objectives-card .card-header > div {
+  flex-wrap: wrap;
+  min-width: 0;
+  max-width: 100%;
+}
 
 /* ==========================================================================
    Status Bar
@@ -150,6 +155,7 @@ body {
 #connect-panel input[type="text"],
 #connect-panel input[type="password"] {
   flex: 1;
+  min-width: 0;
   max-width: 400px;
   padding: 8px 14px;
   background: var(--bg-2);
@@ -229,6 +235,7 @@ button:disabled {
   display: flex;
   gap: 12px;
   align-items: center;
+  flex-wrap: wrap;
   margin-bottom: 8px;
 }
 .axis-selectors label {
@@ -237,7 +244,10 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 4px;
+  min-width: 0;
+  max-width: 100%;
 }
+.axis-selectors select { min-width: 0; max-width: 100%; }
 select {
   padding: 4px 8px;
   background: var(--bg-2);
@@ -436,7 +446,12 @@ input[type="file"] { display: none; }
   #status-bar { gap: 10px; padding: 10px 12px; }
   #connect-panel { width: 100%; flex-wrap: wrap; padding: 8px 0 0; }
   #connect-panel input[type="text"],
-  #connect-panel input[type="password"] { flex: 1 1 100%; max-width: none; }
+  #connect-panel input[type="password"] {
+    flex: 1 1 100%;
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+  }
   .card { padding: 12px; }
   .card-header { align-items: flex-start; gap: 8px; flex-wrap: wrap; }
   canvas { max-width: 100%; }
