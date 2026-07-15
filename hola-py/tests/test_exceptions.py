@@ -12,6 +12,8 @@
 """Public exception hierarchy and error-mapping regressions."""
 
 import socket
+import threading
+from contextlib import suppress
 
 import pytest
 
@@ -58,32 +60,40 @@ def test_remote_transport_and_url_errors_are_distinct():
     with pytest.raises(ConfigurationError, match="Invalid server URL"):
         Study.connect("not-a-url")
 
-    # Select a kernel-assigned loopback port, then close it before connecting.
-    # Keeping a bound socket open without listening can blackhole the SYN until
-    # timeout on macOS and Windows instead of producing a connection refusal.
-    raised = None
-    unexpected_errors = []
-    for _ in range(3):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reserved_socket:
-            reserved_socket.bind(("127.0.0.1", 0))
-            host, port = reserved_socket.getsockname()
-        remote = Study.connect(
-            f"http://{host}:{port}",
-            connect_timeout=1.0,
-            request_timeout=1.0,
-        )
-        try:
-            remote.ask()
-        except RemoteError as error:
-            if "HTTP connection failed" in str(error):
-                raised = error
-                break
-            unexpected_errors.append(str(error))
-        else:
-            unexpected_errors.append("request unexpectedly succeeded")
+    # An active listener avoids OS-specific closed-port behavior (Windows can
+    # silently drop loopback SYNs). Sending plaintext to an HTTPS client forces
+    # a deterministic connector-stage TLS failure on every supported platform.
+    server_errors = []
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(2.0)
+        host, port = listener.getsockname()
 
-    assert raised is not None, f"no connection-refused error after 3 attempts: {unexpected_errors}"
-    assert isinstance(raised, ValueError)
+        def serve_plaintext_once():
+            try:
+                connection, _ = listener.accept()
+                with connection, suppress(BrokenPipeError, ConnectionResetError):
+                    connection.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            except OSError as error:
+                server_errors.append(error)
+
+        thread = threading.Thread(target=serve_plaintext_once, daemon=True)
+        thread.start()
+        try:
+            remote = Study.connect(
+                f"https://{host}:{port}",
+                connect_timeout=1.0,
+                request_timeout=2.0,
+            )
+            with pytest.raises(RemoteError, match="HTTP connection failed") as raised:
+                remote.ask()
+        finally:
+            thread.join(timeout=3.0)
+
+        assert not thread.is_alive(), "plaintext TLS test server did not finish"
+        assert not server_errors, f"plaintext TLS test server failed: {server_errors}"
+    assert isinstance(raised.value, ValueError)
 
 
 def test_invalid_objective_result_raises_objective_error():
