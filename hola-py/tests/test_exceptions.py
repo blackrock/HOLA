@@ -58,19 +58,32 @@ def test_remote_transport_and_url_errors_are_distinct():
     with pytest.raises(ConfigurationError, match="Invalid server URL"):
         Study.connect("not-a-url")
 
-    # Hold a kernel-assigned port without listening so connects are refused and
-    # another process cannot claim the port before remote.ask() uses it.
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reserved_socket:
-        reserved_socket.bind(("127.0.0.1", 0))
-        host, port = reserved_socket.getsockname()
+    # Select a kernel-assigned loopback port, then close it before connecting.
+    # Keeping a bound socket open without listening can blackhole the SYN until
+    # timeout on macOS and Windows instead of producing a connection refusal.
+    raised = None
+    unexpected_errors = []
+    for _ in range(3):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reserved_socket:
+            reserved_socket.bind(("127.0.0.1", 0))
+            host, port = reserved_socket.getsockname()
         remote = Study.connect(
             f"http://{host}:{port}",
-            connect_timeout=0.1,
-            request_timeout=0.1,
+            connect_timeout=1.0,
+            request_timeout=1.0,
         )
-        with pytest.raises(RemoteError, match="HTTP connection failed") as raised:
+        try:
             remote.ask()
-    assert isinstance(raised.value, ValueError)
+        except RemoteError as error:
+            if "HTTP connection failed" in str(error):
+                raised = error
+                break
+            unexpected_errors.append(str(error))
+        else:
+            unexpected_errors.append("request unexpectedly succeeded")
+
+    assert raised is not None, f"no connection-refused error after 3 attempts: {unexpected_errors}"
+    assert isinstance(raised, ValueError)
 
 
 def test_invalid_objective_result_raises_objective_error():

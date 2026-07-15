@@ -36,11 +36,14 @@
 - The dashboard is dependency-free/offline-capable, renders untrusted data as
   inert text, preserves categorical checkpoint metadata, closes snapshot/SSE
   races with replay cursors, keeps controls reachable at narrow viewports,
-  meets AA text contrast, and uses indexed incremental caches for bounded
-  six-figure rendering.
+  keeps focus through keyboard table-sort cycles, disambiguates overlapping
+  parameter and metric columns, meets AA text contrast, and uses indexed
+  incremental caches for bounded six-figure rendering.
 - CI pins toolchains and actions, tests the supported OS/Python/MSRV surfaces,
-  audits dependencies, builds release artifacts for supported platforms, and
-  verifies package metadata, licenses, docs, and dashboard contracts.
+  audits dependencies on the exact release commit, builds release artifacts
+  for supported platforms, emits GitHub provenance for every workflow-uploaded
+  wheel, source distribution, and CLI archive, and verifies package metadata,
+  licenses, docs, and dashboard contracts.
 
 ## 1.0.1-rc7
 

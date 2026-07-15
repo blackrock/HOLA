@@ -28,7 +28,6 @@ const S = {
     objectives: [],           // [{field, type, target, limit, priority, group}]
     serverObjectives: [],    // snapshot of objectives as fetched from the server
     paramNames: [],
-    paramNameSet: new Set(),
     metricNames: [],
     metricCounts: new Map(),
     metricExtents: new Map(),
@@ -45,6 +44,7 @@ const S = {
     paretoCache: null,
     tableCache: null,
     sortCol: null,
+    sortColumn: null,
     sortAsc: true,
     lastTrialTime: null,
     previewActive: false,    // true when client-side rescalarization is active
@@ -415,7 +415,6 @@ async function fetchCompletedTrial(trialId, serverUrl = S.serverUrl) {
 
 function setParamNames(names) {
     S.paramNames = Array.isArray(names) ? names : [];
-    S.paramNameSet = new Set(S.paramNames);
 }
 
 function scoreGroupWidth(trial) {
@@ -627,6 +626,7 @@ function replaceTrials(trials) {
     S.metricNames = [...S.metricCounts.keys()].sort();
     S.paretoCache = null;
     S.tableCache = null;
+    reconcileTableSort();
     rebuildBestAndConvergence();
 }
 
@@ -682,7 +682,7 @@ function upsertTrial(trial) {
         appendConvergenceTrial(trial);
     }
     if (!changedObjectiveShape) updateParetoCacheForAppend(trial, idx, demoted);
-    if (demoted.length > 0 && S.sortCol === 'rank') S.tableCache = null;
+    if (demoted.length > 0 && S.sortColumn?.key === 'builtin:rank') S.tableCache = null;
     else updateTableCacheForAppend(trial, idx);
     return true;
 }
@@ -1718,25 +1718,69 @@ function fmt(v) {
 // ============================================================================
 // Trial Table
 // ============================================================================
+function getTableColumns() {
+    const columns = [
+        { source: 'builtin', name: 'trial_id' },
+        { source: 'builtin', name: 'rank' },
+        ...S.paramNames.map(name => ({ source: 'param', name })),
+        ...S.metricNames.map(name => ({ source: 'metric', name })),
+    ];
+    const nameCounts = new Map();
+    for (const column of columns) {
+        nameCounts.set(column.name, (nameCounts.get(column.name) || 0) + 1);
+    }
+    const sourceLabels = { builtin: 'trial field', param: 'parameter', metric: 'metric' };
+    const sourcePrefixes = { builtin: 'trial', param: 'param', metric: 'metric' };
+    const usedLabels = new Set();
+    return columns.map(column => {
+        const baseLabel = nameCounts.get(column.name) > 1
+            ? `${sourcePrefixes[column.source]} · ${column.name}`
+            : column.name;
+        let label = baseLabel;
+        for (let suffix = 2; usedLabels.has(label); suffix++) label = `${baseLabel} [${suffix}]`;
+        usedLabels.add(label);
+        return {
+            ...column,
+            key: `${column.source}:${column.name}`,
+            label,
+            accessibleLabel: `${sourceLabels[column.source]} ${column.name}`,
+        };
+    });
+}
+
+function reconcileTableSort() {
+    if (!S.sortColumn) return;
+    const replacement = getTableColumns()
+        .find(column => column.key === S.sortColumn.key);
+    if (replacement) {
+        S.sortCol = replacement.name;
+        S.sortColumn = replacement;
+    } else {
+        S.sortCol = null;
+        S.sortColumn = null;
+        S.sortAsc = true;
+    }
+}
+
 function renderTable() {
     const thead = document.getElementById('trial-thead').querySelector('tr');
     const tbody = document.getElementById('trial-tbody');
 
     // Build columns
-    const cols = ['trial_id', 'rank', ...S.paramNames, ...S.metricNames];
+    const cols = getTableColumns();
 
     clearElement(thead);
-    for (const c of cols) {
+    for (const [columnIndex, c] of cols.entries()) {
         const th = document.createElement('th');
         th.scope = 'col';
-        if (S.sortCol === c) {
+        if (S.sortColumn?.key === c.key) {
             th.className = S.sortAsc ? 'sorted-asc' : 'sorted-desc';
             th.setAttribute('aria-sort', S.sortAsc ? 'ascending' : 'descending');
         }
         const button = document.createElement('button');
         button.type = 'button';
-        button.textContent = c;
-        button.setAttribute('aria-label', `Sort trials by ${c}`);
+        button.textContent = c.label;
+        button.setAttribute('aria-label', `Sort trials by ${c.accessibleLabel}`);
         // Keep native button keyboard semantics without changing the compact
         // table-header appearance.
         button.style.background = 'transparent';
@@ -1749,14 +1793,21 @@ function renderTable() {
         button.style.textAlign = 'inherit';
         button.style.width = '100%';
         button.style.cursor = 'pointer';
-        button.addEventListener('click', () => sortTable(c));
+        button.addEventListener('click', () => {
+            const restoreFocus = document.activeElement === button;
+            sortTable(c);
+            if (restoreFocus) {
+                const replacement = thead.children[columnIndex]?.querySelector('button');
+                replacement?.focus({ preventScroll: true });
+            }
+        });
         th.appendChild(button);
         thead.appendChild(th);
     }
 
     const maxRows = 1000;
     let rows;
-    if (S.sortCol) {
+    if (S.sortColumn) {
         rows = getSortedTableEntries(maxRows).map(entry => entry.trial);
     } else {
         // The unsorted view is newest-first-at-the-bottom and only needs the
@@ -1782,11 +1833,13 @@ function renderTable() {
     }
 }
 
-function getCellValue(trial, col) {
-    if (col === 'trial_id') return trial.trial_id;
-    if (col === 'rank') return trial.rank;
-    if (S.paramNameSet.has(col)) return trial.params?.[col] ?? NaN;
-    return trial.metrics?.[col] ?? NaN;
+function getCellValue(trial, column) {
+    if (!column) return NaN;
+    if (column.source === 'builtin' && column.name === 'trial_id') return trial.trial_id;
+    if (column.source === 'builtin' && column.name === 'rank') return trial.rank;
+    if (column.source === 'param') return trial.params?.[column.name] ?? NaN;
+    if (column.source === 'metric') return trial.metrics?.[column.name] ?? NaN;
+    return NaN;
 }
 
 // Normalize a raw cell value to a sortable form: the string 'inf'/'-inf'
@@ -1841,15 +1894,15 @@ function compareCellValues(a, b, asc, column = null) {
 }
 
 function tableCacheKey() {
-    return `${S.sortCol}\u0000${S.sortAsc ? 'asc' : 'desc'}`;
+    return `${S.sortColumn?.key || ''}\u0000${S.sortAsc ? 'asc' : 'desc'}`;
 }
 
 function compareTableEntries(a, b) {
     const cmp = compareCellValues(
-        getCellValue(a.trial, S.sortCol),
-        getCellValue(b.trial, S.sortCol),
+        getCellValue(a.trial, S.sortColumn),
+        getCellValue(b.trial, S.sortColumn),
         S.sortAsc,
-        S.sortCol,
+        S.sortColumn?.source === 'param' ? S.sortColumn.name : null,
     );
     return cmp || a.index - b.index;
 }
@@ -1931,14 +1984,24 @@ function fmtCell(v) {
     return String(v);
 }
 
-function sortTable(col) {
-    if (S.sortCol !== col) {
-        S.sortCol = col;
+function sortTable(column) {
+    let resolved = column;
+    if (typeof column === 'string') {
+        const columns = getTableColumns();
+        resolved = columns.find(candidate => candidate.key === column)
+            || columns.find(candidate => candidate.name === column);
+    }
+    if (!resolved) return;
+    if (S.sortColumn?.key !== resolved.key) {
+        S.sortCol = resolved.name;
+        S.sortColumn = resolved;
         S.sortAsc = true;
     } else if (S.sortAsc) {
+        S.sortColumn = resolved;
         S.sortAsc = false;
     } else {
         S.sortCol = null;
+        S.sortColumn = null;
         S.sortAsc = true;
     }
     S.tableCache = null;
