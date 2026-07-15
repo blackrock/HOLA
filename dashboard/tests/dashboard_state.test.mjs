@@ -237,26 +237,147 @@ test('mixed-space rendering and sorting preserve declared categorical order', ()
         assert.equal(optimizerHeader().querySelector('button')?.type, 'button');
         assert.equal(optimizerHeader().querySelector('button')?.tabIndex, 0);
 
-        optimizerHeader().querySelector('button').click();
+        let optimizerButton = optimizerHeader().querySelector('button');
+        optimizerButton.focus();
+        assert.equal(window.document.activeElement, optimizerButton);
+        optimizerButton.click();
+        optimizerButton = optimizerHeader().querySelector('button');
+        assert.equal(window.document.activeElement, optimizerButton);
         let rows = [...window.document.querySelectorAll('#trial-tbody tr')];
         assert.equal(rows[0].children[optimizerColumn].textContent, 'zeta');
         assert.equal(rows[1].children[optimizerColumn].textContent, 'alpha');
         assert.equal(optimizerHeader().getAttribute('aria-sort'), 'ascending');
         assert.equal(window.document.querySelectorAll('#trial-thead th[aria-sort]').length, 1);
 
-        optimizerHeader().querySelector('button').click();
+        optimizerButton.click();
+        optimizerButton = optimizerHeader().querySelector('button');
+        assert.equal(window.document.activeElement, optimizerButton);
         rows = [...window.document.querySelectorAll('#trial-tbody tr')];
         assert.equal(rows[0].children[optimizerColumn].textContent, 'alpha');
         assert.equal(rows[1].children[optimizerColumn].textContent, 'zeta');
         assert.equal(optimizerHeader().getAttribute('aria-sort'), 'descending');
 
-        optimizerHeader().querySelector('button').click();
+        optimizerButton.click();
+        optimizerButton = optimizerHeader().querySelector('button');
+        assert.equal(window.document.activeElement, optimizerButton);
         rows = [...window.document.querySelectorAll('#trial-tbody tr')];
         assert.equal(window.S.sortCol, null);
         assert.equal(optimizerHeader().getAttribute('aria-sort'), null);
         assert.equal(window.document.querySelectorAll('#trial-thead th[aria-sort]').length, 0);
         assert.equal(rows[0].children[optimizerColumn].textContent, 'alpha');
         assert.equal(rows[1].children[optimizerColumn].textContent, 'zeta');
+    } finally {
+        dom.window.close();
+    }
+});
+
+test('sort focus remains on the exact header when column names overlap', () => {
+    const { dom, window } = createDom();
+    try {
+        window.applyCheckpointData({
+            format: 'hola-dashboard-export',
+            space: [
+                { name: 'overlap', type: 'categorical', choices: ['a', 'b'] },
+                { name: 'param · overlap', type: 'integer', min: 0, max: 10 },
+                { name: 'metric:overlap', type: 'integer', min: 0, max: 10 },
+            ],
+            objectives: [{ field: 'loss', obj_type: 'minimize' }],
+            trials: [
+                {
+                    trial_id: 0,
+                    params: { overlap: 'a', 'param · overlap': 3, 'metric:overlap': 9 },
+                    metrics: { loss: 0.2, overlap: 2 },
+                    score_vector: { loss: 0.2 },
+                },
+                {
+                    trial_id: 1,
+                    params: { overlap: 'b', 'param · overlap': 4, 'metric:overlap': 8 },
+                    metrics: { loss: 0.1, overlap: 1 },
+                    score_vector: { loss: 0.1 },
+                },
+            ],
+        });
+
+        const headerButtons = () => [...window.document.querySelectorAll('#trial-thead button')];
+        const labelsBeforeSort = headerButtons().map(button => button.textContent);
+        const namesBeforeSort = headerButtons().map(button => button.getAttribute('aria-label'));
+        assert.equal(new Set(labelsBeforeSort).size, labelsBeforeSort.length);
+        assert.equal(new Set(namesBeforeSort).size, namesBeforeSort.length);
+        assert.ok(labelsBeforeSort.includes('param · overlap'));
+        assert.ok(labelsBeforeSort.includes('param · overlap [2]'));
+        assert.ok(labelsBeforeSort.includes('metric · overlap'));
+
+        let metricButton = headerButtons()
+            .find(button => button.textContent === 'metric · overlap');
+        assert.equal(metricButton.getAttribute('aria-label'), 'Sort trials by metric overlap');
+        metricButton.focus();
+        metricButton.click();
+        metricButton = headerButtons()
+            .find(button => button.textContent === 'metric · overlap');
+        assert.equal(window.document.activeElement, metricButton);
+        assert.equal(metricButton.closest('th').getAttribute('aria-sort'), 'ascending');
+        assert.equal(window.document.querySelectorAll('#trial-thead th[aria-sort]').length, 1);
+
+        const labels = headerButtons().map(button => button.textContent);
+        const parameterColumn = labels.indexOf('param · overlap');
+        const metricColumn = labels.indexOf('metric · overlap');
+        const rows = [...window.document.querySelectorAll('#trial-tbody tr')];
+        assert.equal(rows[0].children[0].textContent, '1');
+        assert.equal(rows[0].children[parameterColumn].textContent, 'b');
+        assert.equal(rows[0].children[metricColumn].textContent, '1');
+        assert.equal(rows[1].children[0].textContent, '0');
+        assert.equal(rows[1].children[parameterColumn].textContent, 'a');
+        assert.equal(rows[1].children[metricColumn].textContent, '2');
+
+        window.sortTable('metric:overlap');
+        assert.equal(window.S.sortColumn.key, 'metric:overlap');
+        assert.equal(window.S.sortAsc, false);
+        assert.equal(window.document.querySelectorAll('#trial-thead th[aria-sort]').length, 1);
+        const descendingRows = [...window.document.querySelectorAll('#trial-tbody tr')];
+        assert.equal(descendingRows[0].children[0].textContent, '0');
+    } finally {
+        dom.window.close();
+    }
+});
+
+test('replacement checkpoints clear sort state for removed columns', () => {
+    const { dom, window } = createDom();
+    try {
+        window.applyCheckpointData({
+            format: 'hola-dashboard-export',
+            space: [{ name: 'old', type: 'integer', min: 0, max: 1 }],
+            objectives: [{ field: 'loss', obj_type: 'minimize' }],
+            trials: [{
+                trial_id: 0,
+                params: { old: 0 },
+                metrics: { loss: 0 },
+                score_vector: { loss: 0 },
+            }],
+        });
+        window.sortTable('param:old');
+        assert.equal(window.S.sortColumn.key, 'param:old');
+
+        const trials = Array.from({ length: 1001 }, (_, index) => ({
+            trial_id: 10_000 + index,
+            params: { current: index },
+            metrics: { loss: index },
+            score_vector: { loss: index },
+        }));
+        window.applyCheckpointData({
+            format: 'hola-dashboard-export',
+            space: [{ name: 'current', type: 'integer', min: 0, max: 1000 }],
+            objectives: [{ field: 'loss', obj_type: 'minimize' }],
+            trials,
+        });
+
+        assert.equal(window.S.sortCol, null);
+        assert.equal(window.S.sortColumn, null);
+        assert.equal(window.S.sortAsc, true);
+        assert.equal(window.document.querySelectorAll('#trial-thead th[aria-sort]').length, 0);
+        const rows = [...window.document.querySelectorAll('#trial-tbody tr')];
+        assert.equal(rows.length, 1000);
+        assert.equal(rows[0].children[0].textContent, '10001');
+        assert.equal(rows.at(-1).children[0].textContent, '11000');
     } finally {
         dom.window.close();
     }

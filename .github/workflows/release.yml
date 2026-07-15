@@ -234,6 +234,10 @@ jobs:
     needs: [validate-release]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -241,18 +245,23 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: hola-linux-x86_64
+            archive: hola-linux-x86_64.tar.gz
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             artifact: hola-linux-aarch64
+            archive: hola-linux-aarch64.tar.gz
           - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact: hola-macos-x86_64
+            archive: hola-macos-x86_64.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: hola-macos-aarch64
+            archive: hola-macos-aarch64.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: hola-windows-x86_64.exe
+            archive: hola-windows-x86_64.exe.zip
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
@@ -287,21 +296,24 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cp target/${{ matrix.target }}/release/hola ${{ matrix.artifact }}
-          tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+          tar czf ${{ matrix.archive }} ${{ matrix.artifact }}
 
       - name: Package binary (Windows)
         if: runner.os == 'Windows'
         run: |
           cp target/${{ matrix.target }}/release/hola.exe ${{ matrix.artifact }}
-          Compress-Archive -Path ${{ matrix.artifact }} -DestinationPath ${{ matrix.artifact }}.zip
+          Compress-Archive -Path ${{ matrix.artifact }} -DestinationPath ${{ matrix.archive }}
+
+      - name: Attest CLI archive provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: ${{ matrix.archive }}
 
       - name: Upload CLI artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cli-${{ matrix.artifact }}
-          path: |
-            *.tar.gz
-            *.zip
+          path: ${{ matrix.archive }}
 
   # Download and execute every packaged CLI on its native architecture. This
   # runs during the non-publishing dry run as well as the tagged release.

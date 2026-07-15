@@ -1,9 +1,9 @@
 # Release Verification Checklist
 
-Run this checklist on the exact release commit after CI and the scheduled
-security workflow are green. Record the commit, date, operator, browser/OS
-versions, and measured timings in the release notes. A failed item blocks the
-release; it is not a waiver.
+Run this checklist on the exact release commit after the CI and Security Audit
+workflow runs for that commit are green. Record both run URLs and SHAs together
+with the commit, date, operator, browser/OS versions, and measured timings in
+the release notes. A failed item blocks the release; it is not a waiver.
 
 ## Hosted compatibility
 
@@ -91,3 +91,12 @@ peak heap and compare it with the previous release.
   `PYTHONPATH`; run the public Python tests and a CLI ask/tell smoke test.
 - Confirm the dashboard files bundled in the wheel exactly match the reviewed
   standalone assets.
+- Verify GitHub build provenance for every wheel, source distribution, and CLI
+  archive, binding it to this workflow and release commit:
+
+  ```bash
+  gh attestation verify PATH_TO_ASSET \
+    --repo blackrock/HOLA \
+    --signer-workflow blackrock/HOLA/.github/workflows/release.yml \
+    --source-digest RELEASE_SHA
+  ```
