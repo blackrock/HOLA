@@ -178,7 +178,13 @@ pub(crate) mod lossless_float {
 /// observations and full-engine runtime state. Version 1 remains readable for
 /// migration; values that old JSON writers already collapsed to `null` cannot
 /// be reconstructed, but intact finite checkpoints migrate transparently.
-pub const CURRENT_FORMAT_VERSION: u32 = 2;
+///
+/// Version 3 adds fitted-model epoch state for GMM Gauss--Sobol' sampling. The
+/// version gate prevents older binaries from silently ignoring that state and
+/// continuing a checkpoint under incompatible sampling semantics. Versions 1
+/// and 2 remain readable; a GMM loaded from either continues its legacy global
+/// stream until the next successful model installation.
+pub const CURRENT_FORMAT_VERSION: u32 = 3;
 const MIN_SUPPORTED_FORMAT_VERSION: u32 = 1;
 
 /// Maximum number of bytes accepted when loading a checkpoint.
@@ -316,10 +322,15 @@ impl<D, Obs, S> TryFrom<CheckpointData<D, Obs, S>> for Checkpoint<D, Obs, S> {
 
     fn try_from(data: CheckpointData<D, Obs, S>) -> Result<Self, Self::Error> {
         validate_checkpoint_metadata(&data.metadata, data.leaderboard.len())?;
+        let mut metadata = data.metadata;
+        // Once migrated in memory, every subsequent save must advertise the
+        // schema this build writes. Retaining an older label could let an old
+        // reader accept newly serialized strategy state it does not understand.
+        metadata.format_version = CURRENT_FORMAT_VERSION;
         Ok(Self {
             leaderboard: data.leaderboard,
             strategy_state: data.strategy_state,
-            metadata: data.metadata,
+            metadata,
         })
     }
 }
@@ -429,9 +440,11 @@ impl<D, Obs> TryFrom<LeaderboardCheckpointData<D, Obs>> for LeaderboardCheckpoin
 
     fn try_from(data: LeaderboardCheckpointData<D, Obs>) -> Result<Self, Self::Error> {
         validate_checkpoint_metadata(&data.metadata, data.leaderboard.len())?;
+        let mut metadata = data.metadata;
+        metadata.format_version = CURRENT_FORMAT_VERSION;
         Ok(Self {
             leaderboard: data.leaderboard,
-            metadata: data.metadata,
+            metadata,
             observation_kind: data.observation_kind,
         })
     }
@@ -1122,6 +1135,7 @@ mod tests {
         let restored: LeaderboardCheckpoint<f64, f64> =
             LeaderboardCheckpoint::from_json(json).unwrap();
         assert_eq!(restored.observation_kind(), ObservationKind::Scalar);
+        assert_eq!(restored.metadata.format_version, CURRENT_FORMAT_VERSION);
     }
 
     #[test]
@@ -1141,6 +1155,18 @@ mod tests {
         std::fs::write(&path, &json).unwrap();
         let err = LeaderboardCheckpoint::<f64, f64>::load_json(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_version_gate_accepts_migratable_versions_and_writes_v3() {
+        assert!(check_format_version_value(1).is_ok());
+        assert!(check_format_version_value(2).is_ok());
+        assert!(check_format_version_value(3).is_ok());
+        assert!(check_format_version_value(0).is_err());
+        assert!(check_format_version_value(4).is_err());
+
+        let checkpoint = LeaderboardCheckpoint::<f64, f64>::new(Leaderboard::new(), None);
+        assert_eq!(checkpoint.metadata.format_version, 3);
     }
 
     #[test]

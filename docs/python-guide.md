@@ -466,7 +466,8 @@ suggestions, including pending trials. Uses the
 [HOLA algorithm](concepts.md#gmm-strategy).
 GMM exploitation uses seeded Owen-scrambled Gauss–Sobol' points: one
 Sobol' coordinate selects the component, and inverse-normal coordinates
-sample within it.
+sample within it. Each successfully installed GMM starts a new
+epoch-specific scramble at its first point.
 
 - Best for larger budgets (50+ trials) where exploration can
   transition to exploitation
