@@ -29,7 +29,7 @@ The Python API exposes these classes:
 | `Categorical` | Choice from a list of string labels |
 | `Minimize` | Minimize an objective field |
 | `Maximize` | Maximize an objective field |
-| `Gmm` | GMM strategy configuration (refit_interval, elite_fraction, exploration_budget) |
+| `Gmm` | GMM strategy configuration (refit cadence, elite fraction, exploration, and work limits) |
 | `Sobol` | Sobol strategy configuration |
 | `Random` | Random strategy configuration |
 
@@ -199,11 +199,14 @@ objectives=[
 
 - **target.** The "good enough" value. Trials at or better than
   target score 0 for this objective.
-- **limit.** The "unacceptable" value. Trials at or beyond limit
-  score infinity (effectively infeasible).
-- **priority.** Per-objective weight/slope ($P_i$) in the TLP
-  formula:
-  $\varphi_i = P_i \times (\text{value} - \text{target}) / (\text{limit} - \text{target})$.
+- **limit.** The worst acceptable boundary. At the limit, an objective scores
+  `priority`; crossing beyond it makes the trial infeasible and scores infinity.
+- **priority.** The objective's score at the limit and its relative weight
+  within a group ($P_i$). The linear segment's slope is
+  $P_i / (\text{limit} - \text{target})$; `priority` is not itself a slope.
+
+The TLP formula is
+$\varphi_i = P_i \times (\text{value} - \text{target}) / (\text{limit} - \text{target})$.
 
 Between target and limit, the score is interpolated linearly and
 scaled by `priority`. See
@@ -456,9 +459,14 @@ Study(strategy=Gmm(refit_interval=10, elite_fraction=0.1), ...)
 Gaussian Mixture Model strategy. Uses Sobol exploration followed
 by GMM exploitation. Refits a GMM to the top `elite_fraction`
 (default 25%) of trials every `refit_interval` (default 20)
-completed trials. The exploration budget counts issued `ask`
+completed trials. With multiple objective groups, elites are ordered
+by non-domination rank and then descending crowding distance. The
+exploration budget counts issued `ask`
 suggestions, including pending trials. Uses the
 [HOLA algorithm](concepts.md#gmm-strategy).
+GMM exploitation uses seeded Owen-scrambled Gauss–Sobol' points: one
+Sobol' coordinate selects the component, and inverse-normal coordinates
+sample within it.
 
 - Best for larger budgets (50+ trials) where exploration can
   transition to exploitation
@@ -479,6 +487,8 @@ Study(strategy=Gmm(refit_interval=10, elite_fraction=0.1), ...)
 | `refit_interval` | `int` or `None` | 20 | How often the GMM is refit, in completed trials |
 | `elite_fraction` | `float` or `None` | 0.25 | Fraction of top trials used for refitting. Must be in (0, 1]. |
 | `exploration_budget` | `int` or `None` | auto | Number of issued Sobol exploration suggestions before GMM exploitation begins. Pending asks count against this budget. When omitted, computed automatically from the number of dimensions. |
+| `max_refit_samples` | `int` or `None` | 4096 | Maximum elite samples used by one GMM fit. Must be at least 1. |
+| `max_refit_candidates` | `int` or `None` | 16384 | Maximum retained trials ranked during elite selection. Must be at least `max_refit_samples`; longer histories use deterministic stratified coverage. |
 
 ### Sobol
 

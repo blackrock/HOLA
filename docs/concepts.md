@@ -53,9 +53,9 @@ evaluate (your code)
 
 tell()
   ├─ Engine validates metrics against the objective schema
-  ├─ Engine computes per-group costs (plus a scalar fitting proxy)
+  ├─ Engine computes priority-weighted costs within explicit groups
   ├─ Leaderboard stores the trial (params, score_vector, metrics, timestamp)
-  └─ Strategy updates its model from the scalar fitting proxy
+  └─ Strategy refits to scalar-ranked or Pareto/NSGA-II-ranked elites
 ```
 
 ## The Unit Hypercube
@@ -107,6 +107,8 @@ The default strategy is the
 We fit a GMM to the **top quantile** of completed trials, then
 sample new candidates from the fitted model. This concentrates
 samples in regions where good results have been observed.
+For multiple objective groups, the elite order uses non-domination
+rank followed by descending crowding distance.
 
 The lifecycle follows three phases.
 
@@ -116,9 +118,24 @@ The lifecycle follows three phases.
 3. **Exploit.** New samples are drawn from the updated GMM,
    focusing on promising regions.
 
+GMM exploitation uses seeded Owen-scrambled Gauss–Sobol' points.
+One Sobol' coordinate selects the mixture component, and inverse-normal
+coordinates sample within that component.
+
 The exploration budget counts issued suggestions from `ask`,
 including suggestions that are still pending. GMM refits are based
 on completed trials in the leaderboard.
+
+Two implementation limits keep refitting bounded on unusually long studies.
+At most `max_refit_samples` elite points enter one fit (default 4096), and at
+most `max_refit_candidates` retained trials are ranked to choose them (default
+16384). Histories within the candidate limit are ranked globally. Longer
+histories use deterministic chronological strata spanning the full retained
+history, rather than a newest-only window. These are implementation safeguards;
+they do not change the abstract definition of the elite set. Scalar selection
+is linear in the candidate count. General multi-group non-dominated sorting is
+quadratic in the worst case, so long-running studies with many groups may use a
+smaller `max_refit_candidates` value.
 
 This strategy works well for larger budgets (50+ trials) where you
 want to transition from exploration to exploitation. The more
@@ -149,8 +166,8 @@ space matters.
 We convert each metric field into a directed, priority-weighted contribution.
 Contributions in the same priority group are summed. A study with one group
 uses that scalar group cost for ranking; multiple groups retain a cost vector
-and use Pareto/NSGA-II ranking. Strategies may use a summed proxy internally
-for fitting, but the public multi-group leaderboard remains Pareto-ranked.
+and use Pareto/NSGA-II ranking. GMM refits use that same ordering to select
+multi-group elites.
 
 ### Single Field
 
@@ -177,9 +194,12 @@ scalarization. We assign three parameters to each objective field.
 
 - **Target ($t$).** The "satisfactory" value. At or better than
   target, the contribution is 0.
-- **Limit ($l$).** The "unacceptable" value. At or beyond limit,
-  the contribution is infinity (infeasible).
-- **Priority ($p$).** Relative weight in the scalarized sum.
+- **Limit ($l$).** The worst acceptable boundary. At the limit, the
+  contribution is $p$; crossing beyond it makes the trial infeasible and the
+  contribution infinite.
+- **Priority ($p$).** The contribution's score at the limit and its relative
+  weight within a group. The slope between target and limit is
+  $p/(l-t)$; priority is not itself the slope unless $l-t=1$.
 
 Between target and limit, we interpolate linearly
 

@@ -38,6 +38,8 @@ objectives:
 strategy:
   type: gmm               # "gmm" (default), "sobol", or "random"
   refit_interval: 20
+  max_refit_samples: 4096
+  max_refit_candidates: 16384
 
 # Optional: automatic checkpointing
 # checkpoint:

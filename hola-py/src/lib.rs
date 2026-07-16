@@ -12,7 +12,8 @@
 //! Python bindings for the HOLA optimization engine via PyO3.
 
 use hola_engine::hola_engine::{
-    HolaEngine, ObjectiveConfig, ParamConfig, StrategyConfig, StudyConfig,
+    DEFAULT_MAX_REFIT_CANDIDATES, DEFAULT_MAX_REFIT_SAMPLES, HolaEngine, ObjectiveConfig,
+    ParamConfig, StrategyConfig, StudyConfig,
 };
 use pyo3::create_exception;
 use pyo3::exceptions::{PyRuntimeWarning, PyValueError};
@@ -150,9 +151,9 @@ impl Categorical {
 ///     field: Name of the metric to minimize (must appear in the dict returned
 ///         by the objective function).
 ///     target: "Good enough" value; at or below this, the TLP score is 0.
-///     limit: "Unacceptable" value; beyond this, the trial is infeasible (score = inf).
-///     priority: Per-objective weight/slope P_i in the TLP formula:
-///         φ_i = P_i × (value − target) / (limit − target). Default 1.0.
+///     limit: Worst acceptable value; beyond this, the trial is infeasible (score = inf).
+///     priority: The score at the limit and relative weight P_i. The linear
+///         segment's slope is P_i / (limit − target). Default 1.0.
 ///     group: Priority-group label. Objectives sharing the same group are summed
 ///         into one component of the group-cost vector for Pareto ranking. When
 ///         omitted, defaults to the field name (one group per objective).
@@ -198,8 +199,9 @@ impl Minimize {
 ///     field: Name of the metric to maximize (must appear in the dict returned
 ///         by the objective function).
 ///     target: "Good enough" value; at or above this, the TLP score is 0.
-///     limit: "Unacceptable" value; below this, the trial is infeasible (score = inf).
-///     priority: Per-objective weight/slope P_i in the TLP formula. Default 1.0.
+///     limit: Worst acceptable value; below this, the trial is infeasible (score = inf).
+///     priority: The score at the limit and relative weight P_i. The linear
+///         segment's slope is P_i / (limit − target). Default 1.0.
 ///     group: Priority-group label. See Minimize for details.
 #[pyclass(from_py_object)]
 #[derive(Clone)]
@@ -252,6 +254,9 @@ impl Maximize {
 ///         Must be between 0.0 and 1.0.
 ///     exploration_budget: Number of Sobol exploration trials before GMM exploitation
 ///         begins. When omitted, computed automatically from the number of dimensions.
+///     max_refit_samples: Maximum elite samples used by one GMM fit (default: 4096).
+///     max_refit_candidates: Maximum retained trials ranked during elite selection
+///         (default: 16384). Longer histories use deterministic stratified coverage.
 #[pyclass(from_py_object)]
 #[derive(Clone)]
 struct Gmm {
@@ -261,16 +266,22 @@ struct Gmm {
     elite_fraction: Option<f64>,
     #[pyo3(get)]
     exploration_budget: Option<usize>,
+    #[pyo3(get)]
+    max_refit_samples: Option<usize>,
+    #[pyo3(get)]
+    max_refit_candidates: Option<usize>,
 }
 
 #[pymethods]
 impl Gmm {
     #[new]
-    #[pyo3(signature = (refit_interval=None, elite_fraction=None, exploration_budget=None))]
+    #[pyo3(signature = (refit_interval=None, elite_fraction=None, exploration_budget=None, max_refit_samples=None, max_refit_candidates=None))]
     fn new(
         refit_interval: Option<usize>,
         elite_fraction: Option<f64>,
         exploration_budget: Option<usize>,
+        max_refit_samples: Option<usize>,
+        max_refit_candidates: Option<usize>,
     ) -> PyResult<Self> {
         if let Some(ef) = elite_fraction {
             if !ef.is_finite() || ef <= 0.0 || ef > 1.0 {
@@ -286,10 +297,25 @@ impl Gmm {
                 ));
             }
         }
+        let effective_max_refit_samples = max_refit_samples.unwrap_or(DEFAULT_MAX_REFIT_SAMPLES);
+        let effective_max_refit_candidates =
+            max_refit_candidates.unwrap_or(DEFAULT_MAX_REFIT_CANDIDATES);
+        if effective_max_refit_samples == 0 {
+            return Err(ConfigurationError::new_err(
+                "max_refit_samples must be at least 1",
+            ));
+        }
+        if effective_max_refit_candidates < effective_max_refit_samples {
+            return Err(ConfigurationError::new_err(format!(
+                "max_refit_candidates must be at least max_refit_samples ({effective_max_refit_samples}), got {effective_max_refit_candidates}",
+            )));
+        }
         Ok(Self {
             refit_interval,
             elite_fraction,
             exploration_budget,
+            max_refit_samples,
+            max_refit_candidates,
         })
     }
 }
@@ -753,6 +779,8 @@ impl Study {
                 exploration_budget: None,
                 seed,
                 elite_fraction: None,
+                max_refit_samples: DEFAULT_MAX_REFIT_SAMPLES,
+                max_refit_candidates: DEFAULT_MAX_REFIT_CANDIDATES,
             },
             Some(s) => {
                 // Extract each strategy class exactly once: probe with a single
@@ -766,6 +794,12 @@ impl Study {
                         exploration_budget: gmm.exploration_budget,
                         seed,
                         elite_fraction: gmm.elite_fraction,
+                        max_refit_samples: gmm
+                            .max_refit_samples
+                            .unwrap_or(DEFAULT_MAX_REFIT_SAMPLES),
+                        max_refit_candidates: gmm
+                            .max_refit_candidates
+                            .unwrap_or(DEFAULT_MAX_REFIT_CANDIDATES),
                     }
                 } else if s.extract::<Sobol>().is_ok() {
                     StrategyConfig {
@@ -775,6 +809,8 @@ impl Study {
                         exploration_budget: None,
                         seed,
                         elite_fraction: None,
+                        max_refit_samples: DEFAULT_MAX_REFIT_SAMPLES,
+                        max_refit_candidates: DEFAULT_MAX_REFIT_CANDIDATES,
                     }
                 } else if s.extract::<Random>().is_ok() {
                     StrategyConfig {
@@ -784,6 +820,8 @@ impl Study {
                         exploration_budget: None,
                         seed,
                         elite_fraction: None,
+                        max_refit_samples: DEFAULT_MAX_REFIT_SAMPLES,
+                        max_refit_candidates: DEFAULT_MAX_REFIT_CANDIDATES,
                     }
                 } else {
                     let name: String = s.extract().map_err(|_| {
@@ -799,6 +837,8 @@ impl Study {
                         exploration_budget: None,
                         seed,
                         elite_fraction: None,
+                        max_refit_samples: DEFAULT_MAX_REFIT_SAMPLES,
+                        max_refit_candidates: DEFAULT_MAX_REFIT_CANDIDATES,
                     }
                 }
             }
@@ -1356,14 +1396,18 @@ impl Study {
                     let metrics_dict = result.cast::<PyDict>().map_err(|_| {
                         ObjectiveError::new_err("Objective function must return a dict")
                     })?;
-                    slf.borrow(py).tell(py, trial_id, metrics_dict)?;
+                    slf.borrow(py).tell_for_run(py, trial_id, metrics_dict)?;
                     Ok(())
                 })();
                 if let Err(e) = outcome {
                     let _ = slf.borrow(py).cancel(py, trial_id);
+                    // Preserve the objective error, but leave every earlier
+                    // committed trial with a fully ranked retry receipt.
+                    let _ = slf.borrow(py).finalize_run_rankings(py);
                     return Err(e);
                 }
             }
+            slf.borrow(py).finalize_run_rankings(py)?;
         } else {
             // Parallel path: use Python's concurrent.futures.ThreadPoolExecutor
             let cf = py.import("concurrent.futures")?;
@@ -1426,7 +1470,7 @@ impl Study {
                     let metrics_dict = result.cast::<PyDict>().map_err(|_| {
                         ObjectiveError::new_err("Objective function must return a dict")
                     })?;
-                    slf.borrow(py).tell(py, trial_id, metrics_dict)?;
+                    slf.borrow(py).tell_for_run(py, trial_id, metrics_dict)?;
                     pending.swap_remove(finished_index);
                     outstanding.retain(|&id| id != trial_id);
 
@@ -1468,8 +1512,15 @@ impl Study {
             // On the failure path, surface the original objective error and
             // ignore any shutdown error. On the success path, propagate a
             // shutdown error so it is not silently swallowed.
-            outcome?;
+            if let Err(error) = outcome {
+                // Finalization is best-effort on failure so the original
+                // objective/executor error remains the one Python observes.
+                let _ = slf.borrow(py).finalize_run_rankings(py);
+                return Err(error);
+            }
+            let finalization = slf.borrow(py).finalize_run_rankings(py);
             shutdown?;
+            finalization?;
         }
 
         Ok(slf)
@@ -1533,6 +1584,41 @@ impl Study {
             StudyInner::Remote { .. } => Err(ConfigurationError::new_err(
                 "serve() is only available for local studies, not remote connections",
             )),
+        }
+    }
+}
+
+impl Study {
+    /// Internal completion path for `run()`. A local run does not expose the
+    /// per-trial `CompletedTrial`, so the engine can defer leaderboard-wide
+    /// ranking and materialize all receipts once at batch exit. Remote studies
+    /// retain the ordinary HTTP `tell` contract because no private batch
+    /// endpoint exists.
+    fn tell_for_run(
+        &self,
+        py: Python<'_>,
+        trial_id: u64,
+        metrics: &Bound<'_, PyDict>,
+    ) -> PyResult<()> {
+        match &self.inner {
+            StudyInner::Local { engine } => {
+                let raw = py_dict_to_json(metrics)?;
+                let runtime = shared_runtime()?;
+                py.detach(|| runtime.block_on(engine.tell_without_ranking(trial_id, raw)))
+                    .map_err(ObjectiveError::new_err)
+            }
+            StudyInner::Remote { .. } => self.tell(py, trial_id, metrics).map(|_| ()),
+        }
+    }
+
+    fn finalize_run_rankings(&self, py: Python<'_>) -> PyResult<()> {
+        match &self.inner {
+            StudyInner::Local { engine } => {
+                let runtime = shared_runtime()?;
+                py.detach(|| runtime.block_on(engine.finalize_deferred_rankings()))
+                    .map_err(HolaError::new_err)
+            }
+            StudyInner::Remote { .. } => Ok(()),
         }
     }
 }

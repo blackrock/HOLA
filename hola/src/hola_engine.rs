@@ -74,13 +74,14 @@ const MAX_COMPLETION_RECEIPTS: usize = 4096;
 /// after the initial warm-up. This prevents a fitted GMM from permanently
 /// collapsing around sparse early elites.
 const AUTO_EXPLORATION_PERIOD: usize = 5;
-/// Bound repeated EM work and clone volume on long studies. Elite selection
-/// still scans the leaderboard, but model fitting never grows beyond this
-/// representative top-ranked window.
-const MAX_REFIT_SAMPLES: usize = 4096;
-/// Bound the leaderboard window scanned to choose those samples, making
-/// periodic refit cost independent of total study history after warm-up.
-const MAX_REFIT_CANDIDATES: usize = 16_384;
+/// Default bound on the number of elite samples passed to full-covariance EM.
+/// This is an implementation safeguard, not part of the abstract method, and
+/// can be overridden in [`StrategyConfig`].
+pub const DEFAULT_MAX_REFIT_SAMPLES: usize = 4096;
+/// Default bound on the candidate workset ranked to choose those samples.
+/// Histories beyond this size are covered by deterministic chronological
+/// strata rather than a newest-only window.
+pub const DEFAULT_MAX_REFIT_CANDIDATES: usize = 16_384;
 
 fn unix_time_millis() -> u64 {
     SystemTime::now()
@@ -934,6 +935,9 @@ pub struct ObjectiveConfig {
     pub target: Option<f64>,
     #[serde(default)]
     pub limit: Option<f64>,
+    /// TLP score at the limit (when target and limit are configured) and
+    /// relative weight within a priority group. The TLP segment's slope is
+    /// `priority / (limit - target)`.
     #[serde(default = "default_priority")]
     pub priority: f64,
     /// Explicit priority-group label. Objectives sharing the same group are
@@ -969,10 +973,26 @@ pub struct StrategyConfig {
     /// Must be in (0.0, 1.0].
     #[serde(default)]
     pub elite_fraction: Option<f64>,
+    /// Maximum elite samples used by one GMM fit. This bounds EM cost but does
+    /// not change the abstract elite definition.
+    #[serde(default = "default_max_refit_samples")]
+    pub max_refit_samples: usize,
+    /// Maximum retained trials ranked during one elite-selection pass. Longer
+    /// histories are covered by deterministic chronological strata.
+    #[serde(default = "default_max_refit_candidates")]
+    pub max_refit_candidates: usize,
 }
 
 fn default_refit_interval() -> usize {
     20
+}
+
+fn default_max_refit_samples() -> usize {
+    DEFAULT_MAX_REFIT_SAMPLES
+}
+
+fn default_max_refit_candidates() -> usize {
+    DEFAULT_MAX_REFIT_CANDIDATES
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1186,6 +1206,15 @@ fn validate_strategy_config(strategy: &StrategyConfig) -> Result<(), String> {
             ));
         }
     }
+    if strategy.max_refit_samples == 0 {
+        return Err("strategy.max_refit_samples must be at least 1".to_string());
+    }
+    if strategy.max_refit_candidates < strategy.max_refit_samples {
+        return Err(format!(
+            "strategy.max_refit_candidates must be at least max_refit_samples ({}), got {}",
+            strategy.max_refit_samples, strategy.max_refit_candidates,
+        ));
+    }
 
     Ok(())
 }
@@ -1216,7 +1245,8 @@ pub struct CompletedTrial {
     pub metrics: serde_json::Value,
     /// Per-objective scored values after TLP/direction handling.
     /// e.g., `{"loss": 0.3, "latency": 0.8}`.
-    /// 0 = target met, (0,1) = between target and limit, inf = infeasible.
+    /// For TLP fields: 0 = target met, `priority` = at the limit, and inf =
+    /// infeasible beyond it.
     pub scores: serde_json::Value,
     /// Per-priority-group aggregated scores (objectives summed within group).
     /// This is what ranking and Pareto use.
@@ -1497,24 +1527,31 @@ impl DynLeaderboard {
         }
     }
 
-    /// Return top-k trials as (candidate, scalarized_score) for strategy refit.
+    /// Return elite trials as (candidate, strategy observation) for refitting.
+    ///
+    /// A scalar leaderboard uses its ordinary score order. A multi-group
+    /// leaderboard uses the same NSGA-II order as the public leaderboard:
+    /// lower non-domination rank first, then higher crowding distance. Both
+    /// paths rank the full retained history while it fits the configured work
+    /// bound; longer histories use deterministic chronological strata so no
+    /// newest-only bias is introduced.
     fn top_k_for_refit(
         &self,
         k: usize,
+        max_candidates: usize,
         objectives: &[ObjectiveConfig],
     ) -> Vec<(serde_json::Value, f64)> {
         match self {
             DynLeaderboard::Scalar(lb) => lb
-                .top_k_recent(k, MAX_REFIT_CANDIDATES)
+                .top_k_stratified(k, max_candidates)
                 .into_iter()
                 .map(|t| (t.candidate, t.observation))
                 .collect(),
             DynLeaderboard::Vector(lb) => lb
-                .top_k_scalarized_recent(k, MAX_REFIT_CANDIDATES, |obs| {
-                    scalarize_observation(obs, objectives)
-                })
+                .select_nsga2_stratified(k, max_candidates)
                 .into_iter()
-                .map(|t| {
+                .map(|ranked| {
+                    let t = ranked.trial;
                     (
                         t.candidate,
                         scalarize_observation(&t.observation, objectives),
@@ -1670,6 +1707,30 @@ impl DynLeaderboard {
                 let completed = build_completed_vector(trial, 0, objectives);
                 Some((completed, Some((snapshot, trial_id))))
             }
+        }
+    }
+
+    /// Build a completion payload without computing leaderboard-wide rank.
+    ///
+    /// This is only used by the local `Study.run` batch path, which never
+    /// exposes the per-completion return value. The private placeholder rank is
+    /// replaced before a receipt can be returned by the public `tell` API.
+    fn completed_without_ranking(
+        &self,
+        trial_id: u64,
+        objectives: &[ObjectiveConfig],
+    ) -> Option<CompletedTrial> {
+        match self {
+            DynLeaderboard::Scalar(lb) => Some(build_completed_scalar(
+                lb.get(trial_id)?.clone(),
+                0,
+                objectives,
+            )),
+            DynLeaderboard::Vector(lb) => Some(build_completed_vector(
+                lb.get(trial_id)?.clone(),
+                0,
+                objectives,
+            )),
         }
     }
 
@@ -2082,7 +2143,8 @@ fn f64_map_to_json(map: &BTreeMap<String, f64>) -> serde_json::Value {
 
 /// Compute per-objective TLP scores φ_i from raw metrics.
 ///
-/// Each score is P_i × normalized_distance, matching the paper's formula.
+/// Each score is P_i × normalized_distance, so P_i is its score at the limit
+/// and its relative weight within the group.
 fn compute_scores(raw: &serde_json::Value, objectives: &[ObjectiveConfig]) -> serde_json::Value {
     let mut scores = serde_json::Map::new();
     for obj in objectives {
@@ -2179,6 +2241,10 @@ pub struct HolaEngine {
     /// Cheap to clone (Arc); shared across engine clones like `state`.
     refit_lock: Arc<Mutex<()>>,
     refit_config: Option<RefitConfig>,
+    /// Implementation bound for samples passed to one GMM fit.
+    max_refit_samples: usize,
+    /// Implementation bound for trials ranked during elite selection.
+    max_refit_candidates: usize,
     auto_checkpoint: Option<AutoCheckpointConfig>,
     /// Failures from unattended auto-checkpoint writes and rotation. Shared by
     /// clones and exposed to the server metrics endpoint.
@@ -2220,11 +2286,15 @@ struct HolaEngineState {
     completion_receipts: BTreeMap<u64, CompletionReceipt>,
     /// Trial ids in commit order, used to prune the oldest receipt in O(1).
     completion_receipt_order: VecDeque<u64>,
+    /// Number of retained receipts whose public rank/front has not yet been
+    /// materialized. Local batch runners can defer that work and rank the
+    /// leaderboard once at the end instead of once per completion.
+    deferred_completion_receipts: usize,
 }
 
-/// Retry receipt for a committed tell. The exact response view and count are
-/// retained so an uncertain client can replay the operation even if a bounded
-/// leaderboard has already evicted the underlying trial.
+/// Retry receipt for a committed tell. Public tells retain the exact response
+/// view immediately. A local batch may defer its never-exposed rank/front until
+/// batch exit, while retaining the full completion payload durably.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CompletionReceipt {
     commit_sequence: u64,
@@ -2232,6 +2302,10 @@ struct CompletionReceipt {
     committed_count: usize,
     #[serde(default)]
     post_commit_warnings: Vec<String>,
+    /// The completion payload is durable, but `rank`/`pareto_front` are private
+    /// placeholders until the first public observation of this receipt.
+    #[serde(default)]
+    ranking_deferred: bool,
 }
 
 /// Transient job state persisted alongside a full checkpoint.
@@ -2291,6 +2365,7 @@ impl HolaEngineState {
         self.lease_deadlines.clear();
         self.completion_receipts.clear();
         self.completion_receipt_order.clear();
+        self.deferred_completion_receipts = 0;
     }
 
     fn runtime_checkpoint_state(&self) -> RuntimeCheckpointState {
@@ -2450,6 +2525,11 @@ impl HolaEngineState {
                     "checkpoint completion receipt for trial_id {trial_id} has an out-of-range rank/front"
                 ));
             }
+            if receipt.ranking_deferred && !self.leaderboard.contains_trial_id(trial_id) {
+                return Err(format!(
+                    "checkpoint deferred completion receipt for trial_id {trial_id} has no retained leaderboard trial"
+                ));
+            }
             if let Some(stored_metrics) = self.leaderboard.raw_metrics(trial_id) {
                 if stored_metrics != &receipt.completed.metrics {
                     return Err(format!(
@@ -2487,6 +2567,11 @@ impl HolaEngineState {
         self.cancelled = cancelled;
         self.ask_idempotency = runtime.ask_idempotency;
         self.lease_deadlines = runtime.lease_deadlines;
+        self.deferred_completion_receipts = runtime
+            .completion_receipts
+            .values()
+            .filter(|receipt| receipt.ranking_deferred)
+            .count();
         self.completion_receipts = runtime.completion_receipts;
         self.completion_receipt_order = receipt_order
             .into_iter()
@@ -2516,6 +2601,7 @@ impl HolaEngineState {
         sequence: u64,
         completed: CompletedTrial,
         committed_count: usize,
+        ranking_deferred: bool,
     ) {
         let trial_id = completed.trial_id;
         let replaced = self.completion_receipts.insert(
@@ -2525,15 +2611,70 @@ impl HolaEngineState {
                 completed,
                 committed_count,
                 post_commit_warnings: Vec::new(),
+                ranking_deferred,
             },
         );
         debug_assert!(replaced.is_none());
+        if ranking_deferred {
+            self.deferred_completion_receipts += 1;
+        }
         self.completion_receipt_order.push_back(trial_id);
         while self.completion_receipts.len() > MAX_COMPLETION_RECEIPTS {
             if let Some(oldest_trial_id) = self.completion_receipt_order.pop_front() {
-                self.completion_receipts.remove(&oldest_trial_id);
+                if self
+                    .completion_receipts
+                    .remove(&oldest_trial_id)
+                    .is_some_and(|receipt| receipt.ranking_deferred)
+                {
+                    self.deferred_completion_receipts -= 1;
+                }
             }
         }
+    }
+
+    /// Materialize every private batch receipt against one canonical ranking
+    /// snapshot. Deferred receipts are guaranteed to remain in the leaderboard:
+    /// the batch commit path stops deferring before a bounded push can evict.
+    fn finalize_deferred_completion_receipts(&mut self) -> Result<(), String> {
+        if self.deferred_completion_receipts == 0 {
+            return Ok(());
+        }
+
+        let view_count = self.leaderboard.completed_count();
+        let current: BTreeMap<u64, CompletedTrial> = self
+            .leaderboard
+            .completed_trials("rank", true, &self.objectives)
+            .into_iter()
+            .map(|trial| (trial.trial_id, trial))
+            .collect();
+        let expected = self.deferred_completion_receipts;
+        if let Some(trial_id) = self
+            .completion_receipts
+            .iter()
+            .find_map(|(&trial_id, receipt)| {
+                (receipt.ranking_deferred && !current.contains_key(&trial_id)).then_some(trial_id)
+            })
+        {
+            return Err(format!(
+                "Deferred completion receipt for trial {trial_id} has no retained leaderboard trial"
+            ));
+        }
+        let mut finalized = 0usize;
+        for (&trial_id, receipt) in &mut self.completion_receipts {
+            if !receipt.ranking_deferred {
+                continue;
+            }
+            let completed = current
+                .get(&trial_id)
+                .expect("deferred receipt backing was checked above");
+            receipt.completed = completed.clone();
+            receipt.committed_count = view_count;
+            receipt.ranking_deferred = false;
+            finalized += 1;
+        }
+        debug_assert_eq!(finalized, expected);
+        self.deferred_completion_receipts = 0;
+        Ok(())
     }
 
     fn record_post_commit_warnings(&mut self, sequence: u64, trial_id: u64, warnings: &[String]) {
@@ -2563,6 +2704,7 @@ impl HolaEngineState {
                 // not the original commit prefix. Carry the epoch's count so
                 // every rebuilt rank/front remains internally consistent.
                 receipt.committed_count = view_count;
+                receipt.ranking_deferred = false;
                 true
             } else {
                 false
@@ -2570,6 +2712,7 @@ impl HolaEngineState {
         });
         self.completion_receipt_order
             .retain(|trial_id| self.completion_receipts.contains_key(trial_id));
+        self.deferred_completion_receipts = 0;
     }
 
     fn expire_leases(&mut self, now: u64) -> usize {
@@ -2667,6 +2810,12 @@ impl HolaEngine {
         }
 
         let refit_interval = strategy_cfg.map(|s| s.refit_interval).unwrap_or(20);
+        let max_refit_samples = strategy_cfg
+            .map(|strategy| strategy.max_refit_samples)
+            .unwrap_or(DEFAULT_MAX_REFIT_SAMPLES);
+        let max_refit_candidates = strategy_cfg
+            .map(|strategy| strategy.max_refit_candidates)
+            .unwrap_or(DEFAULT_MAX_REFIT_CANDIDATES);
         // Resolve an omitted seed exactly once. The concrete value is used by
         // every strategy and persisted in study_config/checkpoints so an
         // auto-seeded run can be reproduced rather than recording `None`.
@@ -2744,6 +2893,8 @@ impl HolaEngine {
             exploration_budget: effective_exploration_budget,
             seed: Some(seed),
             elite_fraction: effective_elite_fraction,
+            max_refit_samples,
+            max_refit_candidates,
         });
 
         let auto_checkpoint = if let Some(c) = config.checkpoint.as_ref() {
@@ -2779,9 +2930,12 @@ impl HolaEngine {
                 lease_deadlines: BTreeMap::new(),
                 completion_receipts: BTreeMap::new(),
                 completion_receipt_order: VecDeque::new(),
+                deferred_completion_receipts: 0,
             })),
             refit_lock: Arc::new(Mutex::new(())),
             refit_config,
+            max_refit_samples,
+            max_refit_candidates,
             auto_checkpoint,
             checkpoint_failures: Arc::new(AtomicU64::new(0)),
             refit_failures: Arc::new(AtomicU64::new(0)),
@@ -2969,6 +3123,48 @@ impl HolaEngine {
     where
         F: FnOnce(&CompletedTrial, usize),
     {
+        self.tell_with_outcome_mode(trial_id, raw_metrics, false, on_commit)
+            .await
+    }
+
+    /// Commit a result for a local batch runner without eagerly constructing a
+    /// ranked response that the runner will discard.
+    ///
+    /// This is intentionally hidden from the ordinary Rust API. Call
+    /// [`Self::finalize_deferred_rankings`] once the batch ends. Public
+    /// `tell()` calls remain eagerly ranked, and automatically materialize any
+    /// overlapping deferred receipts before returning one.
+    #[doc(hidden)]
+    pub async fn tell_without_ranking(
+        &self,
+        trial_id: u64,
+        raw_metrics: serde_json::Value,
+    ) -> Result<(), String> {
+        self.tell_with_outcome_mode(trial_id, raw_metrics, true, |_, _| {})
+            .await
+            .map(|_| ())
+    }
+
+    /// Materialize private batch receipts using one canonical leaderboard
+    /// ranking snapshot. This is a no-op when no batch completion is pending.
+    #[doc(hidden)]
+    pub async fn finalize_deferred_rankings(&self) -> Result<(), String> {
+        self.state
+            .write()
+            .await
+            .finalize_deferred_completion_receipts()
+    }
+
+    async fn tell_with_outcome_mode<F>(
+        &self,
+        trial_id: u64,
+        raw_metrics: serde_json::Value,
+        mut defer_ranking: bool,
+        on_commit: F,
+    ) -> Result<TellOutcome, String>
+    where
+        F: FnOnce(&CompletedTrial, usize),
+    {
         let mut state = self.state.write().await;
         state.expire_leases(unix_time_millis());
 
@@ -2982,6 +3178,12 @@ impl HolaEngine {
                     "Trial {trial_id} has already been completed with different metrics"
                 ));
             }
+            if !defer_ranking && receipt.ranking_deferred {
+                state.finalize_deferred_completion_receipts()?;
+            }
+            let receipt = state
+                .completion_receipt(trial_id)
+                .expect("finalizing receipts must preserve the requested receipt");
             return Ok(TellOutcome {
                 completed: receipt.completed.clone(),
                 trial_count: receipt.committed_count,
@@ -3017,10 +3219,27 @@ impl HolaEngine {
             });
         }
 
+        // A bounded board must never evict the backing trial for a deferred
+        // receipt. Stop deferring at the capacity boundary and materialize the
+        // prior batch before the push can evict its oldest member.
+        if !state.pending.contains_key(&trial_id) {
+            return Err(format!("Unknown trial_id: {trial_id}"));
+        }
+        let would_evict = state
+            .leaderboard
+            .max_size()
+            .is_some_and(|cap| state.leaderboard.len() >= cap);
+        if !defer_ranking || would_evict {
+            state.finalize_deferred_completion_receipts()?;
+        }
+        if would_evict {
+            defer_ranking = false;
+        }
+
         let candidate = state
             .pending
             .remove(&trial_id)
-            .ok_or_else(|| format!("Unknown trial_id: {trial_id}"))?;
+            .expect("pending membership was checked above");
         state.remove_ask_idempotency_for_trial(trial_id);
         state.lease_deadlines.remove(&trial_id);
 
@@ -3042,28 +3261,44 @@ impl HolaEngine {
         let completed_trials = state.leaderboard.completed_count();
         let commit_sequence = state.leaderboard.total_completed();
 
-        // Build the exact response and receipt before releasing the commit lock.
-        // In particular, a duplicate tell must never observe the vector path's
-        // temporary rank/front placeholders. The snapshot construction is the
-        // only part that reads the leaderboard; ranking then operates on that
-        // owned snapshot.
-        let (mut completed, vector_rank_inputs) = state
-            .leaderboard
-            .completed_for_tell(stored_trial_id, true, &objectives)
-            .ok_or_else(|| format!("Failed to build CompletedTrial for {stored_trial_id}"))?;
-        if let Some((participants, target)) = vector_rank_inputs {
-            let (rank, front) = vector_dashboard_rank(&participants, target)
-                .ok_or_else(|| format!("Failed to rank CompletedTrial for {stored_trial_id}"))?;
-            completed.rank = rank;
-            completed.pareto_front = front;
-        }
-        state.record_completion_receipt(commit_sequence, completed.clone(), completed_trials);
+        // Public tells build their exact response before releasing the commit
+        // lock. The local batch path stores only the completion payload; its
+        // private placeholder rank/front is materialized before any public
+        // replay and once at normal batch exit.
+        let completed = if defer_ranking {
+            state
+                .leaderboard
+                .completed_without_ranking(stored_trial_id, &objectives)
+                .ok_or_else(|| format!("Failed to build CompletedTrial for {stored_trial_id}"))?
+        } else {
+            let (mut completed, vector_rank_inputs) = state
+                .leaderboard
+                .completed_for_tell(stored_trial_id, true, &objectives)
+                .ok_or_else(|| format!("Failed to build CompletedTrial for {stored_trial_id}"))?;
+            if let Some((participants, target)) = vector_rank_inputs {
+                let (rank, front) =
+                    vector_dashboard_rank(&participants, target).ok_or_else(|| {
+                        format!("Failed to rank CompletedTrial for {stored_trial_id}")
+                    })?;
+                completed.rank = rank;
+                completed.pareto_front = front;
+            }
+            completed
+        };
+        state.record_completion_receipt(
+            commit_sequence,
+            completed.clone(),
+            completed_trials,
+            defer_ranking,
+        );
         drop(state);
 
         // There is deliberately no `.await` between recording the receipt and
         // this hook. Cancellation therefore observes either neither operation
         // or both the commit and its externally visible event.
-        on_commit(&completed, completed_trials);
+        if !defer_ranking {
+            on_commit(&completed, completed_trials);
+        }
 
         // Own post-commit maintenance in a spawned task. Awaiting it preserves
         // the synchronous API's warnings on the normal path, while dropping or
@@ -3126,11 +3361,13 @@ impl HolaEngine {
                 let refit_completed = state_guard.leaderboard.completed_count();
                 let k = config
                     .selection_count(refit_completed)
-                    .min(MAX_REFIT_SAMPLES);
+                    .min(self.max_refit_samples);
                 let refit_objectives = state_guard.objectives.clone();
-                let trials = state_guard
-                    .leaderboard
-                    .top_k_for_refit(k, &refit_objectives);
+                let trials = state_guard.leaderboard.top_k_for_refit(
+                    k,
+                    self.max_refit_candidates,
+                    &refit_objectives,
+                );
                 let mut strategy_snapshot = state_guard.strategy.clone();
                 let space_clone = self.space.clone();
                 drop(state_guard);
@@ -3483,9 +3720,12 @@ impl HolaEngine {
         }
         let k = config
             .selection_count(current_completed)
-            .min(MAX_REFIT_SAMPLES);
+            .min(self.max_refit_samples);
         let objectives = state_guard.objectives.clone();
-        let trials = state_guard.leaderboard.top_k_for_refit(k, &objectives);
+        let trials =
+            state_guard
+                .leaderboard
+                .top_k_for_refit(k, self.max_refit_candidates, &objectives);
         let mut strategy_snapshot = state_guard.strategy.clone();
         let space_clone = self.space.clone();
         drop(state_guard);
@@ -3640,6 +3880,8 @@ impl HolaEngine {
         let current_is_vector = count_priority_groups(&objectives) > 1;
         let space = self.space.clone();
         let max_leaderboard_size = self.max_leaderboard_size;
+        let max_refit_samples = self.max_refit_samples;
+        let max_refit_candidates = self.max_refit_candidates;
         let (leaderboard, strategy, n) = tokio::task::spawn_blocking(move || {
             let mut leaderboard = parse_leaderboard_checkpoint(raw, current_is_vector)?;
             leaderboard
@@ -3649,8 +3891,11 @@ impl HolaEngine {
             let n = leaderboard.len();
             leaderboard.set_max_size(max_leaderboard_size);
             let completed_count = leaderboard.completed_count();
-            let trials =
-                leaderboard.top_k_for_refit(completed_count.min(MAX_REFIT_SAMPLES), &objectives);
+            let trials = leaderboard.top_k_for_refit(
+                completed_count.min(max_refit_samples),
+                max_refit_candidates,
+                &objectives,
+            );
             let mut strategy = strategy;
             strategy
                 .reconcile_imported_history(&space, completed_count, &trials)
@@ -3893,6 +4138,7 @@ impl HolaEngine {
                 lease_deadlines: BTreeMap::new(),
                 completion_receipts: BTreeMap::new(),
                 completion_receipt_order: VecDeque::new(),
+                deferred_completion_receipts: 0,
             };
             replacement.leaderboard.set_max_size(max_leaderboard_size);
             replacement
@@ -4088,7 +4334,8 @@ fn parse_leaderboard_checkpoint(
 ///
 /// Implements the paper's formula: F(x) = Σ φ_i(f_i(x)) where
 /// φ_i(u) = P_i × (u − T_i)/(L_i − T_i) for the in-range case.
-/// Each objective's TLP score is multiplied by its priority weight P_i.
+/// Each objective's normalized TLP score is multiplied by its priority P_i,
+/// which is the resulting score at the limit and relative weight in its group.
 fn scalarize_raw(raw: &serde_json::Value, objectives: &[ObjectiveConfig]) -> f64 {
     let mut total = 0.0;
     for obj in objectives {
@@ -4109,8 +4356,9 @@ fn scalarize_raw(raw: &serde_json::Value, objectives: &[ObjectiveConfig]) -> f64
 /// Compute per-group cost vector C(x) from raw metrics.
 ///
 /// Groups objectives by their explicit group label. Within each group,
-/// the group cost is: C_g(x) = Σ_{i ∈ G_g} P_i × φ_i(f_i(x))
-/// where P_i is the per-objective priority weight.
+/// the group cost is C_g(x) = Σ_{i ∈ G_g} φ_i(f_i(x)), where each
+/// paper-defined TLP score φ_i already includes its priority P_i. The code
+/// below forms that score as P_i times the unweighted normalized distance.
 fn vectorize_raw(raw: &serde_json::Value, objectives: &[ObjectiveConfig]) -> BTreeMap<String, f64> {
     let mut groups: BTreeMap<String, f64> = BTreeMap::new();
     for obj in objectives {
@@ -4147,7 +4395,8 @@ fn group_key(obj: &ObjectiveConfig) -> String {
     obj.group.clone().unwrap_or_else(|| obj.field.clone())
 }
 
-/// Compute TLP score for a single value (shared by scalarize_raw and vectorize_raw).
+/// Compute normalized TLP score for a single value (shared by `scalarize_raw`
+/// and `vectorize_raw`).
 fn objective_score(val: f64, obj_type: &str, target: Option<f64>, limit: Option<f64>) -> f64 {
     match obj_type {
         "minimize" => match (target, limit) {
@@ -4250,6 +4499,80 @@ mod tests {
                 &shared,
             ),
             serde_json::json!({"quality": 5.0})
+        );
+    }
+
+    #[test]
+    fn test_vector_refit_elites_use_group_cost_pareto_rank_and_crowding() {
+        let objectives = vec![
+            ObjectiveConfig {
+                field: "error".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 2.0,
+                group: Some("quality".to_string()),
+            },
+            ObjectiveConfig {
+                field: "calibration".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 0.5,
+                group: Some("quality".to_string()),
+            },
+            ObjectiveConfig {
+                field: "latency".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: Some("cost".to_string()),
+            },
+        ];
+        let mut leaderboard = DynLeaderboard::for_objectives(&objectives);
+
+        for (trial_id, candidate, metrics) in [
+            (
+                0,
+                "quality-boundary",
+                serde_json::json!({"error": 0.0, "calibration": 0.0, "latency": 10.0}),
+            ),
+            (
+                1,
+                "summed-cost-winner",
+                serde_json::json!({"error": 1.0, "calibration": 4.0, "latency": 4.0}),
+            ),
+            (
+                2,
+                "cost-boundary",
+                serde_json::json!({"error": 5.0, "calibration": 0.0, "latency": 0.0}),
+            ),
+        ] {
+            leaderboard.push_with_raw(
+                trial_id,
+                serde_json::json!({"candidate": candidate}),
+                metrics,
+                &objectives,
+            );
+        }
+
+        let middle = vectorize_raw(
+            &serde_json::json!({"error": 1.0, "calibration": 4.0, "latency": 4.0}),
+            &objectives,
+        );
+        assert_eq!(middle["quality"], 4.0);
+        assert_eq!(middle["cost"], 4.0);
+
+        let elites = leaderboard.top_k_for_refit(2, DEFAULT_MAX_REFIT_CANDIDATES, &objectives);
+        let names: Vec<&str> = elites
+            .iter()
+            .map(|(candidate, _)| candidate["candidate"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["quality-boundary", "cost-boundary"]);
+        assert!(
+            !names.contains(&"summed-cost-winner"),
+            "the summed-cost winner is an interior Pareto point and must lose the two-slot crowding tie-break"
         );
     }
 
@@ -4622,6 +4945,18 @@ mod tests {
     }
 
     #[test]
+    fn test_strategy_config_legacy_json_uses_refit_limit_defaults() {
+        let strategy: StrategyConfig = serde_json::from_value(serde_json::json!({
+            "type": "gmm",
+            "refit_interval": 20
+        }))
+        .unwrap();
+        assert_eq!(strategy.max_refit_samples, DEFAULT_MAX_REFIT_SAMPLES);
+        assert_eq!(strategy.max_refit_candidates, DEFAULT_MAX_REFIT_CANDIDATES);
+        validate_strategy_config(&strategy).unwrap();
+    }
+
+    #[test]
     fn test_dyn_space_builder_api() {
         let space = DynSpace::new()
             .add_real("x", 0.0, 1.0)
@@ -4955,6 +5290,8 @@ mod tests {
                 exploration_budget: None,
                 seed: None,
                 elite_fraction: None,
+                max_refit_samples: 4096,
+                max_refit_candidates: 16_384,
             })
         };
         let study = |n: usize, ty: &str| StudyConfig {
@@ -5024,6 +5361,8 @@ mod tests {
                 exploration_budget: None,
                 seed: Some(7),
                 elite_fraction: None,
+                max_refit_samples: 4096,
+                max_refit_candidates: 16_384,
             }),
             checkpoint: None,
             max_trials: None,
@@ -5048,6 +5387,39 @@ mod tests {
         let original_trial = engine.ask().await.unwrap();
         let reproduced_trial = reproduced.ask().await.unwrap();
         assert_eq!(original_trial.params, reproduced_trial.params);
+    }
+
+    #[tokio::test]
+    async fn test_refit_limits_are_exported_and_persisted_in_full_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint_path = dir.path().join("refit-limits.json");
+        let mut config = single_objective_config("gmm");
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.max_refit_samples = 17;
+        strategy.max_refit_candidates = 53;
+
+        let engine = HolaEngine::from_config(config).unwrap();
+        let exported = engine.study_config().await;
+        let exported_strategy = exported.strategy.as_ref().unwrap();
+        assert_eq!(exported_strategy.max_refit_samples, 17);
+        assert_eq!(exported_strategy.max_refit_candidates, 53);
+
+        engine
+            .save_full_checkpoint(&checkpoint_path, None)
+            .await
+            .unwrap();
+        let checkpoint: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+        assert_eq!(checkpoint["config"]["strategy"]["max_refit_samples"], 17);
+        assert_eq!(checkpoint["config"]["strategy"]["max_refit_candidates"], 53);
+
+        let restored = HolaEngine::load_from_checkpoint(&checkpoint_path)
+            .await
+            .unwrap();
+        let restored_config = restored.study_config().await;
+        let restored_strategy = restored_config.strategy.unwrap();
+        assert_eq!(restored_strategy.max_refit_samples, 17);
+        assert_eq!(restored_strategy.max_refit_candidates, 53);
     }
 
     #[tokio::test]
@@ -5945,7 +6317,11 @@ mod tests {
                 refit_at.push(cadence);
                 assert_eq!(
                     leaderboard
-                        .top_k_for_refit(config.selection_count(cadence), &objectives)
+                        .top_k_for_refit(
+                            config.selection_count(cadence),
+                            DEFAULT_MAX_REFIT_CANDIDATES,
+                            &objectives,
+                        )
                         .len(),
                     2
                 );
@@ -5982,19 +6358,315 @@ mod tests {
             }
             let leaderboard = DynLeaderboard::Scalar(inner);
             let started = Instant::now();
-            let workset = black_box(leaderboard.top_k_for_refit(MAX_REFIT_SAMPLES, &objectives));
+            let workset = black_box(leaderboard.top_k_for_refit(
+                DEFAULT_MAX_REFIT_SAMPLES,
+                DEFAULT_MAX_REFIT_CANDIDATES,
+                &objectives,
+            ));
             let elapsed = started.elapsed();
 
-            assert_eq!(workset.len(), history_size.min(MAX_REFIT_SAMPLES));
-            assert!(workset.len() <= MAX_REFIT_SAMPLES);
+            assert_eq!(workset.len(), history_size.min(DEFAULT_MAX_REFIT_SAMPLES));
+            assert!(workset.len() <= DEFAULT_MAX_REFIT_SAMPLES);
             assert!(
                 elapsed < std::time::Duration::from_secs(5),
                 "bounded refit selection exceeded the 5s debug budget at history={history_size}: {elapsed:?}"
             );
             eprintln!(
-                "history={history_size}, scanned_at_most={MAX_REFIT_CANDIDATES}, workset={}, selection={elapsed:?}",
+                "history={history_size}, covered_at_most={DEFAULT_MAX_REFIT_CANDIDATES}, workset={}, selection={elapsed:?}",
                 workset.len()
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "performance probe; run explicitly with --ignored --nocapture"]
+    fn multiobjective_refit_selection_scaling_probe() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        const HISTORY_SIZE: usize = 1_000;
+        const ELITE_COUNT: usize = 250;
+        for group_count in [2usize, 3, 5] {
+            let objectives: Vec<ObjectiveConfig> = (0..group_count)
+                .map(|group| ObjectiveConfig {
+                    field: format!("metric-{group}"),
+                    obj_type: "minimize".to_string(),
+                    target: None,
+                    limit: None,
+                    priority: 1.0,
+                    group: Some(format!("group-{group}")),
+                })
+                .collect();
+            let mut inner = Leaderboard::with_capacity(HISTORY_SIZE);
+            for trial in 0..HISTORY_SIZE {
+                let mut observation = BTreeMap::new();
+                observation.insert("group-0".to_string(), trial as f64);
+                observation.insert("group-1".to_string(), (HISTORY_SIZE - trial) as f64);
+                for group in 2..group_count {
+                    observation.insert(
+                        format!("group-{group}"),
+                        ((trial.wrapping_mul(37 + group)) % HISTORY_SIZE) as f64,
+                    );
+                }
+                inner.push(serde_json::json!({"trial": trial}), observation);
+            }
+            let leaderboard = DynLeaderboard::Vector(inner);
+
+            let started = Instant::now();
+            let elites =
+                black_box(leaderboard.top_k_for_refit(ELITE_COUNT, HISTORY_SIZE, &objectives));
+            let elapsed = started.elapsed();
+            assert_eq!(elites.len(), ELITE_COUNT);
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "{group_count}-group NSGA-II selection exceeded the debug-build budget: {elapsed:?}"
+            );
+            eprintln!(
+                "N={HISTORY_SIZE}, groups={group_count}, elites={ELITE_COUNT}, selection={elapsed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_batch_rankings_materialize_and_replay_exactly() {
+        let mut config = single_objective_config("random");
+        config.objectives = (0..3)
+            .map(|group| ObjectiveConfig {
+                field: format!("metric-{group}"),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: Some(format!("group-{group}")),
+            })
+            .collect();
+        let engine = HolaEngine::from_config(config).unwrap();
+        let mut completions = Vec::new();
+        for index in 0..24u64 {
+            let trial = engine.ask().await.unwrap();
+            let metrics = serde_json::json!({
+                "metric-0": (index * 17 % 23) as f64,
+                "metric-1": ((23 - index) * 11 % 29) as f64,
+                "metric-2": (index * index % 31) as f64,
+            });
+            engine
+                .tell_without_ranking(trial.trial_id, metrics.clone())
+                .await
+                .unwrap();
+            completions.push((trial.trial_id, metrics));
+        }
+
+        {
+            let state = engine.state.read().await;
+            assert_eq!(state.deferred_completion_receipts, completions.len());
+            assert!(
+                state
+                    .completion_receipts
+                    .values()
+                    .all(|receipt| receipt.ranking_deferred)
+            );
+        }
+
+        engine.finalize_deferred_rankings().await.unwrap();
+        let final_view: BTreeMap<u64, CompletedTrial> = engine
+            .trials("rank", true)
+            .await
+            .into_iter()
+            .map(|trial| (trial.trial_id, trial))
+            .collect();
+        {
+            let state = engine.state.read().await;
+            assert_eq!(state.deferred_completion_receipts, 0);
+            assert!(
+                state
+                    .completion_receipts
+                    .values()
+                    .all(|receipt| !receipt.ranking_deferred)
+            );
+        }
+
+        for (trial_id, metrics) in completions {
+            let replay = engine.tell_with_outcome(trial_id, metrics).await.unwrap();
+            let expected = &final_view[&trial_id];
+            assert!(!replay.newly_committed);
+            assert_eq!(replay.completed.rank, expected.rank);
+            assert_eq!(replay.completed.pareto_front, expected.pareto_front);
+            assert_eq!(replay.completed.score_vector, expected.score_vector);
+        }
+    }
+
+    #[tokio::test]
+    async fn public_tell_materializes_a_deferred_batch_before_replay() {
+        let mut config = single_objective_config("random");
+        config.objectives = vec![
+            ObjectiveConfig {
+                field: "a".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: Some("a".to_string()),
+            },
+            ObjectiveConfig {
+                field: "b".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: Some("b".to_string()),
+            },
+            ObjectiveConfig {
+                field: "c".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: Some("c".to_string()),
+            },
+        ];
+        let engine = HolaEngine::from_config(config).unwrap();
+        let mut completions = Vec::new();
+        for index in 0..5u64 {
+            let trial = engine.ask().await.unwrap();
+            let metrics = serde_json::json!({
+                "a": index as f64,
+                "b": (5 - index) as f64,
+                "c": (index * 3 % 5) as f64,
+            });
+            engine
+                .tell_without_ranking(trial.trial_id, metrics.clone())
+                .await
+                .unwrap();
+            completions.push((trial.trial_id, metrics));
+        }
+
+        let (trial_id, metrics) = completions[2].clone();
+        let replay = engine.tell_with_outcome(trial_id, metrics).await.unwrap();
+        assert!(!replay.newly_committed);
+        assert_eq!(engine.state.read().await.deferred_completion_receipts, 0);
+        let current = engine.completed_trial(trial_id, true).await.unwrap();
+        assert_eq!(replay.completed.rank, current.rank);
+        assert_eq!(replay.completed.pareto_front, current.pareto_front);
+    }
+
+    #[tokio::test]
+    async fn bounded_batch_never_evicts_an_unranked_receipt() {
+        let mut config = single_objective_config("random");
+        config.max_leaderboard_size = Some(2);
+        let engine = HolaEngine::from_config(config).unwrap();
+        let mut completions = Vec::new();
+        for loss in [0.4, 0.2, 0.3] {
+            let trial = engine.ask().await.unwrap();
+            let metrics = serde_json::json!({"loss": loss});
+            engine
+                .tell_without_ranking(trial.trial_id, metrics.clone())
+                .await
+                .unwrap();
+            completions.push((trial.trial_id, metrics));
+        }
+
+        let state = engine.state.read().await;
+        assert_eq!(state.leaderboard.len(), 2);
+        assert_eq!(state.deferred_completion_receipts, 0);
+        assert!(
+            state
+                .completion_receipts
+                .values()
+                .all(|receipt| !receipt.ranking_deferred)
+        );
+        drop(state);
+
+        // The first trial has left the bounded leaderboard, so this successful
+        // replay proves its exact receipt was materialized before eviction.
+        let replay = engine
+            .tell_with_outcome(completions[0].0, completions[0].1.clone())
+            .await
+            .unwrap();
+        assert!(!replay.newly_committed);
+        assert_eq!(replay.completed.trial_id, completions[0].0);
+    }
+
+    #[tokio::test]
+    async fn deferred_receipts_round_trip_through_a_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deferred.json");
+        let engine = HolaEngine::from_config(single_objective_config("random")).unwrap();
+        let mut completions = Vec::new();
+        for loss in [0.8, 0.1, 0.5] {
+            let trial = engine.ask().await.unwrap();
+            let metrics = serde_json::json!({"loss": loss});
+            engine
+                .tell_without_ranking(trial.trial_id, metrics.clone())
+                .await
+                .unwrap();
+            completions.push((trial.trial_id, metrics));
+        }
+        engine.save(path.to_str().unwrap()).await.unwrap();
+
+        let restored = HolaEngine::load_from_checkpoint(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.state.read().await.deferred_completion_receipts,
+            completions.len()
+        );
+        restored.finalize_deferred_rankings().await.unwrap();
+        let replay = restored
+            .tell_with_outcome(completions[1].0, completions[1].1.clone())
+            .await
+            .unwrap();
+        assert!(!replay.newly_committed);
+        assert_eq!(replay.completed.rank, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "performance probe; run explicitly with --ignored --nocapture"]
+    async fn deferred_multiobjective_batch_scaling_probe() {
+        use std::time::Instant;
+
+        for group_count in [3usize, 5] {
+            for sample_count in [100usize, 200, 500, 1_000] {
+                let mut config = single_objective_config("random");
+                config.objectives = (0..group_count)
+                    .map(|group| ObjectiveConfig {
+                        field: format!("metric-{group}"),
+                        obj_type: "minimize".to_string(),
+                        target: None,
+                        limit: None,
+                        priority: 1.0,
+                        group: Some(format!("group-{group}")),
+                    })
+                    .collect();
+                let engine = HolaEngine::from_config(config).unwrap();
+                let started = Instant::now();
+                for index in 0..sample_count {
+                    let trial = engine.ask().await.unwrap();
+                    let metrics = serde_json::Value::Object(
+                        (0..group_count)
+                            .map(|group| {
+                                (
+                                    format!("metric-{group}"),
+                                    serde_json::json!(
+                                        (index.wrapping_mul(37 + group) % sample_count) as f64
+                                    ),
+                                )
+                            })
+                            .collect(),
+                    );
+                    engine
+                        .tell_without_ranking(trial.trial_id, metrics)
+                        .await
+                        .unwrap();
+                }
+                let commits = started.elapsed();
+                let finalize_started = Instant::now();
+                engine.finalize_deferred_rankings().await.unwrap();
+                let finalize = finalize_started.elapsed();
+                eprintln!(
+                    "N={sample_count}, groups={group_count}, commits={commits:?}, finalize={finalize:?}, total={:?}",
+                    started.elapsed()
+                );
+            }
         }
     }
 

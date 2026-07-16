@@ -75,6 +75,8 @@ fn sobol_config(seed: u64) -> StudyConfig {
             exploration_budget: None,
             seed: Some(seed),
             elite_fraction: None,
+            max_refit_samples: 4096,
+            max_refit_candidates: 16_384,
         }),
         checkpoint: None,
         max_trials: None,

@@ -15,10 +15,14 @@ Demonstrates the core HOLA workflow with TLP scoring:
   1. Minimizing 1D Forrester function using study.run()
   2. Minimizing 2D Branin function using ask/tell loop with Sobol
 
-TLP (Target-Limit-Priority) scoring normalizes each objective to [0, 1]:
+With the default priority of 1, TLP (Target-Limit-Priority) scoring maps:
   - At or below target: score = 0 (satisfied)
   - Between target and limit: score in (0, 1) (acceptable)
+  - At the limit: score = 1
   - Beyond limit: score = inf (infeasible)
+
+In general, priority P is the score at the limit and relative weight; the
+linear segment's slope is P / (limit - target).
 """
 
 from benchmarks.functions.single_objective import branin, forrester

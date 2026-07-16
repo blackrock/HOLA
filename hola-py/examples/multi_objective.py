@@ -16,9 +16,9 @@ using TLP scoring. Each objective is assigned to a separate group via
 the `group` parameter, so HOLA computes a Pareto front over the two
 TLP-normalized group costs rather than raw values.
 
-The `priority` parameter is the per-objective weight (slope P_i) in
-the TLP formula; `group` controls which objectives are combined into
-the same Pareto axis.
+The `priority` parameter is the per-objective score at the limit and relative
+weight P_i; the linear segment's slope is P_i / (limit - target). `group`
+controls which objectives are combined into the same Pareto axis.
 """
 
 from hola_opt import Integer, Minimize, Real, Space, Study

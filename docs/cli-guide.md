@@ -144,9 +144,9 @@ following fields.
 |-------|----------|-------------|
 | `field` | yes | The metrics field name to optimize |
 | `type` | yes | `"minimize"` or `"maximize"` |
-| `priority` | no | Relative weight (default: 1.0) |
 | `target` | no | The "satisfactory" value (for TLP) |
-| `limit` | no | The "unacceptable" value (for TLP) |
+| `limit` | no | The worst acceptable boundary (for TLP) |
+| `priority` | no | TLP score at the limit (when configured) and relative weight (default: 1.0) |
 | `group` | no | Priority group name. Objectives in the same group are summed; distinct groups form Pareto axes. Omit for single-group (scalar) studies. |
 
 ```yaml
@@ -175,6 +175,8 @@ strategy:
   seed: 42                 # optional seed for reproducible runs
   exploration_budget: 50   # number of Sobol asks before switching to GMM
   elite_fraction: 0.25     # fraction of top trials used for GMM fitting (default: 0.25)
+  max_refit_samples: 4096  # maximum elite samples passed to one GMM fit
+  max_refit_candidates: 16384  # maximum trials ranked to choose elites
 ```
 
 | Field | Default | Description |
@@ -184,6 +186,12 @@ strategy:
 | `seed` | none | Seed for reproducible runs. When omitted, HOLA draws one seed once and records it in full checkpoints. |
 | `exploration_budget` | none | Number of issued Sobol exploration suggestions before switching to GMM exploitation. Pending asks count against this budget. When omitted, we use a formula based on `total_budget`. |
 | `elite_fraction` | `0.25` | Fraction of top trials used for GMM refitting. Must be in (0.0, 1.0]. |
+| `max_refit_samples` | `4096` | Maximum elite samples passed to one GMM fit. Must be at least 1. |
+| `max_refit_candidates` | `16384` | Maximum retained trials ranked to choose elites. Must be at least `max_refit_samples`; longer histories use deterministic stratified coverage of the full retained history. |
+
+GMM exploitation uses seeded Owen-scrambled Gauss–Sobol' points. One Sobol'
+coordinate selects the mixture component, and inverse-normal coordinates sample
+within that component.
 
 ### Checkpoint Configuration
 

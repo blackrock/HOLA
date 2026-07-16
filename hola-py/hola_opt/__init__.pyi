@@ -74,9 +74,10 @@ class Minimize:
         field: Name of the metric to minimize (must appear in the dict returned
             by the objective function).
         target: "Good enough" value -- at or below this, the TLP score is 0.
-        limit: "Unacceptable" value -- beyond this, the trial is infeasible
+        limit: Worst acceptable value -- beyond this, the trial is infeasible
             (score = inf).
-        priority: Per-objective weight/slope in the TLP formula. Default 1.0.
+        priority: Score at the limit and relative weight P. The linear segment's
+            slope is P / (limit - target). Default 1.0.
         group: Priority-group label. Objectives sharing the same group are summed
             into one component of the group-cost vector for Pareto ranking. When
             omitted, defaults to the field name (one group per objective).
@@ -103,9 +104,10 @@ class Maximize:
         field: Name of the metric to maximize (must appear in the dict returned
             by the objective function).
         target: "Good enough" value -- at or above this, the TLP score is 0.
-        limit: "Unacceptable" value -- below this, the trial is infeasible
+        limit: Worst acceptable value -- below this, the trial is infeasible
             (score = inf).
-        priority: Per-objective weight/slope in the TLP formula. Default 1.0.
+        priority: Score at the limit and relative weight P. The linear segment's
+            slope is P / (limit - target). Default 1.0.
         group: Priority-group label. See ``Minimize`` for details.
     """
 
@@ -137,20 +139,28 @@ class Gmm:
         exploration_budget: Number of Sobol exploration trials before GMM
             exploitation begins. When omitted, computed automatically from
             the number of dimensions.
+        max_refit_samples: Maximum elite samples used by one GMM fit
+            (default: 4096).
+        max_refit_candidates: Maximum retained trials ranked during elite
+            selection (default: 16384). Longer histories use deterministic
+            stratified coverage.
 
     Raises:
-        ConfigurationError: If ``elite_fraction`` is non-finite or outside the range
-            ``(0.0, 1.0]``, or if ``refit_interval`` is ``0``.
+        ConfigurationError: If a fraction, interval, or refit limit is invalid.
     """
 
     refit_interval: int | None
     elite_fraction: float | None
     exploration_budget: int | None
+    max_refit_samples: int | None
+    max_refit_candidates: int | None
     def __init__(
         self,
         refit_interval: int | None = None,
         elite_fraction: float | None = None,
         exploration_budget: int | None = None,
+        max_refit_samples: int | None = None,
+        max_refit_candidates: int | None = None,
     ) -> None: ...
 
 class Sobol:

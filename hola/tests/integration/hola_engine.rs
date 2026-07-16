@@ -115,6 +115,8 @@ fn valid_config_for_validation() -> StudyConfig {
             exploration_budget: None,
             seed: None,
             elite_fraction: None,
+            max_refit_samples: 4096,
+            max_refit_candidates: 16_384,
         }),
         checkpoint: None,
         max_trials: None,
@@ -244,6 +246,29 @@ fn test_dyn_engine_config_validation_rejects_invalid_refit_and_priority() {
     let mut elite_fraction = valid_config_for_validation();
     elite_fraction.strategy.as_mut().unwrap().elite_fraction = Some(f64::NAN);
     assert_config_error(elite_fraction, &["strategy.elite_fraction", "finite"]);
+
+    let mut zero_fit_samples = valid_config_for_validation();
+    zero_fit_samples
+        .strategy
+        .as_mut()
+        .unwrap()
+        .max_refit_samples = 0;
+    assert_config_error(
+        zero_fit_samples,
+        &["strategy.max_refit_samples", "at least 1"],
+    );
+
+    let mut undersized_candidate_workset = valid_config_for_validation();
+    let strategy = undersized_candidate_workset.strategy.as_mut().unwrap();
+    strategy.max_refit_samples = 100;
+    strategy.max_refit_candidates = 99;
+    assert_config_error(
+        undersized_candidate_workset,
+        &[
+            "strategy.max_refit_candidates",
+            "at least max_refit_samples (100)",
+        ],
+    );
 }
 
 // ==========================================================================
@@ -627,6 +652,8 @@ async fn test_dyn_engine_strategy_types() {
             exploration_budget: None,
             seed: None,
             elite_fraction: None,
+            max_refit_samples: 4096,
+            max_refit_candidates: 16_384,
         }),
         checkpoint: None,
         max_trials: None,
@@ -660,6 +687,8 @@ async fn test_dyn_engine_strategy_types() {
             exploration_budget: None,
             seed: None,
             elite_fraction: None,
+            max_refit_samples: 4096,
+            max_refit_candidates: 16_384,
         }),
         checkpoint: None,
         max_trials: None,
@@ -1213,6 +1242,8 @@ async fn test_dyn_engine_gmm_with_refit() {
             exploration_budget: None,
             seed: None,
             elite_fraction: None,
+            max_refit_samples: 4096,
+            max_refit_candidates: 16_384,
         }),
         checkpoint: None,
         max_trials: None,
@@ -1258,6 +1289,8 @@ async fn test_refit_excludes_infeasible_scalar() {
             exploration_budget: None,
             seed: None,
             elite_fraction: None,
+            max_refit_samples: 4096,
+            max_refit_candidates: 16_384,
         }),
         checkpoint: None,
         max_trials: None,
@@ -1309,6 +1342,8 @@ async fn test_update_objectives_triggers_refit() {
             exploration_budget: None,
             seed: None,
             elite_fraction: None,
+            max_refit_samples: 4096,
+            max_refit_candidates: 16_384,
         }),
         checkpoint: None,
         max_trials: None,
@@ -1394,6 +1429,8 @@ async fn test_dyn_engine_concurrent_refit_serialization() {
             exploration_budget: Some(4),
             seed: Some(7),
             elite_fraction: None,
+            max_refit_samples: 4096,
+            max_refit_candidates: 16_384,
         }),
         checkpoint: None,
         max_trials: None,
@@ -1768,6 +1805,8 @@ async fn test_full_version_one_checkpoint_migrates_without_runtime_state() {
         exploration_budget: None,
         seed: Some(17),
         elite_fraction: None,
+        max_refit_samples: 4096,
+        max_refit_candidates: 16_384,
     });
     let engine = HolaEngine::from_config(config).unwrap();
     let first = engine.ask().await.unwrap();
@@ -1974,6 +2013,8 @@ async fn leaderboard_reimport_uses_completed_count_not_sparse_trial_ids_as_sampl
             exploration_budget: Some(10),
             seed: Some(73),
             elite_fraction: Some(0.5),
+            max_refit_samples: 4096,
+            max_refit_candidates: 16_384,
         });
 
         // Establish the deterministic fifth sample for this strategy after four
@@ -2067,6 +2108,8 @@ fn auto_strategy_test_config(exploration_budget: usize, seed: u64) -> StudyConfi
             exploration_budget: Some(exploration_budget),
             seed: Some(seed),
             elite_fraction: None,
+            max_refit_samples: 4096,
+            max_refit_candidates: 16_384,
         }),
         checkpoint: None,
         max_trials: None,
@@ -2083,6 +2126,8 @@ fn sobol_strategy_test_config(seed: u64) -> StudyConfig {
         exploration_budget: None,
         seed: Some(seed),
         elite_fraction: None,
+        max_refit_samples: 4096,
+        max_refit_candidates: 16_384,
     });
     config
 }
@@ -2157,6 +2202,8 @@ async fn test_auto_strategy_with_explicit_exploration_budget() {
             exploration_budget: Some(10), // switch to GMM after 10 trials
             seed: None,
             elite_fraction: None,
+            max_refit_samples: 4096,
+            max_refit_candidates: 16_384,
         }),
         checkpoint: None,
         max_trials: None,
@@ -2274,6 +2321,8 @@ async fn test_seed_determinism_sobol() {
                 exploration_budget: None,
                 seed: Some(seed),
                 elite_fraction: None,
+                max_refit_samples: 4096,
+                max_refit_candidates: 16_384,
             }),
             checkpoint: None,
             max_trials: None,
@@ -2322,6 +2371,8 @@ async fn test_seed_determinism_random() {
                 exploration_budget: None,
                 seed: Some(seed),
                 elite_fraction: None,
+                max_refit_samples: 4096,
+                max_refit_candidates: 16_384,
             }),
             checkpoint: None,
             max_trials: None,
@@ -2383,6 +2434,8 @@ async fn test_pareto_front_multi_objective() {
             exploration_budget: None,
             seed: Some(0),
             elite_fraction: None,
+            max_refit_samples: 4096,
+            max_refit_candidates: 16_384,
         }),
         checkpoint: None,
         max_trials: None,
@@ -2453,6 +2506,8 @@ async fn test_live_vector_ranks_respect_direction_and_never_promote_infeasible_t
             exploration_budget: None,
             seed: Some(7),
             elite_fraction: None,
+            max_refit_samples: 4096,
+            max_refit_candidates: 16_384,
         }),
         checkpoint: None,
         max_trials: None,
@@ -2619,6 +2674,8 @@ fn concurrency_test_config() -> StudyConfig {
             exploration_budget: Some(8),
             seed: Some(7),
             elite_fraction: None,
+            max_refit_samples: 4096,
+            max_refit_candidates: 16_384,
         }),
         checkpoint: None,
         max_trials: None,
