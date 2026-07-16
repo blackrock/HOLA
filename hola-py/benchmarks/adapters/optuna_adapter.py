@@ -21,6 +21,7 @@ import optuna
 from benchmarks.adapters.base import (
     MultiObjectiveResult,
     SingleObjectiveResult,
+    assert_exact_evaluations,
 )
 from benchmarks.problems.registry import (
     MultiObjectiveProblem,
@@ -35,6 +36,14 @@ class OptunaTPEAdapter:
     """Tree-structured Parzen Estimator via Optuna."""
 
     name = "TPE"
+
+    def configuration(self, budget: int) -> dict[str, object]:
+        return {
+            "adapter": type(self).__name__,
+            "sampler": "TPESampler",
+            "sampler_parameters": "documented defaults",
+            "budget": budget,
+        }
 
     def optimize(
         self,
@@ -59,11 +68,14 @@ class OptunaTPEAdapter:
         t0 = time.perf_counter()
         study.optimize(objective, n_trials=budget, show_progress_bar=False)
         wall_time = time.perf_counter() - t0
+        n_evaluations = len(study.trials)
+        assert_exact_evaluations(n_evaluations, budget, self.name)
 
         return SingleObjectiveResult(
             best_value=study.best_value,
             best_params=study.best_params,
             wall_time_seconds=wall_time,
+            n_evaluations=n_evaluations,
             convergence_trace=trace,
         )
 
@@ -72,6 +84,14 @@ class OptunaNSGAIIAdapter:
     """NSGA-II via Optuna for multi-objective optimization."""
 
     name = "NSGA-II (Optuna)"
+
+    def configuration(self, budget: int) -> dict[str, object]:
+        return {
+            "adapter": type(self).__name__,
+            "sampler": "NSGAIISampler",
+            "sampler_parameters": "documented defaults",
+            "budget": budget,
+        }
 
     def optimize(
         self,
@@ -93,15 +113,35 @@ class OptunaNSGAIIAdapter:
         t0 = time.perf_counter()
         study.optimize(objective, n_trials=budget, show_progress_bar=False)
         wall_time = time.perf_counter() - t0
+        n_evaluations = len(study.trials)
+        assert_exact_evaluations(n_evaluations, budget, self.name)
 
         # Extract Pareto front from best trials
-        pareto_trials = study.best_trials
-        if pareto_trials:
-            front = np.array([list(t.values) for t in pareto_trials if t.values is not None])
+        selected_trials = []
+        front_rows: list[list[int | float]] = []
+        for trial in study.best_trials:
+            values = trial.values
+            if (
+                values is not None
+                and all(np.isfinite(value) for value in values)
+                and not problem.is_infeasible_objectives(values)
+            ):
+                selected_trials.append(trial)
+                front_rows.append(list(values))
+        if selected_trials:
+            front = np.array(front_rows)
+            param_names = list(problem.bounds)
+            decision_vectors = np.asarray(
+                [[trial.params[name] for name in param_names] for trial in selected_trials],
+                dtype=object,
+            )
         else:
             front = np.empty((0, problem.n_objectives))
+            decision_vectors = np.empty((0, problem.dimensionality), dtype=object)
 
         return MultiObjectiveResult(
             pareto_front=front,
             wall_time_seconds=wall_time,
+            n_evaluations=n_evaluations,
+            decision_vectors=decision_vectors,
         )

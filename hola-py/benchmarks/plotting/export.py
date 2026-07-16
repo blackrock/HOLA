@@ -13,14 +13,33 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pgf import LatexError
+
+_pgf_available: bool | None = None
 
 
 def save_figure(fig: plt.Figure, output_dir: Path, name: str) -> None:
-    """Save figure in PDF, PNG, and PGF formats."""
+    """Save PDF and PNG, plus PGF when the local TeX installation supports it."""
+    global _pgf_available
+
     output_dir.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_dir / f"{name}.pdf", bbox_inches="tight", dpi=300)
     fig.savefig(output_dir / f"{name}.png", bbox_inches="tight", dpi=300)
-    fig.savefig(output_dir / f"{name}.pgf", bbox_inches="tight")
+    if _pgf_available is False:
+        return
+    pgf_path = output_dir / f"{name}.pgf"
+    try:
+        fig.savefig(pgf_path, bbox_inches="tight")
+    except (LatexError, FileNotFoundError, OSError, RuntimeError) as error:
+        _pgf_available = False
+        pgf_path.unlink(missing_ok=True)
+        warnings.warn(
+            f"disabling optional PGF export: {type(error).__name__}",
+            stacklevel=2,
+        )
+    else:
+        _pgf_available = True

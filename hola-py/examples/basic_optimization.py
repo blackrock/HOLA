@@ -33,7 +33,7 @@ def example_1d():
     """Optimize the 1D Forrester function."""
     print("=" * 60)
     print("Example 1: Forrester function (1D)")
-    print("  Known minimum: -6.0267 at x ≈ 0.7572")
+    print("  Known minimum: -6.02074 at x ≈ 0.75725")
     print("=" * 60)
 
     study = Study(
@@ -48,7 +48,7 @@ def example_1d():
     print(f"\n  Best found: {best.metrics['value']:.4f}")
     print(f"  TLP score:  {best.scores['value']:.4f}  (0 = at target, 1 = at limit)")
     print(f"  At x = {best.params['x']:.4f}")
-    print(f"  Gap from known optimum: {best.metrics['value'] - (-6.0267):.4f}")
+    print(f"  Gap from known optimum: {best.metrics['value'] - (-6.0207400558):.4f}")
     print()
 
 

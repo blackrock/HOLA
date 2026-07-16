@@ -25,7 +25,7 @@ class RunConfig:
     output_dir: Path = Path("benchmark_results")
     n_runs: int = 50
     n_workers: int = 0  # 0 = os.cpu_count()
-    budgets: list[int] = field(default_factory=lambda: [25, 50, 75, 100, 200, 500, 1000])
+    budgets: list[int] = field(default_factory=lambda: [200, 500, 1000, 2000])
     problems: list[str] | None = None  # None = all, or filter by name
     optimizers: list[str] | None = None  # None = all, or filter by name
     resume: bool = True  # Skip already-completed runs

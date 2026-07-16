@@ -20,7 +20,7 @@ import itertools
 import time
 import warnings
 
-from benchmarks.adapters.base import SingleObjectiveResult
+from benchmarks.adapters.base import SingleObjectiveResult, assert_exact_evaluations
 from benchmarks.problems.registry import SingleObjectiveProblem
 
 
@@ -35,6 +35,14 @@ class IGRAdapter:
 
     def __init__(self, spacing: int = 4) -> None:
         self.spacing = spacing
+
+    def configuration(self, budget: int) -> dict[str, object]:
+        return {
+            "adapter": type(self).__name__,
+            "spacing": self.spacing,
+            "budget": budget,
+            "domain": "normalized unit hypercube",
+        }
 
     def optimize(
         self,
@@ -106,10 +114,12 @@ class IGRAdapter:
                 upper[j] = min(1.0, best_in_gen_norm[j] + half_step)
 
         wall_time = time.perf_counter() - t0
+        assert_exact_evaluations(evals, budget, self.name)
 
         return SingleObjectiveResult(
             best_value=best_value,
             best_params=best_params,
             wall_time_seconds=wall_time,
+            n_evaluations=evals,
             convergence_trace=trace,
         )

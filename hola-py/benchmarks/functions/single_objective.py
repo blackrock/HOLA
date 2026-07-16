@@ -36,7 +36,7 @@ def _extract_vec(p: dict[str, float]) -> list[float]:
 
 
 def forrester(p: dict[str, float]) -> float:
-    """Forrester et al. (2008). Domain: x in [0, 1]. Min: -6.0267."""
+    """Forrester et al. (2008). Domain: x in [0, 1]. Min: -6.0207400558."""
     x = p["x"]
     return (6 * x - 2) ** 2 * math.sin(12 * x - 4)
 
@@ -53,7 +53,7 @@ def gramacy_lee(p: dict[str, float]) -> float:
 
 
 def branin(p: dict[str, float]) -> float:
-    """Branin-Hoo. Domain: x1 in [-5, 10], x2 in [0, 15]. Min: 0.397887."""
+    """Branin-Hoo. Domain: x1 in [-5, 10], x2 in [0, 15]. Min: 0.3978873577."""
     x1, x2 = p["x1"], p["x2"]
     a, b, c = 1, 5.1 / (4 * math.pi**2), 5 / math.pi
     r, s, t = 6, 10, 1 / (8 * math.pi)
@@ -67,7 +67,7 @@ def bukin_6(p: dict[str, float]) -> float:
 
 
 def cross_in_tray(p: dict[str, float]) -> float:
-    """Cross-in-Tray. Domain: x1, x2 in [-10, 10]. Min: -2.06261."""
+    """Cross-in-Tray. Domain: x1, x2 in [-10, 10]. Min: -2.0626118708."""
     x1, x2 = p["x1"], p["x2"]
     inner = abs(
         math.sin(x1) * math.sin(x2) * math.exp(abs(100 - math.sqrt(x1**2 + x2**2) / math.pi))
@@ -83,7 +83,7 @@ def drop_wave(p: dict[str, float]) -> float:
 
 
 def egg_holder(p: dict[str, float]) -> float:
-    """Egg Holder. Domain: x1, x2 in [-512, 512]. Min: -959.6407."""
+    """Egg Holder. Domain: x1, x2 in [-512, 512]. Min: -959.6406627209."""
     x1, x2 = p["x1"], p["x2"]
     t1 = (x2 + 47) * math.sin(math.sqrt(abs(x2 + x1 / 2 + 47)))
     t2 = x1 * math.sin(math.sqrt(abs(x1 - (x2 + 47))))
@@ -91,7 +91,7 @@ def egg_holder(p: dict[str, float]) -> float:
 
 
 def holder_table(p: dict[str, float]) -> float:
-    """Holder Table. Domain: x1, x2 in [-10, 10]. Min: -19.2085."""
+    """Holder Table. Domain: x1, x2 in [-10, 10]. Min: -19.2085025679."""
     x1, x2 = p["x1"], p["x2"]
     return -abs(math.sin(x1) * math.cos(x2) * math.exp(abs(1 - math.sqrt(x1**2 + x2**2) / math.pi)))
 
@@ -130,7 +130,7 @@ def shubert(p: dict[str, float]) -> float:
 
 
 def six_hump_camel(p: dict[str, float]) -> float:
-    """Six-Hump Camel. Domain: x1 in [-3, 3], x2 in [-2, 2]. Min: -1.0316."""
+    """Six-Hump Camel. Domain: x1 in [-3, 3], x2 in [-2, 2]. Min: -1.0316284535."""
     x1, x2 = p["x1"], p["x2"]
     t1 = (4 - 2.1 * x1**2 + x1**4 / 3) * x1**2
     t2 = x1 * x2
@@ -175,7 +175,7 @@ def rosenbrock(p: dict[str, float]) -> float:
 
 
 def schwefel(p: dict[str, float]) -> float:
-    """Schwefel. Domain: xi in [-500, 500]. Min: 0."""
+    """Schwefel. Domain: xi in [-500, 500]. Min: 1.2727566e-5 per dimension."""
     x = _extract_vec(p)
     n = len(x)
     return 418.9829 * n - sum(xi * math.sin(math.sqrt(abs(xi))) for xi in x)

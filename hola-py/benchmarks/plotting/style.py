@@ -24,6 +24,10 @@ OPTIMIZER_COLORS: dict[str, str] = {
     "HOLA MO (GMM)": "#1f77b4",
     "HOLA MO (sobol)": "#aec7e8",
     "HOLA MO (random)": "#c7c7c7",
+    "HOLA HPO (GMM)": "#1f77b4",
+    "HOLA HPO (sobol)": "#aec7e8",
+    "HOLA HPO (random)": "#c7c7c7",
+    "HOLA grouped TLP (GMM)": "#1f77b4",
     "Random x2": "#9467bd",
     "TPE": "#ff7f0e",
     "IGR": "#2ca02c",
@@ -34,6 +38,7 @@ OPTIMIZER_COLORS: dict[str, str] = {
     "NSGA-II (Optuna)": "#ff7f0e",
     "NSGA-II (pymoo)": "#d62728",
     "MOEA/D": "#2ca02c",
+    "Optuna HPO (TPE)": "#ff7f0e",
 }
 
 

@@ -211,6 +211,19 @@ jobs:
             "$GITHUB_WORKSPACE/hola-py/tests/test_benchmarks_smoke.py" -v --timeout=60
         working-directory: hola-py
 
+      - name: Run benchmark protocol tests
+        if: matrix.python-version == '3.12'
+        shell: bash
+        run: |
+          benchmark_imports="$RUNNER_TEMP/hola-benchmark-imports"
+          mkdir -p "$benchmark_imports"
+          cp -R benchmarks "$benchmark_imports/benchmarks"
+          cd "$RUNNER_TEMP"
+          PYTHONPATH="$benchmark_imports" \
+            "$GITHUB_WORKSPACE/hola-py/.venv/bin/python" -m pytest \
+            "$GITHUB_WORKSPACE/hola-py/tests" -m benchmarks -v --timeout=300
+        working-directory: hola-py
+
       - name: Run doc code block tests
         shell: bash
         run: |

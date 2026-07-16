@@ -9,6 +9,10 @@
   Configurable sample and candidate limits bound refit work while preserving
   deterministic coverage of long retained histories, and batched completions
   can defer repeated multi-objective ranking until the batch is committed.
+- Benchmark campaigns now enforce exact completed-evaluation budgets, paired
+  seeds, immutable provenance manifests, failure-visible reporting, fixed
+  metric scales, and strict result-coverage validation. The suite also adds
+  analytic grouped-TLP and sealed-test mixed-space HPO capability studies.
 
 ## 1.0.1-rc8
 

@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 from benchmarks.functions import single_objective as f
-from benchmarks.functions.real_world import gbr_diabetes
 from benchmarks.problems.registry import SingleObjectiveProblem
 
 
@@ -39,7 +38,8 @@ _register(
         name="forrester_1d",
         func=f.forrester,
         bounds={"x": (0.0, 1.0)},
-        known_minimum=-6.0207,
+        known_minimum=-6.0207400557670825,
+        family="forrester",
         description="1D, multiple local minima",
     )
 )
@@ -50,7 +50,8 @@ _register(
         name="branin_2d",
         func=f.branin,
         bounds={"x1": (-5.0, 10.0), "x2": (0.0, 15.0)},
-        known_minimum=0.397887,
+        known_minimum=0.39788735772973816,
+        family="branin",
         description="2D, three global minima",
     )
 )
@@ -60,6 +61,7 @@ _register(
         func=f.bukin_6,
         bounds={"x1": (-15.0, -5.0), "x2": (-3.0, 3.0)},
         known_minimum=0.0,
+        family="bukin6",
         description="2D, narrow valley",
     )
 )
@@ -68,7 +70,8 @@ _register(
         name="cross_in_tray_2d",
         func=f.cross_in_tray,
         bounds={"x1": (-10.0, 10.0), "x2": (-10.0, 10.0)},
-        known_minimum=-2.06261,
+        known_minimum=-2.062611870822739,
+        family="cross_in_tray",
         description="2D, four symmetric minima",
     )
 )
@@ -78,6 +81,7 @@ _register(
         func=f.drop_wave,
         bounds={"x1": (-5.12, 5.12), "x2": (-5.12, 5.12)},
         known_minimum=-1.0,
+        family="drop_wave",
         description="2D, many local minima",
     )
 )
@@ -86,7 +90,8 @@ _register(
         name="egg_holder_2d",
         func=f.egg_holder,
         bounds={"x1": (-512.0, 512.0), "x2": (-512.0, 512.0)},
-        known_minimum=-959.6407,
+        known_minimum=-959.6406627208507,
+        family="egg_holder",
         description="2D, deceptive landscape",
     )
 )
@@ -95,7 +100,8 @@ _register(
         name="holder_table_2d",
         func=f.holder_table,
         bounds={"x1": (-10.0, 10.0), "x2": (-10.0, 10.0)},
-        known_minimum=-19.2085,
+        known_minimum=-19.20850256788675,
+        family="holder_table",
         description="2D, four symmetric minima",
     )
 )
@@ -105,6 +111,7 @@ _register(
         func=f.levy_13,
         bounds={"x1": (-10.0, 10.0), "x2": (-10.0, 10.0)},
         known_minimum=0.0,
+        family="levy13",
         description="2D, many local minima",
     )
 )
@@ -113,7 +120,8 @@ _register(
         name="six_hump_camel_2d",
         func=f.six_hump_camel,
         bounds={"x1": (-3.0, 3.0), "x2": (-2.0, 2.0)},
-        known_minimum=-1.0316,
+        known_minimum=-1.031628453489877,
+        family="six_hump_camel",
         description="2D, six local minima",
     )
 )
@@ -126,6 +134,7 @@ for nd in (2, 5, 7):
             func=f.ackley,
             bounds=_nd_bounds(nd, -32.768, 32.768),
             known_minimum=0.0,
+            family="ackley",
             description=f"{nd}D, exponential + cosine, multimodal",
         )
     )
@@ -138,9 +147,14 @@ for nd in (2, 5, 7):
             func=f.rastrigin,
             bounds=_nd_bounds(nd, -5.12, 5.12),
             known_minimum=0.0,
+            family="rastrigin",
             description=f"{nd}D, highly multimodal",
         )
     )
+
+# The rounded 418.9829 constant used by the implementation leaves a small,
+# nonzero residual at x = 420.9687463599821.
+_SCHWEFEL_MINIMUM_PER_DIMENSION = 1.2727566229386866e-5
 
 # N-D: Schwefel at 2, 5, 7 dimensions
 for nd in (2, 5, 7):
@@ -149,23 +163,8 @@ for nd in (2, 5, 7):
             name=f"schwefel_{nd}d",
             func=f.schwefel,
             bounds=_nd_bounds(nd, -500.0, 500.0),
-            known_minimum=0.0,
+            known_minimum=nd * _SCHWEFEL_MINIMUM_PER_DIMENSION,
+            family="schwefel",
             description=f"{nd}D, deceptive global minimum",
         )
     )
-
-# Real-world: Gradient Boosted Regressor
-_register(
-    SingleObjectiveProblem(
-        name="gbr_diabetes",
-        func=gbr_diabetes,
-        bounds={
-            "n_estimators": (10.0, 1000.0),
-            "max_depth": (1.0, 4.0),
-            "learning_rate": (1e-4, 1.0),
-            "subsample": (0.2, 1.0),
-        },
-        known_minimum=-1.0,  # Perfect R^2 (theoretical, unachievable)
-        description="GBR on diabetes dataset, 4 hyper-parameters",
-    )
-)
