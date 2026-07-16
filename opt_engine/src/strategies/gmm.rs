@@ -40,7 +40,7 @@ use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rand_distr::{Distribution, StandardNormal};
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug};
 use std::marker::PhantomData;
@@ -55,6 +55,11 @@ const COVARIANCE_SYMMETRY_TOLERANCE: f64 = 1e-12;
 /// non-panicking beyond either native limit.
 const SOBOL_BLOCK_DIMS: usize = 256;
 const SOBOL_BLOCK_SAMPLES: u64 = 1 << 16;
+/// Domain separators for deterministic seeds derived from one public strategy
+/// seed. Sampling and EM fitting must not consume the same logical stream.
+const GMM_EPOCH_SCRAMBLE_DOMAIN: u64 = 0xa076_1d64_78bd_642f;
+const GMM_REFIT_SEED_DOMAIN: u64 = 0xe703_7ed1_a0b4_28db;
+const GMM_EPOCH_WIRE_VERSION: u8 = 1;
 /// `sobol_burley` emits one of 2^23 values in `[0, 1)`. Moving each value to
 /// the center of its represented cell keeps the inverse-normal input strictly
 /// inside `(0, 1)` without clipping an entire tail to one value.
@@ -67,6 +72,23 @@ fn mix_u64(mut value: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
+}
+
+#[inline]
+fn epoch_seed(base_seed: u64, epoch: u64, domain: u64) -> u64 {
+    mix_u64(base_seed ^ domain ^ epoch.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+}
+
+#[inline]
+fn epoch_scramble_seed(base_seed: u64, epoch: u64) -> u64 {
+    if epoch == 0 {
+        // Preserve the original stream for new strategies and checkpoints that
+        // predate epoch metadata. Their serialized global cursor can therefore
+        // resume without reissuing or changing the next point.
+        base_seed
+    } else {
+        epoch_seed(base_seed, epoch, GMM_EPOCH_SCRAMBLE_DOMAIN)
+    }
 }
 
 /// Return a deterministic Owen-scrambled Sobol' coordinate in the open unit
@@ -222,6 +244,12 @@ pub enum GmmError {
     },
     NumericalFailure(&'static str),
     LockPoisoned(&'static str),
+    InvalidSamplingCursor {
+        counter: u64,
+        epoch_start: u64,
+    },
+    SamplingCursorExhausted,
+    RefitEpochExhausted,
 }
 
 impl fmt::Display for GmmError {
@@ -320,6 +348,15 @@ impl fmt::Display for GmmError {
             ),
             Self::NumericalFailure(context) => write!(f, "GMM numerical failure: {context}"),
             Self::LockPoisoned(context) => write!(f, "GMM {context} lock is poisoned"),
+            Self::InvalidSamplingCursor {
+                counter,
+                epoch_start,
+            } => write!(
+                f,
+                "GMM epoch start {epoch_start} exceeds logical sampling cursor {counter}"
+            ),
+            Self::SamplingCursorExhausted => write!(f, "GMM logical sampling cursor is exhausted"),
+            Self::RefitEpochExhausted => write!(f, "GMM fitted-model epoch is exhausted"),
         }
     }
 }
@@ -1200,9 +1237,12 @@ fn kmeans_pp_init(
 /// A GMM-based sampling strategy.
 ///
 /// Samples from a Gaussian Mixture Model in the unit hypercube [0, 1]^n using
-/// a seeded Owen-scrambled Gauss-Sobol' sequence. The seed and sequence cursor
-/// are serialized, so checkpoints resume at the exact next point. Points are
-/// clipped to the hypercube bounds (censored GMM).
+/// a seeded Owen-scrambled Gauss-Sobol' sequence. Each installed GMM starts an
+/// epoch-specific scramble at its first point, so every fixed model receives a
+/// balanced prefix without repeating the same quantiles across refits. The
+/// seed, epoch, and sequence cursor are serialized, so checkpoints resume at
+/// the exact next point. Points are clipped to the hypercube bounds (censored
+/// GMM).
 ///
 /// # Example
 ///
@@ -1226,67 +1266,158 @@ fn kmeans_pp_init(
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(bound = "")]
+#[derive(Debug)]
 pub struct GmmStrategy<S, Obs = f64> {
     seed: u64,
-    #[serde(
-        serialize_with = "serialize_counter",
-        deserialize_with = "deserialize_counter"
-    )]
     counter: AtomicU64,
+    /// Logical sampling-cursor value at which the current GMM epoch began.
+    /// An older checkpoint's integer cursor, accompanied by neither epoch
+    /// field, migrates to epoch zero and preserves its historical global
+    /// position without reissuing a point.
+    epoch_start: AtomicU64,
+    /// Number of successfully installed parameter sets after the initial model.
+    refit_epoch: AtomicU64,
     /// GMM parameters (wrapped in RwLock for interior mutability during fitting).
-    #[serde(
-        serialize_with = "serialize_gmm_params",
-        deserialize_with = "deserialize_gmm_params"
-    )]
     params: Arc<RwLock<GmmParams>>,
     /// Caller-owned sampling buffer reused by the production suggestion path.
     ///
     /// The mutex permits concurrent `suggest` calls without sharing mutable
     /// storage unsafely. Scratch capacity is a runtime optimization and is not
     /// part of durable strategy state.
-    #[serde(skip)]
     sample_scratch: Mutex<Vec<f64>>,
     /// Configuration for GMM refitting behavior.
-    #[serde(default)]
     refit_config: GmmRefitConfig,
-    #[serde(skip)]
     _marker: PhantomData<fn() -> (S, Obs)>,
 }
 
-fn serialize_counter<S>(val: &AtomicU64, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_u64(val.load(Ordering::Relaxed))
+#[derive(Serialize)]
+struct GmmStrategySnapshot<'a> {
+    seed: u64,
+    counter: EpochSamplingCursor,
+    epoch_start: u64,
+    refit_epoch: u64,
+    params: &'a GmmParams,
+    refit_config: &'a GmmRefitConfig,
 }
 
-fn deserialize_counter<'de, D>(deserializer: D) -> Result<AtomicU64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let val = u64::deserialize(deserializer)?;
-    Ok(AtomicU64::new(val))
+#[derive(Serialize)]
+struct EpochSamplingCursor {
+    epoch_format: u8,
+    value: u64,
 }
 
-fn serialize_gmm_params<S>(
-    params: &Arc<RwLock<GmmParams>>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    let params = params.read().map_err(serde::ser::Error::custom)?;
-    params.serialize(serializer)
+#[derive(Deserialize)]
+struct SerializedGmmStrategy {
+    seed: u64,
+    counter: SerializedSamplingCursor,
+    #[serde(default)]
+    epoch_start: Option<u64>,
+    #[serde(default)]
+    refit_epoch: Option<u64>,
+    params: GmmParams,
+    #[serde(default)]
+    refit_config: GmmRefitConfig,
 }
 
-fn deserialize_gmm_params<'de, D>(deserializer: D) -> Result<Arc<RwLock<GmmParams>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let params = GmmParams::deserialize(deserializer)?;
-    Ok(Arc::new(RwLock::new(params)))
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SerializedSamplingCursor {
+    Legacy(u64),
+    Epoch(SerializedEpochSamplingCursor),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerializedEpochSamplingCursor {
+    epoch_format: u8,
+    value: u64,
+}
+
+impl<S, Obs> Serialize for GmmStrategy<S, Obs> {
+    fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
+    where
+        Ser: serde::Serializer,
+    {
+        // Parameter replacement holds the corresponding write lock. Capture
+        // the model and its epoch metadata under one read guard so a checkpoint
+        // can never pair a model from one side of a refit with the other side's
+        // scramble.
+        let params = self.params.read().map_err(serde::ser::Error::custom)?;
+        GmmStrategySnapshot {
+            seed: self.seed,
+            counter: EpochSamplingCursor {
+                epoch_format: GMM_EPOCH_WIRE_VERSION,
+                value: self.counter(),
+            },
+            epoch_start: self.epoch_start(),
+            refit_epoch: self.refit_epoch(),
+            params: &params,
+            refit_config: &self.refit_config,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de, S, Obs> Deserialize<'de> for GmmStrategy<S, Obs> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let state = SerializedGmmStrategy::deserialize(deserializer)?;
+        let (counter, epoch_start, refit_epoch) = match state.counter {
+            SerializedSamplingCursor::Legacy(counter) => {
+                if state.epoch_start.is_some() || state.refit_epoch.is_some() {
+                    return Err(D::Error::custom(
+                        "legacy GMM sampling cursors must not contain epoch metadata",
+                    ));
+                }
+                (counter, 0, 0)
+            }
+            SerializedSamplingCursor::Epoch(cursor) => {
+                if cursor.epoch_format != GMM_EPOCH_WIRE_VERSION {
+                    return Err(D::Error::custom(format!(
+                        "unsupported GMM epoch sampling format {}",
+                        cursor.epoch_format
+                    )));
+                }
+                let (Some(epoch_start), Some(refit_epoch)) = (state.epoch_start, state.refit_epoch)
+                else {
+                    return Err(D::Error::custom(
+                        "epoch-aware GMM sampling cursors require epoch_start and refit_epoch",
+                    ));
+                };
+                (cursor.value, epoch_start, refit_epoch)
+            }
+        };
+        if counter == u64::MAX {
+            return Err(D::Error::custom("GMM logical sampling cursor is exhausted"));
+        }
+        if refit_epoch == u64::MAX {
+            return Err(D::Error::custom("GMM fitted-model epoch is exhausted"));
+        }
+        if refit_epoch == 0 && epoch_start != 0 {
+            return Err(D::Error::custom(format!(
+                "GMM initial epoch must start at cursor zero, not {epoch_start}"
+            )));
+        }
+        if epoch_start > counter {
+            return Err(D::Error::custom(format!(
+                "GMM epoch start {epoch_start} exceeds logical sampling cursor {counter}"
+            )));
+        }
+        let sample_capacity = state.params.dim();
+
+        Ok(Self {
+            seed: state.seed,
+            counter: AtomicU64::new(counter),
+            epoch_start: AtomicU64::new(epoch_start),
+            refit_epoch: AtomicU64::new(refit_epoch),
+            params: Arc::new(RwLock::new(state.params)),
+            sample_scratch: Mutex::new(Vec::with_capacity(sample_capacity)),
+            refit_config: state.refit_config,
+            _marker: PhantomData,
+        })
+    }
 }
 
 impl<S, Obs> GmmStrategy<S, Obs> {
@@ -1296,6 +1427,8 @@ impl<S, Obs> GmmStrategy<S, Obs> {
         Self {
             seed,
             counter: AtomicU64::new(0),
+            epoch_start: AtomicU64::new(0),
+            refit_epoch: AtomicU64::new(0),
             params: Arc::new(RwLock::new(params)),
             sample_scratch,
             refit_config: GmmRefitConfig::default(),
@@ -1313,12 +1446,33 @@ impl<S, Obs> GmmStrategy<S, Obs> {
         Ok(Self::new(seed, GmmParams::uniform_prior(dim, variance)?))
     }
 
-    /// Update the GMM parameters.
+    /// Update the GMM parameters and begin a new sampling epoch.
+    ///
+    /// The new model receives point zero of a newly derived scramble. The
+    /// logical sampling cursor is unchanged.
     pub fn set_params(&self, params: GmmParams) -> Result<(), GmmError> {
-        *self
+        let mut current = self
             .params
             .write()
-            .map_err(|_| GmmError::LockPoisoned("parameter write"))? = params;
+            .map_err(|_| GmmError::LockPoisoned("parameter write"))?;
+        let next_epoch = self
+            .refit_epoch
+            .load(Ordering::Relaxed)
+            .checked_add(1)
+            .filter(|epoch| *epoch < u64::MAX)
+            .ok_or(GmmError::RefitEpochExhausted)?;
+        let next_epoch_start = self.counter.load(Ordering::Relaxed);
+        if next_epoch_start == u64::MAX {
+            return Err(GmmError::SamplingCursorExhausted);
+        }
+        *current = params;
+
+        // The transformation from the unit cube has changed. Start a new
+        // independently scrambled Sobol' epoch at its first point. Holding the
+        // parameter write lock makes the model and cursor transition atomic
+        // with respect to `suggest`, which holds the corresponding read lock.
+        self.epoch_start.store(next_epoch_start, Ordering::Relaxed);
+        self.refit_epoch.store(next_epoch, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1331,8 +1485,10 @@ impl<S, Obs> GmmStrategy<S, Obs> {
             .clone())
     }
 
-    /// Advance the deterministic sampling/refit cursor without generating
-    /// discarded samples. Used when importing history without strategy state.
+    /// Advance the deterministic sampling cursor without generating discarded
+    /// samples. Used when importing history without strategy state; in that
+    /// case it is a conservative watermark rather than an exact suggestion
+    /// count.
     pub fn advance_to(&self, counter: u64) {
         self.counter.fetch_max(counter, Ordering::Relaxed);
     }
@@ -1342,9 +1498,34 @@ impl<S, Obs> GmmStrategy<S, Obs> {
         self.seed
     }
 
-    /// Next deterministic sampling/refit stream position.
+    /// Logical GMM sampling cursor.
+    ///
+    /// In a live strategy this advances once per suggestion. Imported and
+    /// legacy state may conservatively place it further ahead.
     pub fn counter(&self) -> u64 {
         self.counter.load(Ordering::Relaxed)
+    }
+
+    /// Current fitted-model epoch (zero denotes the initial model).
+    pub fn refit_epoch(&self) -> u64 {
+        self.refit_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Logical sampling cursor at which the current epoch began.
+    pub fn epoch_start(&self) -> u64 {
+        self.epoch_start.load(Ordering::Relaxed)
+    }
+
+    /// Next point index within the current epoch-specific Sobol' stream.
+    pub fn epoch_index(&self) -> Result<u64, GmmError> {
+        let counter = self.counter();
+        let epoch_start = self.epoch_start();
+        counter
+            .checked_sub(epoch_start)
+            .ok_or(GmmError::InvalidSamplingCursor {
+                counter,
+                epoch_start,
+            })
     }
 
     /// Fit the GMM to normalized samples.
@@ -1366,14 +1547,21 @@ impl<S, Obs> GmmStrategy<S, Obs> {
 
 impl<S, Obs> Clone for GmmStrategy<S, Obs> {
     fn clone(&self) -> Self {
-        let params = self
+        let params_guard = self
             .params
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Keep the read guard while capturing the epoch metadata so a
+        // concurrent `set_params` cannot cross the snapshot boundary.
+        let counter = self.counter.load(Ordering::Relaxed);
+        let epoch_start = self.epoch_start.load(Ordering::Relaxed);
+        let refit_epoch = self.refit_epoch.load(Ordering::Relaxed);
+        let params = params_guard.clone();
         Self {
             seed: self.seed,
-            counter: AtomicU64::new(self.counter.load(Ordering::Relaxed)),
+            counter: AtomicU64::new(counter),
+            epoch_start: AtomicU64::new(epoch_start),
+            refit_epoch: AtomicU64::new(refit_epoch),
             sample_scratch: Mutex::new(Vec::with_capacity(params.dim())),
             params: Arc::new(RwLock::new(params)),
             refit_config: self.refit_config.clone(),
@@ -1397,7 +1585,19 @@ where
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let call_index = self.counter.fetch_add(1, Ordering::Relaxed);
+        let total_index = self.counter.fetch_add(1, Ordering::Relaxed);
+        let epoch_start = self.epoch_start.load(Ordering::Relaxed);
+        let call_index = total_index.checked_sub(epoch_start).unwrap_or_else(|| {
+            // Deserialization and engine checkpoints reject this state. If an
+            // in-memory cursor is nevertheless corrupted, normalize it once
+            // so subsequent calls cannot restart and duplicate an index.
+            eprintln!(
+                "GmmStrategy::suggest: epoch start {epoch_start} exceeds sampling cursor {total_index}; normalizing the epoch start"
+            );
+            self.epoch_start.store(0, Ordering::Relaxed);
+            total_index
+        });
+        let stream_seed = epoch_scramble_seed(self.seed, self.refit_epoch.load(Ordering::Relaxed));
         let mut sample = self
             .sample_scratch
             .lock()
@@ -1410,7 +1610,7 @@ where
         // PyO3 handlers, never panics.
         if params.dim() == dim {
             if let Err(error) =
-                params.sample_gauss_sobol_clamped_into(call_index, self.seed, &mut sample)
+                params.sample_gauss_sobol_clamped_into(call_index, stream_seed, &mut sample)
             {
                 eprintln!(
                     "GmmStrategy::suggest: sampling failed ({error}), falling back to cube center"
@@ -1600,13 +1800,15 @@ where
             .map(|(candidate, _)| space.to_unit_cube(candidate))
             .collect();
 
-        // Derive the fit seed from the current cursor without consuming it.
-        // Failed fitting and failed installation must leave *all* durable
-        // strategy state unchanged, including the next sampling/refit seed.
-        let counter = self.counter.load(Ordering::Relaxed);
-        let refit_seed = self
-            .seed
-            .wrapping_add(counter.wrapping_mul(6364136223846793005));
+        // Derive the fit seed from the next model epoch without consuming a
+        // sampling position. Failed fitting and failed installation must leave
+        // all durable strategy state unchanged.
+        let next_epoch = self
+            .refit_epoch()
+            .checked_add(1)
+            .filter(|epoch| *epoch < u64::MAX)
+            .ok_or(GmmError::RefitEpochExhausted)?;
+        let refit_seed = epoch_seed(self.seed, next_epoch, GMM_REFIT_SEED_DOMAIN);
 
         const MIN_SAMPLES_PER_COMPONENT: usize = 10;
         let supported_components = (samples.len() / MIN_SAMPLES_PER_COMPONENT).max(1);
@@ -1623,8 +1825,6 @@ where
         )?;
 
         self.set_params(fitted)?;
-        self.counter
-            .store(counter.wrapping_add(1), Ordering::Relaxed);
         Ok(())
     }
 }
@@ -1641,15 +1841,38 @@ where
     }
 
     fn reconcile_after_refit(&mut self, live: &Self) {
-        // `self` holds the freshly fitted parameters; `live` may have advanced
-        // its RNG counter via concurrent `suggest` calls while this refit ran
-        // off-lock. Keep the new model but adopt the furthest-advanced counter
-        // so subsequent draws do not reuse an already-issued seed.
+        let fitted_epoch = self.refit_epoch();
+        let live_epoch = live.refit_epoch();
+
+        if fitted_epoch == live_epoch {
+            // `try_refit` is a no-op for an empty workset. In that case no new
+            // model was installed, so preserve the complete live epoch rather
+            // than resetting its within-model stream.
+            *self = live.clone();
+            return;
+        }
+
+        if live_epoch.checked_add(1) != Some(fitted_epoch) {
+            // Refit locks should make any other relationship unreachable. A
+            // stale fitted snapshot must not fabricate an epoch number for a
+            // model fitted under different deterministic seeds.
+            eprintln!(
+                "GmmStrategy::reconcile_after_refit: fitted epoch {fitted_epoch} does not follow live epoch {live_epoch}; preserving the live strategy"
+            );
+            *self = live.clone();
+            return;
+        }
+
+        // `self` holds the freshly fitted parameters; `live` may have issued
+        // suggestions from the old model while this refit ran off-lock. Keep
+        // the new model and begin its new scramble after every such old-model
+        // suggestion. Old-epoch indices need not be carried into a new model.
         let merged = self
             .counter
             .load(Ordering::Relaxed)
             .max(live.counter.load(Ordering::Relaxed));
         self.counter.store(merged, Ordering::Relaxed);
+        self.epoch_start.store(merged, Ordering::Relaxed);
     }
 }
 
@@ -2109,6 +2332,221 @@ mod tests {
     }
 
     #[test]
+    fn test_parameter_install_rejects_epoch_exhaustion_without_mutation() {
+        let strategy =
+            GmmStrategy::<UnitSquare>::new(42, GmmParams::uniform_prior(2, 0.25).unwrap());
+        strategy.refit_epoch.store(u64::MAX - 1, Ordering::Relaxed);
+        let before = serde_json::to_value(strategy.params().unwrap()).unwrap();
+
+        let error = strategy
+            .set_params(GmmParams::uniform_prior(2, 0.5).unwrap())
+            .unwrap_err();
+
+        assert!(matches!(error, GmmError::RefitEpochExhausted));
+        assert_eq!(strategy.refit_epoch(), u64::MAX - 1);
+        assert_eq!(
+            serde_json::to_value(strategy.params().unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn test_successful_refit_starts_fresh_epoch_at_first_sobol_point() {
+        use crate::scales::LinearScale;
+        use crate::spaces::ContinuousSpace;
+
+        let space = ContinuousSpace::new(0.0, 1.0);
+        let params = GmmParams::uniform_prior(1, 0.25).unwrap();
+        let mut strategy = GmmStrategy::<ContinuousSpace<LinearScale>>::new(42, params);
+
+        for _ in 0..3 {
+            let _ = strategy.suggest(&space);
+        }
+        let total_before_refit = strategy.counter();
+        let trials: Vec<(f64, f64)> = (0..20)
+            .map(|index| (0.3 + f64::from(index) * 0.02, 0.0))
+            .collect();
+        strategy.try_refit(&space, &trials).unwrap();
+
+        assert_eq!(strategy.counter(), total_before_refit);
+        assert_eq!(strategy.refit_epoch(), 1);
+        assert_eq!(strategy.epoch_start(), total_before_refit);
+        assert_eq!(strategy.epoch_index().unwrap(), 0);
+
+        let fitted = strategy.params().unwrap();
+        let mut expected = Vec::new();
+        fitted
+            .sample_gauss_sobol_clamped_into(
+                0,
+                epoch_scramble_seed(strategy.seed(), strategy.refit_epoch()),
+                &mut expected,
+            )
+            .unwrap();
+        assert_eq!(strategy.suggest(&space), expected[0]);
+        assert_eq!(strategy.counter(), total_before_refit + 1);
+        assert_eq!(strategy.epoch_index().unwrap(), 1);
+
+        // Reinstalling the identical transformation still defines a new epoch.
+        // It begins at point zero under a different scramble, so two similar
+        // successive fits do not repeatedly probe the same quantiles.
+        strategy.set_params(fitted).unwrap();
+        assert_eq!(strategy.counter(), total_before_refit + 1);
+        assert_eq!(strategy.refit_epoch(), 2);
+        assert_eq!(strategy.epoch_index().unwrap(), 0);
+        assert_ne!(strategy.suggest(&space), expected[0]);
+    }
+
+    #[test]
+    fn test_legacy_checkpoint_without_epoch_metadata_resumes_global_stream() {
+        use crate::scales::LinearScale;
+        use crate::spaces::ContinuousSpace;
+
+        let space = ContinuousSpace::new(0.0, 1.0);
+        let strategy =
+            GmmStrategy::<ContinuousSpace<LinearScale>>::uniform_prior(42, 1, 0.25).unwrap();
+        for _ in 0..7 {
+            let _ = strategy.suggest(&space);
+        }
+
+        let mut legacy = serde_json::to_value(&strategy).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("epoch_start");
+        object.remove("refit_epoch");
+        object.insert("counter".to_string(), serde_json::json!(7));
+        let mut restored: GmmStrategy<ContinuousSpace<LinearScale>> =
+            serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(restored.counter(), 7);
+        assert_eq!(restored.epoch_start(), 0);
+        assert_eq!(restored.refit_epoch(), 0);
+        assert_eq!(restored.epoch_index().unwrap(), 7);
+
+        let control =
+            GmmStrategy::<ContinuousSpace<LinearScale>>::uniform_prior(42, 1, 0.25).unwrap();
+        control.advance_to(7);
+        for _ in 0..10 {
+            assert_eq!(restored.suggest(&space), control.suggest(&space));
+        }
+
+        let cursor_before_refit = restored.counter();
+        let trials: Vec<(f64, f64)> = (0..20)
+            .map(|index| (0.3 + f64::from(index) * 0.02, 0.0))
+            .collect();
+        restored.try_refit(&space, &trials).unwrap();
+        assert_eq!(restored.counter(), cursor_before_refit);
+        assert_eq!(restored.refit_epoch(), 1);
+        assert_eq!(restored.epoch_start(), cursor_before_refit);
+        assert_eq!(restored.epoch_index().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_checkpoint_rejects_epoch_start_after_sampling_cursor() {
+        use crate::scales::LinearScale;
+        use crate::spaces::ContinuousSpace;
+
+        let strategy =
+            GmmStrategy::<ContinuousSpace<LinearScale>>::uniform_prior(42, 1, 0.25).unwrap();
+        let mut forged = serde_json::to_value(&strategy).unwrap();
+        forged["epoch_start"] = serde_json::json!(1);
+        forged["refit_epoch"] = serde_json::json!(1);
+
+        let error = serde_json::from_value::<GmmStrategy<ContinuousSpace<LinearScale>>>(forged)
+            .unwrap_err();
+        assert!(error.to_string().contains("epoch start 1"));
+        assert!(error.to_string().contains("sampling cursor 0"));
+    }
+
+    #[test]
+    fn test_version_two_fitted_checkpoint_resumes_legacy_global_stream() {
+        use crate::scales::LinearScale;
+        use crate::spaces::ContinuousSpace;
+        use crate::{Checkpoint, Leaderboard};
+
+        type Space = ContinuousSpace<LinearScale>;
+        type Strategy = GmmStrategy<Space>;
+        type Saved = Checkpoint<f64, f64, Strategy>;
+
+        let samples: Vec<Vec<f64>> = (0..40)
+            .map(|index| vec![if index < 20 { 0.2 } else { 0.8 }])
+            .collect();
+        let fitted = GmmParams::fit(&samples, 2, 100, 1e-6, 1e-4, 7).unwrap();
+        let strategy = Strategy::new(42, fitted.clone());
+        // A v2 counter could include both suggestions and positions consumed
+        // by historical refits. Its exact origin does not matter: migration
+        // must continue at this global sequence position.
+        strategy.advance_to(11);
+        let checkpoint = Saved::new(Leaderboard::new(), strategy, None);
+        let mut legacy = serde_json::to_value(checkpoint).unwrap();
+        legacy["metadata"]["format_version"] = serde_json::json!(2);
+        let state = legacy["strategy_state"].as_object_mut().unwrap();
+        state.remove("epoch_start");
+        state.remove("refit_epoch");
+        state.insert("counter".to_string(), serde_json::json!(11));
+
+        let restored: Saved = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.metadata.format_version, 3);
+        let control = Strategy::new(42, fitted);
+        control.advance_to(11);
+        let space = ContinuousSpace::new(0.0, 1.0);
+        for _ in 0..10 {
+            assert_eq!(
+                restored.strategy_state.suggest(&space),
+                control.suggest(&space)
+            );
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_rejects_partial_or_exhausted_epoch_metadata() {
+        use crate::scales::LinearScale;
+        use crate::spaces::ContinuousSpace;
+
+        type Strategy = GmmStrategy<ContinuousSpace<LinearScale>>;
+        let strategy = Strategy::uniform_prior(42, 1, 0.25).unwrap();
+        let base = serde_json::to_value(&strategy).unwrap();
+        // The epoch-aware cursor is deliberately not an integer, so a raw
+        // strategy reader from before epoch support fails instead of ignoring
+        // the new fields and silently changing sequence semantics.
+        assert!(serde_json::from_value::<u64>(base["counter"].clone()).is_err());
+        let error_text = |value| {
+            serde_json::from_value::<Strategy>(value)
+                .unwrap_err()
+                .to_string()
+        };
+
+        let mut partial = base.clone();
+        partial.as_object_mut().unwrap().remove("refit_epoch");
+        assert!(error_text(partial).contains("require epoch_start and refit_epoch"));
+
+        let mut missing = base.clone();
+        let missing_object = missing.as_object_mut().unwrap();
+        missing_object.remove("epoch_start");
+        missing_object.remove("refit_epoch");
+        assert!(error_text(missing).contains("require epoch_start and refit_epoch"));
+
+        let mut invalid_initial_epoch = base.clone();
+        invalid_initial_epoch["counter"]["value"] = serde_json::json!(1);
+        invalid_initial_epoch["epoch_start"] = serde_json::json!(1);
+        assert!(error_text(invalid_initial_epoch).contains("initial epoch must start"));
+
+        let mut exhausted_cursor = base.clone();
+        exhausted_cursor["counter"]["value"] = serde_json::json!(u64::MAX);
+        assert!(error_text(exhausted_cursor).contains("sampling cursor is exhausted"));
+
+        let mut exhausted_epoch = base.clone();
+        exhausted_epoch["refit_epoch"] = serde_json::json!(u64::MAX);
+        assert!(error_text(exhausted_epoch).contains("fitted-model epoch is exhausted"));
+
+        let mut unsupported_epoch_format = base.clone();
+        unsupported_epoch_format["counter"]["epoch_format"] = serde_json::json!(2);
+        assert!(error_text(unsupported_epoch_format).contains("unsupported GMM epoch"));
+
+        let mut mislabeled_legacy = base;
+        mislabeled_legacy["counter"] = serde_json::json!(0);
+        assert!(error_text(mislabeled_legacy).contains("legacy GMM sampling cursors"));
+    }
+
+    #[test]
     fn test_gmm_determinism_same_seed() {
         use crate::scales::LinearScale;
         use crate::spaces::ContinuousSpace;
@@ -2268,27 +2706,91 @@ mod tests {
     }
 
     #[test]
-    fn test_reconcile_after_refit_adopts_higher_counter() {
+    fn test_reconcile_after_refit_starts_new_epoch_after_live_suggestions() {
         use crate::scales::LinearScale;
         use crate::spaces::ContinuousSpace;
         use crate::traits::RefittableStrategy;
 
-        // `live` is the engine's current strategy, whose RNG counter advanced
-        // via concurrent `suggest` calls while a refit ran off-lock.
+        let space = ContinuousSpace::new(0.0, 1.0);
         let live = GmmStrategy::<ContinuousSpace<LinearScale>>::uniform_prior(42, 1, 0.1).unwrap();
-        for _ in 0..5 {
-            live.counter.fetch_add(1, Ordering::Relaxed);
-        }
-        assert_eq!(live.counter.load(Ordering::Relaxed), 5);
-
-        // `fitted` is the off-lock snapshot taken before those suggests, so its
-        // counter is lower. After reconciliation it must adopt the live (higher)
-        // counter so subsequent draws do not reuse an already-issued seed.
         let mut fitted = live.clone();
-        fitted.counter.store(2, Ordering::Relaxed);
+        let trials: Vec<(f64, f64)> = (0..20)
+            .map(|index| (0.2 + f64::from(index) * 0.01, 0.0))
+            .collect();
+        fitted.try_refit(&space, &trials).unwrap();
+        assert_eq!(fitted.refit_epoch(), 1);
+
+        // The live strategy issues old-model suggestions while the fit runs on
+        // its snapshot.
+        for _ in 0..5 {
+            let _ = live.suggest(&space);
+        }
+        assert_eq!(live.counter(), 5);
+
         fitted.reconcile_after_refit(&live);
 
-        assert_eq!(fitted.counter.load(Ordering::Relaxed), 5);
+        assert_eq!(fitted.counter(), 5);
+        assert_eq!(fitted.refit_epoch(), 1);
+        assert_eq!(fitted.epoch_start(), 5);
+        assert_eq!(fitted.epoch_index().unwrap(), 0);
+
+        let params = fitted.params().unwrap();
+        let mut expected = Vec::new();
+        params
+            .sample_gauss_sobol_clamped_into(
+                0,
+                epoch_scramble_seed(fitted.seed(), fitted.refit_epoch()),
+                &mut expected,
+            )
+            .unwrap();
+        assert_eq!(fitted.suggest(&space), expected[0]);
+    }
+
+    #[test]
+    fn test_reconcile_after_empty_refit_preserves_live_epoch() {
+        use crate::scales::LinearScale;
+        use crate::spaces::ContinuousSpace;
+        use crate::traits::RefittableStrategy;
+
+        let space = ContinuousSpace::new(0.0, 1.0);
+        let live = GmmStrategy::<ContinuousSpace<LinearScale>>::uniform_prior(42, 1, 0.1).unwrap();
+        let mut snapshot = live.clone();
+        for _ in 0..5 {
+            let _ = live.suggest(&space);
+        }
+
+        snapshot.try_refit(&space, &[]).unwrap();
+        snapshot.reconcile_after_refit(&live);
+
+        assert_eq!(snapshot.refit_epoch(), live.refit_epoch());
+        assert_eq!(snapshot.epoch_start(), live.epoch_start());
+        assert_eq!(snapshot.counter(), live.counter());
+        assert_eq!(snapshot.suggest(&space), live.suggest(&space));
+    }
+
+    #[test]
+    fn test_reconcile_after_stale_refit_preserves_live_strategy() {
+        use crate::scales::LinearScale;
+        use crate::spaces::ContinuousSpace;
+        use crate::traits::RefittableStrategy;
+
+        let space = ContinuousSpace::new(0.0, 1.0);
+        let live = GmmStrategy::<ContinuousSpace<LinearScale>>::uniform_prior(42, 1, 0.1).unwrap();
+        let mut fitted = live.clone();
+        let trials: Vec<(f64, f64)> = (0..20)
+            .map(|index| (0.2 + f64::from(index) * 0.01, 0.0))
+            .collect();
+        fitted.try_refit(&space, &trials).unwrap();
+
+        live.set_params(GmmParams::uniform_prior(1, 0.2).unwrap())
+            .unwrap();
+        live.set_params(GmmParams::uniform_prior(1, 0.3).unwrap())
+            .unwrap();
+        let expected = serde_json::to_value(&live).unwrap();
+
+        fitted.reconcile_after_refit(&live);
+
+        assert_eq!(serde_json::to_value(&fitted).unwrap(), expected);
     }
 
     #[test]
@@ -2503,9 +3005,14 @@ mod tests {
             "refit should have produced fitted multi-component params"
         );
 
-        // Advance the sampling counter past the refit so the roundtrip must also
-        // preserve the counter, not just the mixture params.
+        // Advance within the first fitted epoch, then refit once more so the
+        // roundtrip must preserve a multi-epoch cursor as well as the model.
         for _ in 0..3 {
+            let _ = strat.suggest(&space);
+        }
+        strat.refit(&space, &trials);
+        assert_eq!(strat.refit_epoch(), 2);
+        for _ in 0..2 {
             let _ = strat.suggest(&space);
         }
 

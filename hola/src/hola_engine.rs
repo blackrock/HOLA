@@ -681,6 +681,9 @@ impl DynStrategy {
                 let params = strategy
                     .params()
                     .map_err(|error| format!("invalid checkpoint GMM state: {error}"))?;
+                strategy
+                    .epoch_index()
+                    .map_err(|error| format!("invalid checkpoint GMM sampling state: {error}"))?;
                 if params.dim() != expected_dim {
                     return Err(format!(
                         "checkpoint GMM dimension {} does not match search-space dimension {expected_dim}",
@@ -707,6 +710,10 @@ impl DynStrategy {
                     .gmm
                     .params()
                     .map_err(|error| format!("invalid checkpoint GMM state: {error}"))?;
+                strategy
+                    .gmm
+                    .epoch_index()
+                    .map_err(|error| format!("invalid checkpoint GMM sampling state: {error}"))?;
                 if params.dim() != expected_dim {
                     return Err(format!(
                         "checkpoint GMM dimension {} does not match search-space dimension {expected_dim}",
@@ -6048,6 +6055,49 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("random seed"));
+        assert_eq!(target.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn full_checkpoint_rejects_gmm_epoch_start_after_suggestion_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gmm-pending.json");
+        let config = single_objective_config("gmm");
+        let source = HolaEngine::from_config(config.clone()).unwrap();
+        let _pending = source.ask().await.unwrap();
+        source.save_full_checkpoint(&path, None).await.unwrap();
+
+        let pristine: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut missing_epoch = pristine.clone();
+        let gmm = missing_epoch["checkpoint"]["strategy_state"]["inner"]["gmm"]
+            .as_object_mut()
+            .unwrap();
+        gmm.remove("epoch_start");
+        gmm.remove("refit_epoch");
+        let target = HolaEngine::from_config(config.clone()).unwrap();
+        let error = target
+            .load_full_checkpoint_document(missing_epoch)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("require epoch_start"));
+        assert_eq!(target.pending_count().await, 0);
+
+        let mut forged = pristine;
+        let counter = forged["checkpoint"]["strategy_state"]["inner"]["gmm"]["counter"]["value"]
+            .as_u64()
+            .unwrap();
+        forged["checkpoint"]["strategy_state"]["inner"]["gmm"]["epoch_start"] =
+            serde_json::json!(counter + 1);
+        forged["checkpoint"]["strategy_state"]["inner"]["gmm"]["refit_epoch"] =
+            serde_json::json!(1);
+
+        let target = HolaEngine::from_config(config).unwrap();
+        let error = target
+            .load_full_checkpoint_document(forged)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("GMM epoch start"));
         assert_eq!(target.pending_count().await, 0);
     }
 

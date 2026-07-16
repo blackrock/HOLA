@@ -6,6 +6,11 @@
   distance, and grouped objectives apply priority weights only within their
   explicit group.
 - GMM exploitation now uses seeded Owen-scrambled Gauss--Sobol' samples.
+  Each successfully installed GMM starts at the first point of a new
+  epoch-specific scramble, so refitting does not consume or strand suggestion
+  points and each fixed model receives a balanced sequence prefix. Checkpoint
+  format version 3 records the fitted-model epoch and rejects downgrade into a
+  binary that would ignore the new sampling state.
   Configurable sample and candidate limits bound refit work while preserving
   deterministic coverage of long retained histories, and batched completions
   can defer repeated multi-objective ranking until the batch is committed.

@@ -120,7 +120,10 @@ The lifecycle follows three phases.
 
 GMM exploitation uses seeded Owen-scrambled Gauss–Sobol' points.
 One Sobol' coordinate selects the mixture component, and inverse-normal
-coordinates sample within that component.
+coordinates sample within that component. Each successfully installed GMM
+starts a new epoch-specific scramble at its first point, giving every fixed
+model a balanced sequence prefix without repeating the same scramble across
+refits.
 
 The exploration budget counts issued suggestions from `ask`,
 including suggestions that are still pending. GMM refits are based
