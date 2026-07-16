@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from benchmarks.adapters.base import SingleObjectiveResult
+from benchmarks.adapters.base import SingleObjectiveResult, assert_exact_evaluations
 from benchmarks.adapters.hola_adapter import HolaSingleObjectiveAdapter
 from benchmarks.problems.registry import SingleObjectiveProblem
 
@@ -31,10 +31,21 @@ class RandomDoubleAdapter:
     def __init__(self) -> None:
         self._inner = HolaSingleObjectiveAdapter(strategy="random")
 
+    def configuration(self, budget: int) -> dict[str, object]:
+        return {
+            "adapter": type(self).__name__,
+            "strategy": "HOLA random",
+            "declared_budget": budget,
+            "evaluation_multiplier": 2,
+            "actual_budget": budget * 2,
+        }
+
     def optimize(
         self,
         problem: SingleObjectiveProblem,
         budget: int,
         seed: int,
     ) -> SingleObjectiveResult:
-        return self._inner.optimize(problem, budget * 2, seed)
+        result = self._inner.optimize(problem, budget * 2, seed)
+        assert_exact_evaluations(result.n_evaluations, budget * 2, self.name)
+        return result

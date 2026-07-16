@@ -16,13 +16,39 @@ from __future__ import annotations
 import numpy as np
 from pymoo.indicators.igd import IGD
 
+from benchmarks.metrics.normalization import normalize_objectives
+
 
 def compute_igd(front: np.ndarray, true_front: np.ndarray) -> float:
     """Compute IGD from true front to approximation.
 
     Lower is better. Returns inf if front is empty.
     """
-    if front.size == 0:
+    values = np.asarray(front, dtype=float)
+    reference = np.asarray(true_front, dtype=float)
+    if values.size == 0:
         return float("inf")
-    indicator = IGD(true_front)
-    return float(indicator(front))
+    if values.ndim == 1:
+        values = values.reshape(1, -1)
+    if reference.ndim == 1:
+        reference = reference.reshape(1, -1)
+    values = values[np.all(np.isfinite(values), axis=1)]
+    reference = reference[np.all(np.isfinite(reference), axis=1)]
+    if values.size == 0:
+        return float("inf")
+    if reference.size == 0:
+        raise ValueError("a non-empty finite true front is required for IGD")
+    indicator = IGD(reference)
+    return float(indicator(values))
+
+
+def compute_normalized_igd(
+    front: np.ndarray,
+    true_front: np.ndarray,
+    ideal_point: np.ndarray | tuple[float, ...],
+    reference_point: np.ndarray | tuple[float, ...],
+) -> float:
+    """Compute IGD after fixed ideal-reference objective normalization."""
+    normalized_front = normalize_objectives(front, ideal_point, reference_point)
+    normalized_true_front = normalize_objectives(true_front, ideal_point, reference_point)
+    return compute_igd(normalized_front, normalized_true_front)

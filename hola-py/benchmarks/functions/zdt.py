@@ -24,6 +24,20 @@ import math
 
 import numpy as np
 
+ZDT3_IDEAL_F2 = -0.7733690123266403
+# The right endpoint of each interval is a local minimum of the continuous
+# ZDT3 front.  Each later left endpoint is where the front first improves on
+# the preceding interval's minimum.  Points in the intervening gaps are
+# dominated and are therefore not part of the Pareto front.
+ZDT3_PARETO_INTERVALS = (
+    (0.0, 0.08300153492691163),
+    (0.1822287280293998, 0.25776236338783026),
+    (0.4093136748086568, 0.4538821040888302),
+    (0.6183967944392658, 0.6525117038046625),
+    (0.8233317983266327, 0.8518328654364139),
+)
+ZDT6_IDEAL_F1 = 0.28077531881536977
+
 
 def _extract_vec(p: dict[str, float]) -> list[float]:
     keys = sorted((k for k in p if k.startswith("x")), key=lambda k: int(k[1:]))
@@ -118,6 +132,6 @@ def zdt4_pareto_front(n_points: int = 500) -> np.ndarray:
 
 def zdt6_pareto_front(n_points: int = 500) -> np.ndarray:
     # ZDT6 front: f1 in [~0.2807, 1], f2 = 1 - f1^2
-    f1 = np.linspace(0.2807753191, 1, n_points)
+    f1 = np.linspace(ZDT6_IDEAL_F1, 1, n_points)
     f2 = 1 - f1**2
     return np.column_stack([f1, f2])

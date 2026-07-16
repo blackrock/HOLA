@@ -51,7 +51,8 @@ cargo build --locked -p hola-cli --release
 ## Your First Optimization (Python)
 
 This example minimizes the 1D Forrester function, a standard
-benchmark with a known minimum of $-6.0267$ at $x = 0.7572$.
+benchmark with a known minimum of approximately $-6.02074$ at
+$x = 0.75725$.
 
 ```python
 from hola_opt import Study, Space, Real, Minimize

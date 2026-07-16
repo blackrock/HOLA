@@ -15,7 +15,8 @@ Reference: Deb, Thiele, Laumanns & Zitzler (2005), "Scalable Test Problems
 for Evolutionary Multiobjective Optimization."
 
 Decision variables x0..x_{n-1} in [0, 1]. Number of objectives M is
-configurable. Standard choices: n = M + k where k = 4 (DTLZ1) or k = 9.
+configurable. We use n = M + 4 for DTLZ1 and n = M + 9 otherwise,
+corresponding to k = n - M + 1 values of 5 and 10, respectively.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ def _extract_vec(p: dict[str, float]) -> list[float]:
 
 
 def dtlz1(p: dict[str, float], n_obj: int = 3) -> dict[str, float]:
-    """DTLZ1: linear Pareto front (hyperplane). k = n - M + 1 = 4 standard."""
+    """DTLZ1: linear Pareto front (hyperplane); configured with k = 5."""
     x = _extract_vec(p)
     n = len(x)
     k = n - n_obj + 1
@@ -51,7 +52,7 @@ def dtlz1(p: dict[str, float], n_obj: int = 3) -> dict[str, float]:
 
 
 def dtlz2(p: dict[str, float], n_obj: int = 3) -> dict[str, float]:
-    """DTLZ2: spherical Pareto front. k = n - M + 1 = 9 standard."""
+    """DTLZ2: spherical Pareto front; configured with k = 10."""
     x = _extract_vec(p)
     xm = x[n_obj - 1 :]
 
@@ -69,7 +70,7 @@ def dtlz2(p: dict[str, float], n_obj: int = 3) -> dict[str, float]:
 
 
 def dtlz3(p: dict[str, float], n_obj: int = 3) -> dict[str, float]:
-    """DTLZ3: spherical front with multimodal g (many local fronts). k = 9 standard."""
+    """DTLZ3: spherical front with multimodal g; configured with k = 10."""
     x = _extract_vec(p)
     n = len(x)
     k = n - n_obj + 1
@@ -89,7 +90,7 @@ def dtlz3(p: dict[str, float], n_obj: int = 3) -> dict[str, float]:
 
 
 def dtlz4(p: dict[str, float], n_obj: int = 3, alpha: float = 100.0) -> dict[str, float]:
-    """DTLZ4: spherical front with biased density. k = 9 standard."""
+    """DTLZ4: spherical front with biased density; configured with k = 10."""
     x = _extract_vec(p)
     xm = x[n_obj - 1 :]
 

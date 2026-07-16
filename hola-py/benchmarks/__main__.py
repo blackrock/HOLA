@@ -26,8 +26,12 @@ def main() -> None:
 
     subparsers.add_parser("run-single", help="Run single-objective benchmarks")
     subparsers.add_parser("run-multi", help="Run multi-objective benchmarks")
+    subparsers.add_parser("run-hpo", help="Run the practical mixed-space HPO benchmark")
+    subparsers.add_parser("run-grouped-tlp", help="Run the grouped-TLP capability benchmark")
     subparsers.add_parser("plot-single", help="Generate single-objective plots")
     subparsers.add_parser("plot-multi", help="Generate multi-objective plots")
+    subparsers.add_parser("plot-hpo", help="Report the practical HPO campaign")
+    subparsers.add_parser("plot-grouped-tlp", help="Report the grouped-TLP campaign")
 
     args, remaining = parser.parse_known_args()
 
@@ -42,6 +46,14 @@ def main() -> None:
         from benchmarks.runner.run_multi_objective import main as run_mo
 
         run_mo()
+    elif args.command == "run-hpo":
+        from benchmarks.runner.run_hpo import main as run_hpo
+
+        run_hpo()
+    elif args.command == "run-grouped-tlp":
+        from benchmarks.runner.run_grouped_tlp import main as run_grouped_tlp
+
+        run_grouped_tlp()
     elif args.command == "plot-single":
         from benchmarks.plotting.single_objective import main as plot_so
 
@@ -50,6 +62,14 @@ def main() -> None:
         from benchmarks.plotting.multi_objective import main as plot_mo
 
         plot_mo()
+    elif args.command == "plot-hpo":
+        from benchmarks.plotting.hpo import main as plot_hpo
+
+        plot_hpo()
+    elif args.command == "plot-grouped-tlp":
+        from benchmarks.plotting.grouped_tlp import main as plot_grouped_tlp
+
+        plot_grouped_tlp()
 
 
 if __name__ == "__main__":

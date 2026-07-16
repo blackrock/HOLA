@@ -11,20 +11,31 @@ import pytest
 BENCHMARK_MODULES = (
     "benchmarks.adapters.base",
     "benchmarks.adapters.hola_adapter",
+    "benchmarks.adapters.hpo",
     "benchmarks.adapters.igr_adapter",
     "benchmarks.adapters.optuna_adapter",
+    "benchmarks.adapters.pymoo_common",
     "benchmarks.adapters.pymoo_multi",
     "benchmarks.adapters.pymoo_single",
+    "benchmarks.data.manifest",
     "benchmarks.data.normalize",
+    "benchmarks.data.persistence",
     "benchmarks.functions.dtlz",
     "benchmarks.functions.grouped_tlp",
+    "benchmarks.functions.hpo",
     "benchmarks.functions.single_objective",
     "benchmarks.functions.wfg",
     "benchmarks.functions.zdt",
     "benchmarks.problems.grouped_tlp",
+    "benchmarks.problems.hpo",
     "benchmarks.problems.multi_objective",
     "benchmarks.problems.single_objective",
+    "benchmarks.plotting.bootstrap",
+    "benchmarks.plotting.grouped_tlp",
+    "benchmarks.plotting.hpo",
     "benchmarks.runner.executor",
+    "benchmarks.runner.run_grouped_tlp",
+    "benchmarks.runner.run_hpo",
 )
 
 
@@ -55,6 +66,10 @@ def test_benchmark_cli_help(isolated_benchmarks_path, isolated_benchmarks_env):
     )
     assert result.returncode == 0, f"CLI help failed:\n{result.stderr[-2000:]}"
     assert "run-single" in result.stdout
+    assert "run-hpo" in result.stdout
+    assert "run-grouped-tlp" in result.stdout
+    assert "plot-hpo" in result.stdout
+    assert "plot-grouped-tlp" in result.stdout
 
 
 @pytest.mark.benchmarks
@@ -71,7 +86,7 @@ def test_benchmark_mini_run(tmp_path, isolated_benchmarks_path, isolated_benchma
             "--n-runs",
             "1",
             "--budgets",
-            "5",
+            "6",
             "--problems",
             "forrester_1d",
             "--n-workers",

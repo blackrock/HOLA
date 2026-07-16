@@ -2,117 +2,74 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Grouped TLP benchmark functions.
-
-These test the full priority-group pipeline where each group contains
-multiple objectives with TLP scalarization.
-"""
+"""Analytically checkable grouped-TLP benchmark functions."""
 
 from __future__ import annotations
 
-import time
-
 import numpy as np
-from sklearn.datasets import load_diabetes
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.metrics import f1_score, r2_score
-from sklearn.model_selection import train_test_split
 
 
-def _extract_vec(p: dict[str, float]) -> np.ndarray:
-    keys = sorted((k for k in p if k.startswith("x")), key=lambda k: int(k[1:]))
-    return np.array([p[k] for k in keys])
+def _extract_vec(params: dict[str, float]) -> np.ndarray:
+    keys = sorted((key for key in params if key.startswith("x")), key=lambda key: int(key[1:]))
+    return np.asarray([params[key] for key in keys], dtype=float)
 
 
-# ---------------------------------------------------------------------------
-# Synthetic grouped problem: 4 objectives in 2 groups
-# ---------------------------------------------------------------------------
+def synthetic_grouped_tlp(params: dict[str, float]) -> dict[str, float]:
+    """Return four raw objectives with an exact grouped-TLP Pareto curve.
 
-
-def synthetic_grouped(p: dict[str, float]) -> dict[str, float]:
-    """Synthetic grouped TLP benchmark.
-
-    4 raw objectives partitioned into 2 groups of 2.
-    Decision variables: x0..x4 in [0, 1].
-
-    Group 1: f1 = ||x||^2, f2 = ||x - e1||^2
-    Group 2: f3 = ||x - e2||^2, f4 = ||x - e1 - e2||^2
-
-    where e1, e2 are the first two standard basis vectors.
+    ``x0`` controls the trade-off and the remaining coordinates contribute a
+    non-negative nuisance penalty to every raw objective. With the registered
+    targets and limits, the exact Pareto set has zero nuisance penalty and
+    ``x0`` in ``[0.2, 0.8]``. The outer target plateaus are dominated, while
+    parts of the search box genuinely violate a TLP limit.
     """
-    x = _extract_vec(p)
-    n = len(x)
+    x = _extract_vec(params)
+    if x.shape != (5,):
+        raise ValueError(f"synthetic grouped TLP expects 5 variables; got {len(x)}")
 
-    e1 = np.zeros(n)
-    e1[0] = 1.0
-    e2 = np.zeros(n)
-    e2[1] = 1.0
-
-    f1 = float(np.sum(x**2))
-    f2 = float(np.sum((x - e1) ** 2))
-    f3 = float(np.sum((x - e2) ** 2))
-    f4 = float(np.sum((x - e1 - e2) ** 2))
-
-    return {"f1": f1, "f2": f2, "f3": f3, "f4": f4}
-
-
-# ---------------------------------------------------------------------------
-# ML-inspired grouped problem: performance vs resource
-# ---------------------------------------------------------------------------
-
-# Preload dataset once at module level
-_DIABETES = load_diabetes()
-_X_TRAIN, _X_TEST, _Y_TRAIN, _Y_TEST = train_test_split(
-    _DIABETES.data, _DIABETES.target, test_size=0.2, random_state=42
-)
-
-
-def ml_grouped(p: dict[str, float]) -> dict[str, float]:
-    """ML-inspired grouped TLP benchmark.
-
-    Hyper-parameters: n_estimators, max_depth, learning_rate, subsample.
-
-    Performance group: {accuracy (R^2), pseudo-F1}
-    Resource group: {training_time, model_size (n_estimators * max_depth)}
-    """
-    n_estimators = int(p["n_estimators"])
-    max_depth = int(p["max_depth"])
-    learning_rate = p["learning_rate"]
-    subsample = p["subsample"]
-
-    model = GradientBoostingRegressor(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        learning_rate=learning_rate,
-        subsample=subsample,
-        random_state=42,
-    )
-
-    t0 = time.perf_counter()
-    model.fit(_X_TRAIN, _Y_TRAIN)
-    train_time = time.perf_counter() - t0
-
-    y_pred = model.predict(_X_TEST)
-    r2 = r2_score(_Y_TEST, y_pred)
-
-    # Pseudo-F1: threshold regression predictions into binary (above/below median)
-    median_y = float(np.median(_Y_TEST))
-    y_true_bin = (_Y_TEST > median_y).astype(int)  # noqa: SIM300
-    y_pred_bin = (y_pred > median_y).astype(int)
-    f1 = f1_score(y_true_bin, y_pred_bin, zero_division=0.0)
-
-    model_size = float(n_estimators * max_depth)
-
+    tradeoff = x[0]
+    complement = 1.0 - tradeoff
+    nuisance = 0.05 * float(np.sum(x[1:] ** 2))
     return {
-        "r2": r2,
-        "f1": f1,
-        "train_time": train_time,
-        "model_size": model_size,
+        "f1": float(tradeoff + nuisance),
+        "f2": float(tradeoff**2 + nuisance),
+        "f3": float(complement + nuisance),
+        "f4": float(complement**2 + nuisance),
     }
+
+
+def synthetic_grouped_tlp_pareto_front(n_points: int = 1001) -> np.ndarray:
+    """Return a deterministic sampling of the exact two-group Pareto curve.
+
+    Along the Pareto set, ``x0`` ranges from ``1/5`` to ``4/5`` and the
+    nuisance coordinates are zero. The expressions below apply the registered
+    target-limit normalizations and unequal within-group priorities directly.
+    """
+    if n_points < 2:
+        raise ValueError("the grouped TLP reference front needs at least two points")
+    linear_target = 0.2
+    linear_limit = 0.9
+    quadratic_target = linear_target**2
+    quadratic_limit = linear_limit**2
+    x = np.linspace(linear_target, 1.0 - linear_target, n_points)
+    complement = 1.0 - x
+    group_a = (x - linear_target) / (linear_limit - linear_target) + 2.0 * (
+        x**2 - quadratic_target
+    ) / (quadratic_limit - quadratic_target)
+    group_b = 2.0 * (complement - linear_target) / (linear_limit - linear_target) + (
+        complement**2 - quadratic_target
+    ) / (quadratic_limit - quadratic_target)
+    # Decimal endpoints can otherwise produce negative roundoff on the order
+    # of 1e-16 even though a TLP cost is non-negative by construction.
+    group_a = np.maximum(group_a, 0.0)
+    group_b = np.maximum(group_b, 0.0)
+    return np.column_stack((group_a, group_b))
