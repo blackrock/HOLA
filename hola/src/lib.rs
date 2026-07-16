@@ -30,6 +30,7 @@ pub mod server;
 
 // Re-export at crate root for convenience
 pub use hola_engine::{
-    AutoStrategy, CompletedTrial, DynSpace, DynTrial, HolaEngine, ObjectiveConfig, ParamConfig,
-    ParamInfo, StrategyConfig, StudyConfig,
+    AutoStrategy, CompletedTrial, DEFAULT_MAX_REFIT_CANDIDATES, DEFAULT_MAX_REFIT_SAMPLES,
+    DynSpace, DynTrial, HolaEngine, ObjectiveConfig, ParamConfig, ParamInfo, StrategyConfig,
+    StudyConfig,
 };

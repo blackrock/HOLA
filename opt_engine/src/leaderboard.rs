@@ -621,10 +621,45 @@ impl<D: Clone> Leaderboard<D, f64> {
         feasible.into_iter().cloned().collect()
     }
 
+    /// Return the best `k` feasible trials from a deterministic, stratified
+    /// sample of the retained feasible history.
+    ///
+    /// Feasible histories no larger than `max_candidates` are ranked globally
+    /// without approximation. Larger feasible histories contribute one
+    /// midpoint from each equal-sized chronological stratum, avoiding the
+    /// recency bias of a newest-only window while bounding repeated selection
+    /// work. Infeasible trials do not consume the candidate budget.
+    pub fn top_k_stratified(&self, k: usize, max_candidates: usize) -> Vec<Trial<D, f64>> {
+        if self.trials.is_empty() || k == 0 || max_candidates == 0 {
+            return Vec::new();
+        }
+        let feasible_history: Vec<&Trial<D, f64>> = self
+            .trials
+            .iter()
+            .filter(|trial| Self::trial_is_feasible(trial))
+            .collect();
+        let mut feasible: Vec<&Trial<D, f64>> =
+            stratified_history_indices(feasible_history.len(), max_candidates)
+                .into_iter()
+                .map(|index| feasible_history[index])
+                .collect();
+        let limit = k.min(feasible.len());
+        if limit < feasible.len() {
+            feasible.select_nth_unstable_by(limit, |a, b| Self::compare_best(a, b));
+            feasible.truncate(limit);
+        }
+        feasible.sort_by(|a, b| Self::compare_best(a, b));
+        feasible.into_iter().cloned().collect()
+    }
+
     /// Return the best `k` feasible trials from at most the most recent
-    /// `max_candidates` entries. This bounds repeated selection work for
-    /// long-running refit loops while retaining deterministic partial
-    /// selection within the chosen window.
+    /// `max_candidates` entries.
+    ///
+    /// This method preserves the historical newest-window behavior for source
+    /// and semantic compatibility. Refit callers should generally prefer
+    /// [`Self::top_k_stratified`], which covers the full feasible history
+    /// without recency bias.
+    #[deprecated(note = "use top_k_stratified for full-history coverage")]
     pub fn top_k_recent(&self, k: usize, max_candidates: usize) -> Vec<Trial<D, f64>> {
         if self.trials.is_empty() || k == 0 || max_candidates == 0 {
             return Vec::new();
@@ -801,6 +836,81 @@ impl<D: Clone> Leaderboard<D, f64> {
 
 type ScoredMultiTrial<'a, D> = (&'a Trial<D, BTreeMap<String, f64>>, f64);
 
+/// Select at most `maximum` indices with deterministic coverage of a complete
+/// chronological history. Each non-empty stratum contributes its midpoint.
+fn stratified_history_indices(length: usize, maximum: usize) -> Vec<usize> {
+    if length == 0 || maximum == 0 {
+        return Vec::new();
+    }
+    if length <= maximum {
+        return (0..length).collect();
+    }
+
+    let base_size = length / maximum;
+    let larger_strata = length % maximum;
+    let mut start = 0usize;
+    let mut indices = Vec::with_capacity(maximum);
+    for stratum in 0..maximum {
+        let size = base_size + usize::from(stratum < larger_strata);
+        indices.push(start + size / 2);
+        start += size;
+    }
+    debug_assert_eq!(start, length);
+    indices
+}
+
+/// Flatten a rectangular, finite objective table for allocation-free pairwise
+/// dominance checks. Malformed or heterogeneous maps fall back to the general
+/// map-merging comparison.
+fn dense_objective_matrix<D>(
+    trials: &[Trial<D, BTreeMap<String, f64>>],
+) -> Option<(usize, Vec<f64>)> {
+    let first = trials.first()?;
+    let keys: Vec<&str> = first.observation.keys().map(String::as_str).collect();
+    if keys.is_empty() {
+        return None;
+    }
+
+    let mut values = Vec::with_capacity(trials.len().checked_mul(keys.len())?);
+    for trial in trials {
+        if trial.observation.len() != keys.len() {
+            return None;
+        }
+        for key in &keys {
+            let value = *trial.observation.get(*key)?;
+            if !value.is_finite() {
+                return None;
+            }
+            values.push(value);
+        }
+    }
+    Some((keys.len(), values))
+}
+
+/// Compare two aligned finite objective vectors in one pass. `Less` means `a`
+/// dominates `b`, `Greater` means `b` dominates `a`, and `Equal` means neither
+/// dominates (including an exact tie).
+#[inline]
+fn dense_dominance_relation(a: &[f64], b: &[f64]) -> Ordering {
+    let mut a_better = false;
+    let mut b_better = false;
+    for (&a_value, &b_value) in a.iter().zip(b) {
+        if a_value < b_value {
+            a_better = true;
+        } else if b_value < a_value {
+            b_better = true;
+        }
+        if a_better && b_better {
+            return Ordering::Equal;
+        }
+    }
+    match (a_better, b_better) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => Ordering::Equal,
+    }
+}
+
 impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
     /// Check if a trial is feasible (all objective values are finite).
     ///
@@ -839,15 +949,43 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
     /// - both NaN is a tie in that objective.
     fn dominates(a: &BTreeMap<String, f64>, b: &BTreeMap<String, f64>) -> bool {
         let mut dominated_some = false;
-        let keys: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
-        if keys.is_empty() {
-            return false;
-        }
-        for key in keys {
-            // A missing objective is malformed and ranks as invalid (NaN), not
-            // as a silently omitted dimension.
-            let va = a.get(key).copied().unwrap_or(f64::NAN);
-            let vb = b.get(key).copied().unwrap_or(f64::NAN);
+        let mut saw_objective = false;
+        let mut a_entries = a.iter().peekable();
+        let mut b_entries = b.iter().peekable();
+        loop {
+            let (va, vb) = match (a_entries.peek(), b_entries.peek()) {
+                (Some((a_key, a_value)), Some((b_key, b_value))) => match a_key.cmp(b_key) {
+                    Ordering::Less => {
+                        let value = **a_value;
+                        a_entries.next();
+                        (value, f64::NAN)
+                    }
+                    Ordering::Equal => {
+                        let values = (**a_value, **b_value);
+                        a_entries.next();
+                        b_entries.next();
+                        values
+                    }
+                    Ordering::Greater => {
+                        let value = **b_value;
+                        b_entries.next();
+                        (f64::NAN, value)
+                    }
+                },
+                (Some((_, a_value)), None) => {
+                    let value = **a_value;
+                    a_entries.next();
+                    (value, f64::NAN)
+                }
+                (None, Some((_, b_value))) => {
+                    let value = **b_value;
+                    b_entries.next();
+                    (f64::NAN, value)
+                }
+                (None, None) => break,
+            };
+            saw_objective = true;
+
             // Deterministic NaN policy: NaN is strictly worst. Handle the cases
             // involving NaN explicitly because `>` / `<` are always false for
             // NaN and would otherwise be silently treated as a tie.
@@ -867,13 +1005,7 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
                 dominated_some = true;
             }
         }
-        // Check if b has keys that a doesn't (a would have infinity there)
-        for key in b.keys() {
-            if !a.contains_key(key) {
-                return false; // a is worse (infinity) in this objective
-            }
-        }
-        dominated_some
+        saw_objective && dominated_some
     }
 
     /// Return 0-indexed front membership for a rectangular, finite two-objective
@@ -1276,21 +1408,42 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
         }
 
         let n = feasible.len();
+        let dense = dense_objective_matrix(&feasible);
 
         let mut domination_count: Vec<usize> = vec![0; n];
         let mut dominated_by: Vec<Vec<usize>> = vec![Vec::new(); n];
 
         for i in 0..n {
             for j in (i + 1)..n {
-                let obs_i = &feasible[i].observation;
-                let obs_j = &feasible[j].observation;
+                let relation = if let Some((objectives, values)) = &dense {
+                    let i_start = i * objectives;
+                    let j_start = j * objectives;
+                    dense_dominance_relation(
+                        &values[i_start..i_start + objectives],
+                        &values[j_start..j_start + objectives],
+                    )
+                } else {
+                    let obs_i = &feasible[i].observation;
+                    let obs_j = &feasible[j].observation;
+                    if Self::dominates(obs_i, obs_j) {
+                        Ordering::Less
+                    } else if Self::dominates(obs_j, obs_i) {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Equal
+                    }
+                };
 
-                if Self::dominates(obs_i, obs_j) {
-                    dominated_by[i].push(j);
-                    domination_count[j] += 1;
-                } else if Self::dominates(obs_j, obs_i) {
-                    dominated_by[j].push(i);
-                    domination_count[i] += 1;
+                match relation {
+                    Ordering::Less => {
+                        dominated_by[i].push(j);
+                        domination_count[j] += 1;
+                    }
+                    Ordering::Greater => {
+                        dominated_by[j].push(i);
+                        domination_count[i] += 1;
+                    }
+                    Ordering::Equal => {}
                 }
             }
         }
@@ -1507,6 +1660,36 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
         }
 
         selected
+    }
+
+    /// Select top-k feasible trials with NSGA-II from a deterministic,
+    /// stratified sample of the retained feasible history.
+    ///
+    /// Feasible histories no larger than `max_candidates` use the exact global
+    /// [`Self::select_nsga2`] order. Larger feasible histories contribute one
+    /// midpoint from each equal-sized chronological stratum, bounding repeated
+    /// ranking work without favoring the newest trials. Infeasible trials do
+    /// not consume the candidate budget.
+    pub fn select_nsga2_stratified(&self, k: usize, max_candidates: usize) -> Vec<RankedTrial<D>> {
+        if self.trials.is_empty() || k == 0 || max_candidates == 0 {
+            return Vec::new();
+        }
+
+        let feasible_history: Vec<&Trial<D, BTreeMap<String, f64>>> = self
+            .trials
+            .iter()
+            .filter(|trial| Self::trial_is_feasible(trial))
+            .collect();
+
+        if feasible_history.len() <= max_candidates {
+            return self.select_nsga2(k);
+        }
+
+        let mut covered = Leaderboard::with_capacity(max_candidates);
+        for index in stratified_history_indices(feasible_history.len(), max_candidates) {
+            covered.push_existing_trial(feasible_history[index].clone());
+        }
+        covered.select_nsga2(k)
     }
 
     /// Select top-k trials using NSGA-II criteria, including infeasible.
@@ -1727,17 +1910,59 @@ mod tests {
     }
 
     #[test]
-    fn test_top_k_recent_limits_selection_to_bounded_window() {
+    fn test_top_k_stratified_covers_full_history_without_recency_bias() {
         let mut lb: Leaderboard<&str, f64> = Leaderboard::new();
 
-        lb.push("old_global_best", 0.0);
-        lb.push("recent_worst", 5.0);
-        lb.push("recent_best", 2.0);
+        // Six entries split into three two-entry strata select indices 1, 3,
+        // and 5. The global best is deliberately older than the newest three.
+        lb.push("old-padding", 9.0);
+        lb.push("old-global-best", 0.0);
+        lb.push("middle-padding", 8.0);
+        lb.push("middle", 4.0);
+        lb.push("recent-padding", 7.0);
+        lb.push("recent", 2.0);
+
+        let top = lb.top_k_stratified(1, 3);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].candidate, "old-global-best");
+        assert!(lb.top_k_stratified(1, 0).is_empty());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_top_k_recent_preserves_legacy_newest_window() {
+        let mut lb: Leaderboard<&str, f64> = Leaderboard::new();
+
+        lb.push("old-global-best", 0.0);
+        lb.push("recent-worst", 5.0);
+        lb.push("recent-best", 2.0);
 
         let top = lb.top_k_recent(1, 2);
         assert_eq!(top.len(), 1);
-        assert_eq!(top[0].candidate, "recent_best");
+        assert_eq!(top[0].candidate, "recent-best");
         assert!(lb.top_k_recent(1, 0).is_empty());
+    }
+
+    #[test]
+    fn test_top_k_stratified_does_not_spend_capacity_on_infeasible_trials() {
+        let mut lb: Leaderboard<&str, f64> = Leaderboard::new();
+
+        // Sampling the six raw entries with a budget of three would select
+        // indices 1, 3, and 5, all of which are infeasible. Feasible-history
+        // stratification instead retains all three usable trials.
+        lb.push("feasible-old", 3.0);
+        lb.push("infeasible-old", f64::INFINITY);
+        lb.push("feasible-middle", 2.0);
+        lb.push("infeasible-middle", f64::NAN);
+        lb.push("feasible-recent", 1.0);
+        lb.push("infeasible-recent", f64::NEG_INFINITY);
+
+        let top = lb.top_k_stratified(3, 3);
+        assert_eq!(top.len(), 3);
+        assert_eq!(
+            top.iter().map(|trial| trial.candidate).collect::<Vec<_>>(),
+            ["feasible-recent", "feasible-middle", "feasible-old"]
+        );
     }
 
     #[test]
@@ -2171,6 +2396,56 @@ mod tests {
         // Both extremes should be selected (they have infinite crowding distance)
         assert!(candidates.contains(&"extreme1"));
         assert!(candidates.contains(&"extreme2"));
+    }
+
+    #[test]
+    fn test_select_nsga2_stratified_covers_full_history_without_recency_bias() {
+        let mut lb: Leaderboard<&str, BTreeMap<String, f64>> = Leaderboard::new();
+
+        let observation = |x, y| [("x".into(), x), ("y".into(), y)].into();
+        lb.push("old-padding", observation(9.0, 9.0));
+        lb.push("old-global-best", observation(0.0, 0.0));
+        lb.push("middle-padding", observation(8.0, 8.0));
+        lb.push("middle", observation(4.0, 4.0));
+        lb.push("recent-padding", observation(7.0, 7.0));
+        lb.push("recent", observation(2.0, 2.0));
+
+        let selected = lb.select_nsga2_stratified(1, 3);
+        let candidates: Vec<&str> = selected
+            .iter()
+            .map(|ranked| ranked.trial.candidate)
+            .collect();
+        assert_eq!(candidates, vec!["old-global-best"]);
+        assert!(lb.select_nsga2_stratified(1, 0).is_empty());
+    }
+
+    #[test]
+    fn test_select_nsga2_stratified_does_not_spend_capacity_on_infeasible_trials() {
+        let mut lb: Leaderboard<&str, BTreeMap<String, f64>> = Leaderboard::new();
+
+        let observation = |x, y| [("x".into(), x), ("y".into(), y)].into();
+        lb.push("feasible-old", observation(3.0, 1.0));
+        lb.push("infeasible-old", observation(f64::INFINITY, 0.0));
+        lb.push("feasible-middle", observation(2.0, 2.0));
+        lb.push("infeasible-middle", observation(0.0, f64::NAN));
+        lb.push("feasible-recent", observation(1.0, 3.0));
+        lb.push("infeasible-recent", observation(f64::NEG_INFINITY, 0.0));
+
+        let selected = lb.select_nsga2_stratified(3, 3);
+        assert_eq!(selected.len(), 3);
+        assert!(
+            selected
+                .iter()
+                .all(|ranked| ranked.trial.candidate.starts_with("feasible-"))
+        );
+    }
+
+    #[test]
+    fn test_stratified_history_indices_are_deterministic_and_global() {
+        assert_eq!(stratified_history_indices(0, 4), Vec::<usize>::new());
+        assert_eq!(stratified_history_indices(4, 0), Vec::<usize>::new());
+        assert_eq!(stratified_history_indices(4, 4), vec![0, 1, 2, 3]);
+        assert_eq!(stratified_history_indices(10, 4), vec![1, 4, 7, 9]);
     }
 
     #[test]

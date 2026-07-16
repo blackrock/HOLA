@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Multi-group GMM refits now select elites by Pareto rank and crowding
+  distance, and grouped objectives apply priority weights only within their
+  explicit group.
+- GMM exploitation now uses seeded Owen-scrambled Gauss--Sobol' samples.
+  Configurable sample and candidate limits bound refit work while preserving
+  deterministic coverage of long retained histories, and batched completions
+  can defer repeated multi-objective ranking until the batch is committed.
+
 ## 1.0.1-rc8
 
 - API tokens now protect read endpoints and SSE by default. The explicit

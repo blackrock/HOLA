@@ -60,6 +60,8 @@ jobs:
           cargo test --locked -p opt_engine --test integration leaderboard_scalability -- --ignored --nocapture
           cargo test --locked -p opt_engine gmm_hot_path_throughput_probe -- --ignored --nocapture
           cargo test --locked -p hola bounded_refit_workset_scaling_probe -- --ignored --nocapture
+          cargo test --locked -p hola multiobjective_refit_selection_scaling_probe -- --ignored --nocapture
+          cargo test --locked -p hola deferred_multiobjective_batch_scaling_probe -- --ignored --nocapture
           cargo test --locked -p hola tell_hot_path_scaling_probe -- --ignored --nocapture
 
       - name: Documentation (warnings are errors)

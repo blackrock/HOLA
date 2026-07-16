@@ -543,9 +543,9 @@ Each objective in the array has the following fields.
 |-------|------|----------|-------------|
 | `field` | string | yes | Metrics field name |
 | `obj_type` | string | yes | `"minimize"` or `"maximize"` |
-| `priority` | float | no | Relative weight (default: 1.0) |
 | `target` | float | no | TLP target value |
 | `limit` | float | no | TLP limit value |
+| `priority` | float | no | TLP score at the limit (when configured) and relative weight (default: 1.0) |
 
 **Response (200)**
 

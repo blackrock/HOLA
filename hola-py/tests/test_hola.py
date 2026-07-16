@@ -210,6 +210,24 @@ def test_study_strategy_gmm():
     assert study.trial_count() == 1
 
 
+def test_gmm_refit_limit_configuration_and_validation():
+    from hola_opt import ConfigurationError, Gmm, Minimize, Real, Space, Study
+
+    strategy = Gmm(max_refit_samples=17, max_refit_candidates=53)
+    assert strategy.max_refit_samples == 17
+    assert strategy.max_refit_candidates == 53
+    Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("loss")],
+        strategy=strategy,
+    )
+
+    with pytest.raises(ConfigurationError, match="max_refit_samples must be at least 1"):
+        Gmm(max_refit_samples=0)
+    with pytest.raises(ConfigurationError, match=r"at least max_refit_samples \(100\)"):
+        Gmm(max_refit_samples=100, max_refit_candidates=99)
+
+
 # ==========================================================================
 # 4. Multi-Param & Objectives
 # ==========================================================================
@@ -460,6 +478,34 @@ def test_study_run_returns_self():
     result = study.run(lambda p: {"loss": p["x"]}, n_trials=5)
     # Should return the same study object (for chaining)
     assert result is study
+
+
+def test_study_run_materializes_multiobjective_retry_receipts():
+    """run() may batch ranking internally, but every later tell replay is exact."""
+    from hola_opt import Minimize, Random, Real, Space, Study
+
+    study = Study(
+        space=Space(x=Real(0.0, 1.0), y=Real(0.0, 1.0)),
+        objectives=[Minimize("a"), Minimize("b"), Minimize("c")],
+        strategy=Random(),
+        seed=17,
+    )
+
+    study.run(
+        lambda p: {
+            "a": p["x"],
+            "b": p["y"],
+            "c": (p["x"] - p["y"]) ** 2,
+        },
+        n_trials=20,
+    )
+
+    completed = study.trials(sorted_by="index", include_infeasible=True)
+    for expected in completed:
+        replay = study.tell(expected.trial_id, expected.metrics)
+        assert replay.rank == expected.rank
+        assert replay.pareto_front == expected.pareto_front
+        assert replay.score_vector == expected.score_vector
 
 
 def test_study_run_chain_best():

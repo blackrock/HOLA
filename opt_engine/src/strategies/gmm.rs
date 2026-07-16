@@ -12,7 +12,10 @@
 //! Gaussian Mixture Model (GMM) strategy for informed sampling.
 //!
 //! This strategy samples from a user-specified GMM in the standardized [0, 1]^n
-//! hypercube. Samples are clipped to the unit hypercube (censored GMM).
+//! hypercube. Strategy suggestions use Owen-scrambled Gauss-Sobol' points:
+//! Sobol' coordinates select the mixture component and are transformed through
+//! the inverse standard-normal CDF before applying the component Cholesky
+//! factor. Samples are clipped to the unit hypercube (censored GMM).
 //!
 //! The GMM can be specified directly with parameters, or fitted from observed
 //! normalized samples using the EM algorithm.
@@ -46,6 +49,101 @@ use std::sync::{Arc, Mutex, RwLock};
 
 const WEIGHT_SUM_TOLERANCE: f64 = 1e-9;
 const COVARIANCE_SYMMETRY_TOLERANCE: f64 = 1e-12;
+/// `sobol_burley` supports 256 dimensions and 2^16 points per scrambled
+/// sequence. Logical dimensions and later samples are assigned deterministic
+/// independently scrambled blocks so GMM sampling remains quasi-random and
+/// non-panicking beyond either native limit.
+const SOBOL_BLOCK_DIMS: usize = 256;
+const SOBOL_BLOCK_SAMPLES: u64 = 1 << 16;
+/// `sobol_burley` emits one of 2^23 values in `[0, 1)`. Moving each value to
+/// the center of its represented cell keeps the inverse-normal input strictly
+/// inside `(0, 1)` without clipping an entire tail to one value.
+const SOBOL_F32_HALF_CELL: f64 = 1.0 / ((1u64 << 24) as f64);
+
+/// SplitMix64 finalizer used only to derive independent deterministic Sobol'
+/// scrambling seeds from the public 64-bit strategy seed and block numbers.
+#[inline]
+fn mix_u64(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+/// Return a deterministic Owen-scrambled Sobol' coordinate in the open unit
+/// interval. Native Sobol' blocks are extended by independently scrambling
+/// each 2^16-sample and 256-dimensional block.
+#[inline]
+fn gauss_sobol_uniform(sample_index: u64, logical_dimension: usize, seed: u64) -> f64 {
+    let sample_block = sample_index / SOBOL_BLOCK_SAMPLES;
+    let native_sample = (sample_index % SOBOL_BLOCK_SAMPLES) as u32;
+    let dimension_block = logical_dimension / SOBOL_BLOCK_DIMS;
+    let native_dimension = (logical_dimension % SOBOL_BLOCK_DIMS) as u32;
+    let block_key = seed
+        ^ sample_block.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (dimension_block as u64).wrapping_mul(0xd1b5_4a32_d192_ed03);
+    let mixed = mix_u64(block_key);
+    let scramble_seed = (mixed ^ (mixed >> 32)) as u32;
+    f64::from(sobol_burley::sample(
+        native_sample,
+        native_dimension,
+        scramble_seed,
+    )) + SOBOL_F32_HALF_CELL
+}
+
+/// Inverse CDF of a standard normal distribution.
+///
+/// This is Acklam's rational approximation. Its relative error is below about
+/// 1.2e-9 over `(0, 1)`, substantially finer than the f32 Sobol' coordinates
+/// supplied by `sobol_burley`.
+fn standard_normal_inverse_cdf(probability: f64) -> f64 {
+    debug_assert!(probability > 0.0 && probability < 1.0);
+
+    const A: [f64; 6] = [
+        -3.969_683_028_665_376e1,
+        2.209_460_984_245_205e2,
+        -2.759_285_104_469_687e2,
+        1.383_577_518_672_69e2,
+        -3.066_479_806_614_716e1,
+        2.506_628_277_459_239,
+    ];
+    const B: [f64; 5] = [
+        -5.447_609_879_822_406e1,
+        1.615_858_368_580_409e2,
+        -1.556_989_798_598_866e2,
+        6.680_131_188_771_972e1,
+        -1.328_068_155_288_572e1,
+    ];
+    const C: [f64; 6] = [
+        -7.784_894_002_430_293e-3,
+        -3.223_964_580_411_365e-1,
+        -2.400_758_277_161_838,
+        -2.549_732_539_343_734,
+        4.374_664_141_464_968,
+        2.938_163_982_698_783,
+    ];
+    const D: [f64; 4] = [
+        7.784_695_709_041_462e-3,
+        3.224_671_290_700_398e-1,
+        2.445_134_137_142_996,
+        3.754_408_661_907_416,
+    ];
+    const LOWER_TAIL: f64 = 0.024_25;
+
+    if probability < LOWER_TAIL {
+        let q = (-2.0 * probability.ln()).sqrt();
+        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    } else if probability > 1.0 - LOWER_TAIL {
+        let q = (-2.0 * (1.0 - probability).ln()).sqrt();
+        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    } else {
+        let q = probability - 0.5;
+        let r = q * q;
+        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
+            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+    }
+}
 
 /// Validation or numerical error produced by GMM construction and fitting.
 #[derive(Clone, Debug, PartialEq)]
@@ -449,6 +547,44 @@ impl GaussianComponent {
         }
     }
 
+    /// Fill a caller-owned buffer from one Gauss-Sobol' point.
+    ///
+    /// `normal_dimension_offset` reserves preceding Sobol' coordinates for
+    /// mixture-component selection, so each Gaussian coordinate uses a distinct
+    /// dimension of the same low-discrepancy point.
+    fn sample_gauss_sobol_into(
+        &self,
+        sample_index: u64,
+        seed: u64,
+        normal_dimension_offset: usize,
+        sample: &mut Vec<f64>,
+    ) -> Result<(), GmmError> {
+        let dim = self.dim();
+        sample.resize(dim, 0.0);
+        for (dimension, value) in sample.iter_mut().enumerate() {
+            let uniform = gauss_sobol_uniform(
+                sample_index,
+                normal_dimension_offset.saturating_add(dimension),
+                seed,
+            );
+            *value = standard_normal_inverse_cdf(uniform);
+        }
+        for row in (0..dim).rev() {
+            let mut value = self.mean[row];
+            for (column, standard_normal) in sample.iter().copied().take(row + 1).enumerate() {
+                value += self.cholesky_l[(row, column)] * standard_normal;
+            }
+            sample[row] = value;
+        }
+        if sample.iter().all(|value| value.is_finite()) {
+            Ok(())
+        } else {
+            Err(GmmError::NumericalFailure(
+                "Gauss-Sobol sample contains a non-finite value",
+            ))
+        }
+    }
+
     pub fn dim(&self) -> usize {
         self.mean.len()
     }
@@ -668,6 +804,34 @@ impl GmmParams {
     ) -> Result<(), GmmError> {
         let idx = self.component_distribution.sample(rng);
         self.components[idx].sample_into(rng, sample)?;
+        for value in sample {
+            *value = value.clamp(0.0, 1.0);
+        }
+        Ok(())
+    }
+
+    /// Fill a caller-owned buffer with a clamped Gauss-Sobol' GMM sample.
+    ///
+    /// The first Sobol' coordinate selects a component by inverse transform;
+    /// the remaining coordinates become independent standard-normal quantiles.
+    fn sample_gauss_sobol_clamped_into(
+        &self,
+        sample_index: u64,
+        seed: u64,
+        sample: &mut Vec<f64>,
+    ) -> Result<(), GmmError> {
+        let component_quantile = gauss_sobol_uniform(sample_index, 0, seed);
+        let mut cumulative_weight = 0.0;
+        let mut component_index = self.components.len() - 1;
+        for (index, weight) in self.weights.iter().copied().enumerate() {
+            cumulative_weight += weight;
+            if component_quantile < cumulative_weight {
+                component_index = index;
+                break;
+            }
+        }
+
+        self.components[component_index].sample_gauss_sobol_into(sample_index, seed, 1, sample)?;
         for value in sample {
             *value = value.clamp(0.0, 1.0);
         }
@@ -1035,8 +1199,10 @@ fn kmeans_pp_init(
 
 /// A GMM-based sampling strategy.
 ///
-/// Samples from a Gaussian Mixture Model in the unit hypercube [0, 1]^n.
-/// Points are clipped to the hypercube bounds (censored GMM).
+/// Samples from a Gaussian Mixture Model in the unit hypercube [0, 1]^n using
+/// a seeded Owen-scrambled Gauss-Sobol' sequence. The seed and sequence cursor
+/// are serialized, so checkpoints resume at the exact next point. Points are
+/// clipped to the hypercube bounds (censored GMM).
 ///
 /// # Example
 ///
@@ -1232,10 +1398,6 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let call_index = self.counter.fetch_add(1, Ordering::Relaxed);
-        let call_seed = self
-            .seed
-            .wrapping_add(call_index.wrapping_mul(6364136223846793005));
-        let mut rng = SmallRng::seed_from_u64(call_seed);
         let mut sample = self
             .sample_scratch
             .lock()
@@ -1247,7 +1409,9 @@ where
         // so this hot path, which runs under the engine write lock inside axum/
         // PyO3 handlers, never panics.
         if params.dim() == dim {
-            if let Err(error) = params.sample_clamped_into(&mut rng, &mut sample) {
+            if let Err(error) =
+                params.sample_gauss_sobol_clamped_into(call_index, self.seed, &mut sample)
+            {
                 eprintln!(
                     "GmmStrategy::suggest: sampling failed ({error}), falling back to cube center"
                 );
@@ -1500,6 +1664,37 @@ mod tests {
     use crate::traits::SampleSpace;
 
     #[test]
+    fn test_standard_normal_inverse_cdf_known_quantiles() {
+        let quantiles = [
+            (0.001, -3.090_232_306_167_813),
+            (0.025, -1.959_963_984_540_054),
+            (0.5, 0.0),
+            (0.975, 1.959_963_984_540_054),
+            (0.999, 3.090_232_306_167_813),
+        ];
+        for (probability, expected) in quantiles {
+            let actual = standard_normal_inverse_cdf(probability);
+            assert!(
+                (actual - expected).abs() < 5e-9,
+                "Phi^-1({probability}) = {actual}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gauss_sobol_uniform_extends_native_limits() {
+        for sample_index in [0, SOBOL_BLOCK_SAMPLES - 1, SOBOL_BLOCK_SAMPLES, u64::MAX] {
+            for dimension in [0, SOBOL_BLOCK_DIMS - 1, SOBOL_BLOCK_DIMS, 10_000] {
+                let value = gauss_sobol_uniform(sample_index, dimension, 42);
+                assert!(
+                    value > 0.0 && value < 1.0,
+                    "sample {sample_index}, dimension {dimension} produced {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_gaussian_component_sampling() {
         let mean = DVector::from_vec(vec![0.5, 0.5]);
         let comp = GaussianComponent::isotropic(mean.clone(), 0.01).unwrap();
@@ -1562,6 +1757,43 @@ mod tests {
             let point = strategy.suggest(&space);
             assert!(space.contains(&point));
         }
+    }
+
+    #[test]
+    fn test_gmm_strategy_gauss_sobol_stratifies_mixture_weights() {
+        use crate::scales::LinearScale;
+        use crate::spaces::ContinuousSpace;
+
+        let first = GaussianComponent::isotropic(DVector::from_vec(vec![0.25]), 1e-8).unwrap();
+        let second = GaussianComponent::isotropic(DVector::from_vec(vec![0.75]), 1e-8).unwrap();
+        let params = GmmParams::new(vec![0.25, 0.75], vec![first, second]).unwrap();
+        let strategy = GmmStrategy::<ContinuousSpace<LinearScale>>::new(42, params);
+        let space = ContinuousSpace::new(0.0, 1.0);
+
+        let first_component_count = (0..256).filter(|_| strategy.suggest(&space) < 0.5).count();
+        assert_eq!(
+            first_component_count, 64,
+            "a 256-point Sobol' block should allocate exactly 25% of points to the first component"
+        );
+    }
+
+    #[test]
+    fn test_gmm_strategy_gauss_sobol_preserves_categorical_mapping() {
+        use crate::spaces::CategoricalSpace;
+
+        let space = CategoricalSpace::from_strs(&["adam", "sgd", "rmsprop"]);
+        let strategy = GmmStrategy::<CategoricalSpace>::uniform_prior(42, 1, 0.25).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let candidate = strategy.suggest(&space);
+            assert!(space.contains(&candidate));
+            seen.insert(candidate);
+        }
+        assert_eq!(
+            seen.len(),
+            3,
+            "all categorical bins should remain reachable"
+        );
     }
 
     #[test]
@@ -2382,9 +2614,18 @@ mod tests {
 
         let params = GmmParams::uniform_prior(4, 0.1).unwrap();
         let mut rng = SmallRng::seed_from_u64(11);
-        let sampling_start = Instant::now();
+        let random_sampling_start = Instant::now();
         for _ in 0..100_000 {
             params.sample_clamped(&mut rng).unwrap();
+        }
+        let random_sampling_elapsed = random_sampling_start.elapsed();
+
+        let mut sample = Vec::with_capacity(4);
+        let sampling_start = Instant::now();
+        for sample_index in 0..100_000 {
+            params
+                .sample_gauss_sobol_clamped_into(sample_index, 11, &mut sample)
+                .unwrap();
         }
         let sampling_elapsed = sampling_start.elapsed();
 
@@ -2399,7 +2640,7 @@ mod tests {
         let fitting_elapsed = fitting_start.elapsed();
 
         eprintln!(
-            "100k cached-distribution suggestions: {sampling_elapsed:?}; 2k-sample fit: {fitting_elapsed:?}"
+            "100k pseudorandom suggestions: {random_sampling_elapsed:?}; 100k Gauss-Sobol' suggestions: {sampling_elapsed:?}; 2k-sample fit: {fitting_elapsed:?}"
         );
         let budget = Duration::from_secs(5);
         assert!(
