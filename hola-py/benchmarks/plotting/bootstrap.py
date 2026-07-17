@@ -27,7 +27,7 @@ DEFAULT_CONFIDENCE_LEVEL = 0.95
 BOOTSTRAP_METHOD = "paired run-id resampling; median; percentile interval"
 
 
-def _problem_context_seed(seed: int, problem: str) -> int:
+def problem_context_seed(seed: int, problem: str) -> int:
     """Domain-separate a stable bootstrap stream for one problem."""
     material = f"paired-bootstrap:{seed}:{problem}".encode()
     return int(hashlib.sha256(material).hexdigest()[:16], 16)
@@ -92,7 +92,7 @@ def paired_median_summary(
                     f"problem {problem!r} does not have the same run IDs in every cell"
                 )
 
-        context_seed = _problem_context_seed(seed, problem)
+        context_seed = problem_context_seed(seed, problem)
         generator = np.random.default_rng(context_seed)
         draws = generator.integers(0, len(run_ids), size=(n_resamples, len(run_ids)))
 

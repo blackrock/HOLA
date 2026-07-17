@@ -29,7 +29,12 @@ from benchmarks.data.composite import (
     SOURCE_RESULTS_COLUMN,
     load_reporting_results,
 )
-from benchmarks.data.normalize import lexicographic_failure_ranks
+from benchmarks.data.normalize import (
+    DEFAULT_BOOTSTRAP_SAMPLES,
+    DEFAULT_BOOTSTRAP_SEED,
+    aggregate_family_balanced_paired_win_rates,
+    lexicographic_failure_ranks,
+)
 from benchmarks.data.persistence import SOURCE_RESULT_ROW_INDEX_COLUMN
 from benchmarks.plotting.export import save_figure
 from benchmarks.plotting.style import apply_paper_style, get_color
@@ -41,6 +46,18 @@ PRIMARY_METRICS = {
     "normalized_hypervolume_gap": "Normalized hypervolume gap",
     "normalized_igd": "Normalized IGD",
 }
+GMM_OPTIMIZER = "HOLA MO (GMM)"
+GMM_MECHANISM_COMPARATORS = ("HOLA MO (random)", "HOLA MO (sobol)")
+GMM_PAIRED_WIN_METRICS = ("normalized_igd", "normalized_hypervolume_gap")
+GMM_PAIRED_WIN_AGGREGATION = (
+    "mean within each concrete task; equal task weight within named family; "
+    "equal named-family weight"
+)
+GMM_PAIRED_WIN_BOOTSTRAP_METHOD = (
+    "resample already-paired focal/comparator outcome scores independently within each "
+    "concrete task; "
+    "equal task/family weighting; percentile interval"
+)
 FAILURE_COLUMNS = [
     "problem",
     "optimizer",
@@ -579,6 +596,77 @@ def aggregate_family_balanced_metric_ranks(
     )
 
 
+def summarize_gmm_paired_win_rates(
+    results: pd.DataFrame,
+    *,
+    metrics: Sequence[str] = GMM_PAIRED_WIN_METRICS,
+    n_bootstrap: int = DEFAULT_BOOTSTRAP_SAMPLES,
+    seed: int = DEFAULT_BOOTSTRAP_SEED,
+) -> pd.DataFrame:
+    """Compare HOLA GMM with its exploration strategies on paired runs.
+
+    A win means that GMM has a lower fixed-scale metric than its comparator;
+    exact metric ties contribute one half. Concrete tasks receive equal weight
+    within their registered named family, and named families receive equal
+    weight in the reported rate.
+    """
+    required = {
+        "problem",
+        "optimizer",
+        "budget",
+        "run_id",
+        "status",
+        *metrics,
+    }
+    missing = required - set(results.columns)
+    if missing:
+        raise ValueError(f"missing MO paired-win columns: {', '.join(sorted(missing))}")
+    unknown = sorted(set(results["problem"].dropna()) - set(MULTI_OBJECTIVE_PROBLEMS))
+    if unknown:
+        raise ValueError(f"unknown multi-objective problems: {', '.join(unknown)}")
+    if not metrics:
+        raise ValueError("MO paired-win reporting requires at least one metric")
+    unknown_metrics = sorted(set(metrics) - set(PRIMARY_METRICS))
+    if unknown_metrics:
+        raise ValueError(f"unknown MO paired-win metrics: {', '.join(unknown_metrics)}")
+
+    family_by_problem = {
+        name: problem.family or name for name, problem in MULTI_OBJECTIVE_PROBLEMS.items()
+    }
+    dimensions_by_problem = {
+        name: problem.dimensionality for name, problem in MULTI_OBJECTIVE_PROBLEMS.items()
+    }
+    summaries: list[pd.DataFrame] = []
+    for metric in metrics:
+        comparison = results.assign(
+            suite="multi_objective",
+            family=results["problem"].map(family_by_problem),
+            dimension=results["problem"].map(dimensions_by_problem),
+            regret=pd.to_numeric(results[metric], errors="coerce"),
+        )
+        summary = aggregate_family_balanced_paired_win_rates(
+            comparison,
+            focal_optimizer=GMM_OPTIMIZER,
+            comparators=GMM_MECHANISM_COMPARATORS,
+            n_bootstrap=n_bootstrap,
+            seed=seed,
+        )
+        summary.insert(1, "metric", metric)
+        summary.insert(2, "metric_direction", "lower_is_better")
+        summary["win_definition"] = (
+            "focal metric < comparator metric; exact ties contribute 0.5; "
+            "a sole successful focal run wins and a sole successful comparator run loses"
+        )
+        summary["aggregation_method"] = GMM_PAIRED_WIN_AGGREGATION
+        summary["bootstrap_method"] = GMM_PAIRED_WIN_BOOTSTRAP_METHOD
+        summaries.append(summary)
+
+    return pd.concat(summaries, ignore_index=True).sort_values(
+        ["metric", "comparator", "budget"],
+        ignore_index=True,
+    )
+
+
 def plot_family_balanced_metric_ranks(
     ranks: pd.DataFrame,
     output_dir: Path,
@@ -742,6 +830,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate multi-objective plots")
     parser.add_argument("--results-dir", type=Path, default=Path("benchmark_results"))
     parser.add_argument("--output-dir", type=Path, default=Path("benchmark_results/plots"))
+    parser.add_argument(
+        "--bootstrap-resamples",
+        type=int,
+        default=DEFAULT_BOOTSTRAP_SAMPLES,
+    )
+    parser.add_argument("--bootstrap-seed", type=int, default=DEFAULT_BOOTSTRAP_SEED)
     args = parser.parse_args()
 
     df = load_reporting_results(args.results_dir, "multi_objective")
@@ -756,6 +850,20 @@ def main() -> None:
     for metric, label in PRIMARY_METRICS.items():
         plot_metric_by_budget(df, args.output_dir, metric, label)
     summary = write_metrics_table(df, args.output_dir)
+    mechanism_optimizers = {GMM_OPTIMIZER, *GMM_MECHANISM_COMPARATORS}
+    if mechanism_optimizers.issubset(set(df["optimizer"])):
+        paired_win_rates = summarize_gmm_paired_win_rates(
+            df,
+            n_bootstrap=args.bootstrap_resamples,
+            seed=args.bootstrap_seed,
+        )
+        paired_win_rates.to_csv(
+            args.output_dir / "multi_objective_gmm_paired_win_rates.csv",
+            index=False,
+        )
+    else:
+        missing = sorted(mechanism_optimizers - set(df["optimizer"]))
+        print("Skipped HOLA MO GMM mechanism comparison; campaign omits " + ", ".join(missing))
     summary_metrics = {
         "hv_gap_median": ("normalized_hypervolume_gap", "normalized hypervolume gap"),
         "igd_median": ("normalized_igd", "normalized IGD"),
