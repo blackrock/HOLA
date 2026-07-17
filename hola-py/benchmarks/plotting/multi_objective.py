@@ -23,8 +23,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from benchmarks.data.composite import (
+    SOURCE_MANIFEST_COLUMN,
+    SOURCE_PATH_COLUMN,
+    SOURCE_RESULTS_COLUMN,
+    load_reporting_results,
+)
 from benchmarks.data.normalize import lexicographic_failure_ranks
-from benchmarks.data.persistence import ResultStore
+from benchmarks.data.persistence import SOURCE_RESULT_ROW_INDEX_COLUMN
 from benchmarks.plotting.export import save_figure
 from benchmarks.plotting.style import apply_paper_style, get_color
 from benchmarks.problems.multi_objective import MULTI_OBJECTIVE_PROBLEMS
@@ -57,6 +63,9 @@ REPRESENTATIVE_SELECTION_COLUMNS = [
     "budget",
     "selection_status",
     "source_result_row_index",
+    SOURCE_PATH_COLUMN,
+    SOURCE_MANIFEST_COLUMN,
+    SOURCE_RESULTS_COLUMN,
     "run_id",
     "seed",
     "result_status",
@@ -131,6 +140,17 @@ def _failure_errors(rows: pd.DataFrame) -> str:
     return " | ".join(sorted(errors))
 
 
+def _source_metadata(rows: pd.DataFrame) -> dict[str, object]:
+    metadata: dict[str, object] = {}
+    for column in (SOURCE_PATH_COLUMN, SOURCE_MANIFEST_COLUMN, SOURCE_RESULTS_COLUMN):
+        if column not in rows:
+            metadata[column] = None
+            continue
+        values = rows[column].dropna().unique()
+        metadata[column] = values[0] if len(values) == 1 else None
+    return metadata
+
+
 def _empty_representative_selection(
     problem: str,
     optimizer: str,
@@ -146,6 +166,7 @@ def _empty_representative_selection(
         "budget": budget,
         "selection_status": status,
         "source_result_row_index": None,
+        **_source_metadata(optimizer_rows),
         "run_id": None,
         "seed": None,
         "result_status": None,
@@ -198,7 +219,8 @@ def representative_terminal_front_tables(
         raise ValueError(f"unknown representative-front problems: {', '.join(unknown)}")
 
     values = results.copy()
-    values["_source_result_row_index"] = np.arange(len(values), dtype=int)
+    if SOURCE_RESULT_ROW_INDEX_COLUMN not in values:
+        values[SOURCE_RESULT_ROW_INDEX_COLUMN] = np.arange(len(values), dtype=int)
     optimizers = sorted(str(value) for value in values["optimizer"].dropna().unique())
     selection_rows: list[dict[str, object]] = []
     point_rows: list[dict[str, object]] = []
@@ -322,7 +344,8 @@ def representative_terminal_front_tables(
                     "optimizer": optimizer,
                     "budget": largest_budget,
                     "selection_status": selection_status,
-                    "source_result_row_index": int(chosen["_source_result_row_index"]),
+                    "source_result_row_index": int(chosen[SOURCE_RESULT_ROW_INDEX_COLUMN]),
+                    **_source_metadata(chosen.to_frame().T),
                     "run_id": run_id,
                     "seed": seed,
                     "result_status": str(chosen["status"]),
@@ -721,8 +744,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("benchmark_results/plots"))
     args = parser.parse_args()
 
-    store = ResultStore(args.results_dir)
-    df = store.load_complete_multi()
+    df = load_reporting_results(args.results_dir, "multi_objective")
 
     write_failure_table(df, args.output_dir)
     if df["problem"].isin(REPRESENTATIVE_FRONT_PROBLEMS).any():

@@ -24,14 +24,25 @@ def main() -> None:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("run-single", help="Run single-objective benchmarks")
-    subparsers.add_parser("run-multi", help="Run multi-objective benchmarks")
-    subparsers.add_parser("run-hpo", help="Run the practical mixed-space HPO benchmark")
-    subparsers.add_parser("run-grouped-tlp", help="Run the grouped-TLP capability benchmark")
-    subparsers.add_parser("plot-single", help="Generate single-objective plots")
-    subparsers.add_parser("plot-multi", help="Generate multi-objective plots")
-    subparsers.add_parser("plot-hpo", help="Report the practical HPO campaign")
-    subparsers.add_parser("plot-grouped-tlp", help="Report the grouped-TLP campaign")
+    subparsers.add_parser("run-single", help="Run single-objective benchmarks", add_help=False)
+    subparsers.add_parser("run-multi", help="Run multi-objective benchmarks", add_help=False)
+    subparsers.add_parser(
+        "run-hpo", help="Run the practical mixed-space HPO benchmark", add_help=False
+    )
+    subparsers.add_parser(
+        "run-grouped-tlp", help="Run the grouped-TLP capability benchmark", add_help=False
+    )
+    subparsers.add_parser("plot-single", help="Generate single-objective plots", add_help=False)
+    subparsers.add_parser("plot-multi", help="Generate multi-objective plots", add_help=False)
+    subparsers.add_parser("plot-hpo", help="Report the practical HPO campaign", add_help=False)
+    subparsers.add_parser(
+        "plot-grouped-tlp", help="Report the grouped-TLP campaign", add_help=False
+    )
+    subparsers.add_parser(
+        "compose-results",
+        help="Compose compatible campaigns for authenticated reporting",
+        add_help=False,
+    )
 
     args, remaining = parser.parse_known_args()
 
@@ -70,6 +81,10 @@ def main() -> None:
         from benchmarks.plotting.grouped_tlp import main as plot_grouped_tlp
 
         plot_grouped_tlp()
+    elif args.command == "compose-results":
+        from benchmarks.data.composite import main as compose_results
+
+        compose_results()
 
 
 if __name__ == "__main__":

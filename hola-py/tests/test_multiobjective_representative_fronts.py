@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -197,8 +196,8 @@ def test_plot_multi_writes_selected_row_and_metrics_to_audit_csv(
     )
     monkeypatch.setattr(
         multi_plotting,
-        "ResultStore",
-        lambda _: SimpleNamespace(load_complete_multi=lambda: results),
+        "load_reporting_results",
+        lambda *_: results,
     )
     monkeypatch.setattr(multi_plotting, "plot_metric_by_budget", lambda *args: None)
     monkeypatch.setattr(

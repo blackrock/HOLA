@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from benchmarks.data.composite import load_reporting_results
 from benchmarks.data.normalize import (
     GMM_MECHANISM_COMPARATORS,
     GMM_OPTIMIZER,
@@ -29,7 +30,6 @@ from benchmarks.data.normalize import (
     aggregate_family_balanced_ranks,
     summarize_regret,
 )
-from benchmarks.data.persistence import ResultStore
 from benchmarks.plotting.export import save_figure
 from benchmarks.plotting.style import apply_paper_style, get_color
 from benchmarks.problems.single_objective import SINGLE_OBJECTIVE_PROBLEMS
@@ -260,8 +260,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("benchmark_results/plots"))
     args = parser.parse_args()
 
-    store = ResultStore(args.results_dir)
-    df = store.load_complete_single()
+    df = load_reporting_results(args.results_dir, "single_objective")
 
     regret = add_simple_regret(df, SINGLE_OBJECTIVE_PROBLEMS)
     summary = summarize_regret(regret)
