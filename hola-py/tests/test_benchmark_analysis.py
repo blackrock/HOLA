@@ -31,7 +31,10 @@ from benchmarks.metrics.spacing import (  # noqa: E402
     compute_spacing,
 )
 from benchmarks.plotting.multi_objective import (  # noqa: E402
+    GMM_MECHANISM_COMPARATORS,
+    GMM_OPTIMIZER,
     aggregate_family_balanced_metric_ranks,
+    summarize_gmm_paired_win_rates,
     summarize_multiobjective_metrics,
 )
 from benchmarks.problems.multi_objective import MULTI_OBJECTIVE_PROBLEMS  # noqa: E402
@@ -199,6 +202,47 @@ def test_multiobjective_family_balance_keeps_primary_metrics_separate() -> None:
     assert igd_ranks.loc["left", "mean_rank"] == pytest.approx(1.75)
     assert igd_ranks.loc["right", "mean_rank"] == pytest.approx(1.25)
     assert hv_ranks["n_families"].tolist() == [2, 2]
+
+
+@pytest.mark.benchmarks
+def test_multiobjective_gmm_paired_win_rate_balances_named_families() -> None:
+    rows = []
+    for problem in ("zdt1_30d", "dtlz1_3obj_7d", "dtlz1_5obj_9d"):
+        for run_id in range(2):
+            for optimizer in (GMM_OPTIMIZER, *GMM_MECHANISM_COMPARATORS):
+                gmm_wins = problem == "zdt1_30d"
+                metric = 0.0 if (optimizer == GMM_OPTIMIZER) == gmm_wins else 1.0
+                rows.append(
+                    {
+                        "problem": problem,
+                        "optimizer": optimizer,
+                        "budget": 200,
+                        "run_id": run_id,
+                        "status": "success",
+                        "normalized_hypervolume_gap": metric,
+                        "normalized_igd": metric,
+                    }
+                )
+
+    summary = summarize_gmm_paired_win_rates(
+        pd.DataFrame(rows),
+        n_bootstrap=128,
+        seed=123,
+    )
+
+    assert len(summary) == 4
+    assert summary["win_rate"].tolist() == pytest.approx([0.5] * 4)
+    assert set(summary["n_families"]) == {2}
+    assert set(summary["n_tasks"]) == {3}
+    assert set(summary["n_paired_runs"]) == {2}
+    assert set(summary["n_paired_outcomes"]) == {6}
+    assert set(summary["n_wins"]) == {2}
+    assert set(summary["n_losses"]) == {4}
+    assert set(summary["metric_direction"]) == {"lower_is_better"}
+    assert set(summary["aggregation_method"]) == {
+        "mean within each concrete task; equal task weight within named family; "
+        "equal named-family weight"
+    }
 
 
 @pytest.mark.benchmarks

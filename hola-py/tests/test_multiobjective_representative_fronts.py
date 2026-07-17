@@ -227,3 +227,60 @@ def test_plot_multi_writes_selected_row_and_metrics_to_audit_csv(
     assert audit.loc[0, "normalized_igd"] == pytest.approx(0.2)
     assert audit.loc[0, "spacing"] == pytest.approx(0.05)
     assert plotted == [(1, 2)]
+
+
+def test_plot_multi_writes_gmm_paired_win_rate_audit_csv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = {
+        multi_plotting.GMM_OPTIMIZER: (0.1, 0.2),
+        multi_plotting.GMM_MECHANISM_COMPARATORS[0]: (0.2, 0.3),
+        multi_plotting.GMM_MECHANISM_COMPARATORS[1]: (0.1, 0.4),
+    }
+    results = pd.DataFrame(
+        [
+            _result_row(
+                optimizer,
+                run_id,
+                gap,
+                problem="zdt1_30d",
+                igd=igd,
+            )
+            for optimizer, (gap, igd) in values.items()
+            for run_id in range(2)
+        ]
+    )
+    monkeypatch.setattr(multi_plotting, "load_reporting_results", lambda *_: results)
+    monkeypatch.setattr(multi_plotting, "plot_metric_by_budget", lambda *args: None)
+    monkeypatch.setattr(
+        multi_plotting,
+        "plot_family_balanced_metric_ranks",
+        lambda *args: None,
+    )
+    output_dir = tmp_path / "plots"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "plot-multi",
+            "--results-dir",
+            str(tmp_path),
+            "--output-dir",
+            str(output_dir),
+            "--bootstrap-resamples",
+            "64",
+        ],
+    )
+
+    multi_plotting.main()
+
+    audit = pd.read_csv(output_dir / "multi_objective_gmm_paired_win_rates.csv")
+    assert len(audit) == 4
+    assert set(audit["metric"]) == {"normalized_hypervolume_gap", "normalized_igd"}
+    assert set(audit["comparator"]) == set(multi_plotting.GMM_MECHANISM_COMPARATORS)
+    assert set(audit["bootstrap_samples"]) == {64}
+    assert set(audit["win_definition"]) == {
+        "focal metric < comparator metric; exact ties contribute 0.5; "
+        "a sole successful focal run wins and a sole successful comparator run loses"
+    }

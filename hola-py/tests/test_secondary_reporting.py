@@ -113,8 +113,8 @@ def test_paired_bootstrap_records_an_all_failure_resample(
 
 
 def _hpo_manifest() -> dict[str, Any]:
-    optimizers = ["left", "right"]
-    budgets = [25, 50]
+    optimizers = [hpo_reporting.HPO_GMM_OPTIMIZER, *hpo_reporting.HPO_GMM_COMPARATORS]
+    budgets = list(hpo_reporting.HPO_BUDGET_CHANGE)
     return build_campaign_manifest(
         run_kind="hpo",
         budgets=budgets,
@@ -138,10 +138,13 @@ def _hpo_manifest() -> dict[str, Any]:
 def _write_hpo_campaign(path: Path) -> ResultStore:
     store = ResultStore(path)
     store.prepare_campaign(_hpo_manifest(), resume=False)
-    for optimizer_index, optimizer in enumerate(("left", "right")):
-        for budget in (25, 50):
+    optimizers = [hpo_reporting.HPO_GMM_OPTIMIZER, *hpo_reporting.HPO_GMM_COMPARATORS]
+    for optimizer_index, optimizer in enumerate(optimizers):
+        for budget in hpo_reporting.HPO_BUDGET_CHANGE:
             for run_id in range(3):
-                failed = optimizer == "right" and budget == 25 and run_id == 2
+                failed = optimizer == hpo_reporting.HPO_GMM_COMPARATORS[-1] and (
+                    budget == 25 and run_id == 2
+                )
                 store.append_hpo(
                     {
                         "problem": "gbr_diabetes_hpo",
@@ -155,12 +158,16 @@ def _write_hpo_campaign(path: Path) -> ResultStore:
                         "optimizer_config": {"adapter": optimizer},
                         "n_validation_evaluations": 10 if failed else budget,
                         "best_validation_r2": (
-                            None if failed else 0.4 + 0.01 * run_id + 0.02 * optimizer_index
+                            None
+                            if failed
+                            else 0.4 + 0.01 * run_id + 0.02 * optimizer_index + budget / 10_000
                         ),
                         "best_params": None if failed else {"n_estimators": 50},
                         "validation_trace": None if failed else [0.4] * budget,
                         "heldout_test_r2": (
-                            None if failed else 0.3 + 0.01 * run_id + 0.02 * optimizer_index
+                            None
+                            if failed
+                            else 0.3 + 0.01 * run_id + 0.02 * optimizer_index + budget / 20_000
                         ),
                         "n_heldout_evaluations": 0 if failed else 1,
                         "train_size": 264,
@@ -204,16 +211,72 @@ def test_hpo_cli_writes_separate_authenticated_audit_summaries(
     validation = pd.read_csv(output_dir / "hpo_validation_summary.csv")
     heldout = pd.read_csv(output_dir / "hpo_heldout_summary.csv")
     failures = pd.read_csv(output_dir / "hpo_failures.csv")
+    optimizer_contrasts = pd.read_csv(output_dir / "hpo_paired_optimizer_contrasts.csv")
+    budget_changes = pd.read_csv(output_dir / "hpo_paired_budget_changes.csv")
     assert set(validation["metric"]) == {"best_validation_r2"}
     assert set(heldout["metric"]) == {"heldout_test_r2"}
     assert set(validation["bootstrap_method"]) == {
         "paired run-id resampling; median; percentile interval"
     }
     assert failures[["optimizer", "budget", "run_id"]].to_records(index=False).tolist() == [
-        ("right", 25, 2)
+        (hpo_reporting.HPO_GMM_COMPARATORS[-1], 25, 2)
     ]
     assert failures.loc[0, "search_seed"] != failures.loc[0, "split_seed"]
+    assert len(optimizer_contrasts) == 12
+    assert set(optimizer_contrasts["difference_definition"]) == {
+        "focal_optimizer - reference_optimizer"
+    }
+    assert set(optimizer_contrasts["positive_difference_favors"]) == {"focal_optimizer"}
+    assert len(budget_changes) == 8
+    assert set(budget_changes["difference_definition"]) == {"later_budget - earlier_budget"}
+    assert set(budget_changes["positive_difference_favors"]) == {"later_budget"}
+    assert set(budget_changes["earlier_budget"]) == {25}
+    assert set(budget_changes["later_budget"]) == {100}
     assert plotted == ["best_validation_r2", "heldout_test_r2"]
+
+
+def test_hpo_paired_contrasts_are_deterministic_and_keep_outcomes_separate(
+    tmp_path: Path,
+) -> None:
+    results = _write_hpo_campaign(tmp_path / "hpo-contrasts").load_complete_hpo()
+    shuffled = results.sample(frac=1.0, random_state=17).reset_index(drop=True)
+
+    optimizer_contrasts = hpo_reporting.summarize_hpo_optimizer_contrasts(
+        results,
+        n_resamples=257,
+        seed=123,
+    )
+    shuffled_optimizer_contrasts = hpo_reporting.summarize_hpo_optimizer_contrasts(
+        shuffled,
+        n_resamples=257,
+        seed=123,
+    )
+    pd.testing.assert_frame_equal(optimizer_contrasts, shuffled_optimizer_contrasts)
+    random_at_100 = optimizer_contrasts[
+        optimizer_contrasts["reference_optimizer"].eq(hpo_reporting.HPO_GMM_COMPARATORS[0])
+        & optimizer_contrasts["budget"].eq(100)
+    ]
+    assert random_at_100["median_paired_difference"].tolist() == pytest.approx([-0.02, -0.02])
+    assert set(random_at_100["metric"]) == {"best_validation_r2", "heldout_test_r2"}
+    assert set(random_at_100["metric_direction"]) == {"higher_is_better"}
+
+    budget_changes = hpo_reporting.summarize_hpo_budget_changes(
+        shuffled,
+        n_resamples=257,
+        seed=123,
+    )
+    gmm_changes = budget_changes[
+        budget_changes["optimizer"].eq(hpo_reporting.HPO_GMM_OPTIMIZER)
+    ].set_index("metric")
+    assert gmm_changes.loc["best_validation_r2", "median_paired_difference"] == pytest.approx(
+        0.0075
+    )
+    assert gmm_changes.loc["heldout_test_r2", "median_paired_difference"] == pytest.approx(0.00375)
+    assert (gmm_changes["ci_lower"] <= gmm_changes["median_paired_difference"]).all()
+    assert (gmm_changes["ci_upper"] >= gmm_changes["median_paired_difference"]).all()
+    assert set(budget_changes["bootstrap_method"]) == {
+        "paired run-id resampling; median of paired differences; percentile interval"
+    }
 
 
 def test_hpo_cli_authenticates_completeness_before_writing(
