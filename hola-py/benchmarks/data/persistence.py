@@ -30,6 +30,8 @@ from benchmarks.data.manifest import MANIFEST_FILENAME, validate_manifest
 from benchmarks.data.schema import HPO_COLUMNS, MO_COLUMNS, SO_COLUMNS
 from benchmarks.data.seeding import make_hpo_split_seed, make_seed
 
+SOURCE_RESULT_ROW_INDEX_COLUMN = "_source_result_row_index"
+
 
 class _ResultRow(Protocol):
     """Typed view of the union of persisted benchmark result schemas."""
@@ -104,15 +106,72 @@ class ResultStore:
         """Load a complete, authenticated practical-HPO campaign."""
         return self._load_complete_campaign("hpo", self.load_hpo())
 
+    def load_complete_selected(
+        self,
+        expected_run_kind: str,
+        optimizers: list[str],
+        *,
+        chunksize: int = 64,
+    ) -> pd.DataFrame:
+        """Load and validate one optimizer projection of a campaign.
+
+        Composite reports use this projection so a source campaign can supply
+        only the methods attributed to it. Reading in small chunks avoids
+        materializing excluded convergence traces or Pareto fronts.
+        """
+        manifest = self.load_manifest(expected_run_kind=expected_run_kind)
+        declared = self._manifest_string_axis(manifest, "optimizers")
+        if (
+            not optimizers
+            or any(not isinstance(optimizer, str) or not optimizer for optimizer in optimizers)
+            or len(optimizers) != len(set(optimizers))
+        ):
+            raise RuntimeError("selected optimizers must be a nonempty list of unique strings")
+        unknown = [optimizer for optimizer in optimizers if optimizer not in declared]
+        if unknown:
+            raise RuntimeError(
+                "selected optimizer(s) are absent from the source campaign: " + ", ".join(unknown)
+            )
+        if isinstance(chunksize, bool) or not isinstance(chunksize, int) or chunksize <= 0:
+            raise ValueError("chunksize must be a positive integer")
+
+        path, columns = self._result_path_and_columns(expected_run_kind)
+        if not path.exists():
+            results = pd.DataFrame(columns=columns)
+        else:
+            selected = set(optimizers)
+            chunks: list[pd.DataFrame] = []
+            for chunk in pd.read_csv(path, chunksize=chunksize):
+                if "optimizer" not in chunk:
+                    raise RuntimeError("campaign results are missing required columns: optimizer")
+                projection = chunk.loc[chunk["optimizer"].isin(selected)].copy()
+                if not projection.empty:
+                    projection[SOURCE_RESULT_ROW_INDEX_COLUMN] = projection.index.astype(int)
+                    chunks.append(projection)
+            results = (
+                pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=columns)
+            )
+        return self._load_complete_campaign(
+            expected_run_kind,
+            results,
+            manifest=manifest,
+            selected_optimizers=optimizers,
+        )
+
     def _load_complete_campaign(
         self,
         expected_run_kind: str,
         results: pd.DataFrame,
+        *,
+        manifest: dict[str, Any] | None = None,
+        selected_optimizers: list[str] | None = None,
     ) -> pd.DataFrame:
         """Validate exact manifest Cartesian coverage before analysis."""
-        manifest = self.load_manifest(expected_run_kind=expected_run_kind)
+        if manifest is None:
+            manifest = self.load_manifest(expected_run_kind=expected_run_kind)
         problems = self._manifest_string_axis(manifest, "problems")
-        optimizers = self._manifest_string_axis(manifest, "optimizers")
+        declared_optimizers = self._manifest_string_axis(manifest, "optimizers")
+        optimizers = declared_optimizers if selected_optimizers is None else selected_optimizers
         budgets = self._manifest_integer_axis(manifest, "budgets")
         n_runs = manifest.get("n_runs")
         if isinstance(n_runs, bool) or not isinstance(n_runs, int) or n_runs <= 0:
@@ -197,6 +256,7 @@ class ResultStore:
             manifest,
             optimizers,
             budgets,
+            projection=selected_optimizers is not None,
         )
         self._validate_row_configurations(canonical, configurations)
         if expected_run_kind == "hpo":
@@ -209,11 +269,22 @@ class ResultStore:
                 self._validate_multi_objective_contract(canonical)
         return canonical
 
+    def _result_path_and_columns(self, run_kind: str) -> tuple[Path, list[str]]:
+        if run_kind == "single_objective":
+            return self.so_path, SO_COLUMNS
+        if run_kind == "multi_objective":
+            return self.mo_path, MO_COLUMNS
+        if run_kind == "hpo":
+            return self.hpo_path, HPO_COLUMNS
+        raise RuntimeError(f"unsupported benchmark run kind {run_kind!r}")
+
     @staticmethod
     def _manifest_optimizer_configurations(
         manifest: dict[str, Any],
         optimizers: list[str],
         budgets: list[int],
+        *,
+        projection: bool = False,
     ) -> dict[tuple[str, int], dict[str, Any]]:
         """Return the manifest's complete optimizer-by-budget configuration map."""
         entries = manifest.get("optimizer_configurations")
@@ -228,6 +299,8 @@ class ResultStore:
             by_budget = entry.get("by_budget")
             if not isinstance(optimizer, str) or not isinstance(by_budget, list):
                 raise RuntimeError("campaign manifest has a malformed optimizer configuration")
+            if projection and optimizer not in optimizers:
+                continue
             for item in by_budget:
                 if not isinstance(item, dict):
                     raise RuntimeError("campaign manifest has a malformed budget configuration")

@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from benchmarks.data.persistence import ResultStore
+from benchmarks.data.composite import load_reporting_results
 from benchmarks.plotting.bootstrap import (
     DEFAULT_BOOTSTRAP_RESAMPLES,
     DEFAULT_BOOTSTRAP_SEED,
@@ -329,7 +329,7 @@ def main() -> None:
 
     # Authenticate the manifest and exact Cartesian result coverage before
     # creating any reporting artifacts.
-    results = ResultStore(args.results_dir).load_complete_multi()
+    results = load_reporting_results(args.results_dir, "multi_objective")
     summary = summarize_grouped_tlp(
         results,
         n_resamples=args.bootstrap_resamples,

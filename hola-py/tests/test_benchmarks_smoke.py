@@ -17,6 +17,7 @@ BENCHMARK_MODULES = (
     "benchmarks.adapters.pymoo_common",
     "benchmarks.adapters.pymoo_multi",
     "benchmarks.adapters.pymoo_single",
+    "benchmarks.data.composite",
     "benchmarks.data.manifest",
     "benchmarks.data.normalize",
     "benchmarks.data.persistence",
@@ -70,6 +71,32 @@ def test_benchmark_cli_help(isolated_benchmarks_path, isolated_benchmarks_env):
     assert "run-grouped-tlp" in result.stdout
     assert "plot-hpo" in result.stdout
     assert "plot-grouped-tlp" in result.stdout
+
+
+@pytest.mark.benchmarks
+@pytest.mark.parametrize(
+    ("command", "expected_option"),
+    [
+        ("run-single", "--optimizers"),
+        ("compose-results", "--replacement"),
+    ],
+)
+def test_benchmark_subcommand_help_reaches_the_command_parser(
+    isolated_benchmarks_path,
+    isolated_benchmarks_env,
+    command: str,
+    expected_option: str,
+):
+    result = subprocess.run(
+        [sys.executable, "-m", "benchmarks", command, "--help"],
+        cwd=str(isolated_benchmarks_path),
+        env=isolated_benchmarks_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert expected_option in result.stdout
 
 
 @pytest.mark.benchmarks
