@@ -138,20 +138,33 @@ class Gmm:
             (default: 0.25). Must be between 0.0 and 1.0.
         exploration_budget: Number of Sobol exploration trials before GMM
             exploitation begins. When omitted, computed automatically from
-            the number of dimensions.
+            the total budget and number of dimensions.
         max_refit_samples: Maximum elite samples used by one GMM fit
             (default: 4096).
         max_refit_candidates: Maximum retained trials ranked during elite
             selection (default: 16384). Longer histories use deterministic
             stratified coverage.
+        ongoing_exploration_period: Period between Sobol exploration trials
+            after GMM exploitation begins. ``None`` uses the default (currently
+            5), ``0`` disables ongoing exploration, and explicit periods must
+            be at least 2.
+        max_components: Maximum number of Gaussian mixture components. When
+            omitted, uses the default (currently 3). Must be at least 1.
+        min_elite_samples: Minimum feasible elite samples required before GMM
+            fitting. When omitted, uses the default (currently 1). Must be at
+            least 1 and must not exceed ``max_refit_samples``.
 
     Raises:
-        ConfigurationError: If a fraction, interval, or refit limit is invalid.
+        ConfigurationError: If a fraction, interval, component count, sample
+            count, or refit limit is invalid.
     """
 
     refit_interval: int | None
     elite_fraction: float | None
     exploration_budget: int | None
+    ongoing_exploration_period: int | None
+    max_components: int | None
+    min_elite_samples: int | None
     max_refit_samples: int | None
     max_refit_candidates: int | None
     def __init__(
@@ -161,6 +174,9 @@ class Gmm:
         exploration_budget: int | None = None,
         max_refit_samples: int | None = None,
         max_refit_candidates: int | None = None,
+        ongoing_exploration_period: int | None = None,
+        max_components: int | None = None,
+        min_elite_samples: int | None = None,
     ) -> None: ...
 
 class Sobol:

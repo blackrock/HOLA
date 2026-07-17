@@ -253,10 +253,19 @@ impl Maximize {
 ///     elite_fraction: Fraction of top trials used for GMM refitting (default: 0.25).
 ///         Must be between 0.0 and 1.0.
 ///     exploration_budget: Number of Sobol exploration trials before GMM exploitation
-///         begins. When omitted, computed automatically from the number of dimensions.
+///         begins. When omitted, computed automatically from the total budget and
+///         number of dimensions.
 ///     max_refit_samples: Maximum elite samples used by one GMM fit (default: 4096).
 ///     max_refit_candidates: Maximum retained trials ranked during elite selection
 ///         (default: 16384). Longer histories use deterministic stratified coverage.
+///     ongoing_exploration_period: Period between Sobol exploration trials after
+///         GMM exploitation begins. ``None`` uses the default (currently 5), ``0``
+///         disables ongoing exploration, and explicit periods must be at least 2.
+///     max_components: Maximum number of Gaussian mixture components. When omitted,
+///         uses the default (currently 3). Must be at least 1 when specified.
+///     min_elite_samples: Minimum feasible elite samples required before GMM fitting.
+///         When omitted, uses the default (currently 1). Must be at least 1 when
+///         specified and must not exceed ``max_refit_samples``.
 #[pyclass(from_py_object)]
 #[derive(Clone)]
 struct Gmm {
@@ -267,6 +276,12 @@ struct Gmm {
     #[pyo3(get)]
     exploration_budget: Option<usize>,
     #[pyo3(get)]
+    ongoing_exploration_period: Option<usize>,
+    #[pyo3(get)]
+    max_components: Option<usize>,
+    #[pyo3(get)]
+    min_elite_samples: Option<usize>,
+    #[pyo3(get)]
     max_refit_samples: Option<usize>,
     #[pyo3(get)]
     max_refit_candidates: Option<usize>,
@@ -275,13 +290,17 @@ struct Gmm {
 #[pymethods]
 impl Gmm {
     #[new]
-    #[pyo3(signature = (refit_interval=None, elite_fraction=None, exploration_budget=None, max_refit_samples=None, max_refit_candidates=None))]
+    #[pyo3(signature = (refit_interval=None, elite_fraction=None, exploration_budget=None, max_refit_samples=None, max_refit_candidates=None, ongoing_exploration_period=None, max_components=None, min_elite_samples=None))]
+    #[allow(clippy::too_many_arguments)] // One flat argument per public Python setting.
     fn new(
         refit_interval: Option<usize>,
         elite_fraction: Option<f64>,
         exploration_budget: Option<usize>,
         max_refit_samples: Option<usize>,
         max_refit_candidates: Option<usize>,
+        ongoing_exploration_period: Option<usize>,
+        max_components: Option<usize>,
+        min_elite_samples: Option<usize>,
     ) -> PyResult<Self> {
         if let Some(ef) = elite_fraction {
             if !ef.is_finite() || ef <= 0.0 || ef > 1.0 {
@@ -297,6 +316,21 @@ impl Gmm {
                 ));
             }
         }
+        if ongoing_exploration_period == Some(1) {
+            return Err(ConfigurationError::new_err(
+                "ongoing_exploration_period must be 0 (disabled) or at least 2",
+            ));
+        }
+        if max_components == Some(0) {
+            return Err(ConfigurationError::new_err(
+                "max_components must be at least 1",
+            ));
+        }
+        if min_elite_samples == Some(0) {
+            return Err(ConfigurationError::new_err(
+                "min_elite_samples must be at least 1",
+            ));
+        }
         let effective_max_refit_samples = max_refit_samples.unwrap_or(DEFAULT_MAX_REFIT_SAMPLES);
         let effective_max_refit_candidates =
             max_refit_candidates.unwrap_or(DEFAULT_MAX_REFIT_CANDIDATES);
@@ -304,6 +338,11 @@ impl Gmm {
             return Err(ConfigurationError::new_err(
                 "max_refit_samples must be at least 1",
             ));
+        }
+        if min_elite_samples.is_some_and(|minimum| minimum > effective_max_refit_samples) {
+            return Err(ConfigurationError::new_err(format!(
+                "min_elite_samples must not exceed max_refit_samples ({effective_max_refit_samples})",
+            )));
         }
         if effective_max_refit_candidates < effective_max_refit_samples {
             return Err(ConfigurationError::new_err(format!(
@@ -314,6 +353,9 @@ impl Gmm {
             refit_interval,
             elite_fraction,
             exploration_budget,
+            ongoing_exploration_period,
+            max_components,
+            min_elite_samples,
             max_refit_samples,
             max_refit_candidates,
         })
@@ -779,6 +821,9 @@ impl Study {
                 exploration_budget: None,
                 seed,
                 elite_fraction: None,
+                ongoing_exploration_period: None,
+                max_components: None,
+                min_elite_samples: None,
                 max_refit_samples: DEFAULT_MAX_REFIT_SAMPLES,
                 max_refit_candidates: DEFAULT_MAX_REFIT_CANDIDATES,
             },
@@ -794,6 +839,9 @@ impl Study {
                         exploration_budget: gmm.exploration_budget,
                         seed,
                         elite_fraction: gmm.elite_fraction,
+                        ongoing_exploration_period: gmm.ongoing_exploration_period,
+                        max_components: gmm.max_components,
+                        min_elite_samples: gmm.min_elite_samples,
                         max_refit_samples: gmm
                             .max_refit_samples
                             .unwrap_or(DEFAULT_MAX_REFIT_SAMPLES),
@@ -809,6 +857,9 @@ impl Study {
                         exploration_budget: None,
                         seed,
                         elite_fraction: None,
+                        ongoing_exploration_period: None,
+                        max_components: None,
+                        min_elite_samples: None,
                         max_refit_samples: DEFAULT_MAX_REFIT_SAMPLES,
                         max_refit_candidates: DEFAULT_MAX_REFIT_CANDIDATES,
                     }
@@ -820,6 +871,9 @@ impl Study {
                         exploration_budget: None,
                         seed,
                         elite_fraction: None,
+                        ongoing_exploration_period: None,
+                        max_components: None,
+                        min_elite_samples: None,
                         max_refit_samples: DEFAULT_MAX_REFIT_SAMPLES,
                         max_refit_candidates: DEFAULT_MAX_REFIT_CANDIDATES,
                     }
@@ -837,6 +891,9 @@ impl Study {
                         exploration_budget: None,
                         seed,
                         elite_fraction: None,
+                        ongoing_exploration_period: None,
+                        max_components: None,
+                        min_elite_samples: None,
                         max_refit_samples: DEFAULT_MAX_REFIT_SAMPLES,
                         max_refit_candidates: DEFAULT_MAX_REFIT_CANDIDATES,
                     }

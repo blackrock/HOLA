@@ -29,7 +29,7 @@ use opt_engine::persistence::{
 };
 use opt_engine::scales::{LinearScale, Log10Scale, LogScale, Scale};
 use opt_engine::spaces::{CategoricalSpace, ContinuousSpace, DiscreteSpace};
-use opt_engine::strategies::{GmmStrategy, RandomStrategy, SobolStrategy};
+use opt_engine::strategies::{GmmRefitConfig, GmmStrategy, RandomStrategy, SobolStrategy};
 use opt_engine::traits::{RefitConfig, SampleSpace, StandardizedSpace, Strategy};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -70,10 +70,16 @@ const MAX_ASK_IDEMPOTENCY_KEYS: usize = MAX_PENDING_TRIALS;
 /// the idempotency ledger into unbounded study history.
 const MAX_COMPLETION_RECEIPTS: usize = 4096;
 
-/// Continue drawing a low-discrepancy global-exploration point at this cadence
-/// after the initial warm-up. This prevents a fitted GMM from permanently
-/// collapsing around sparse early elites.
-const AUTO_EXPLORATION_PERIOD: usize = 5;
+/// Legacy cadence for low-discrepancy exploration after the initial warm-up.
+/// This prevents a fitted GMM from permanently collapsing around sparse early
+/// elites.
+pub const DEFAULT_ONGOING_EXPLORATION_PERIOD: usize = 5;
+/// Legacy upper bound on fitted GMM components.
+pub const DEFAULT_MAX_COMPONENTS: usize = 3;
+/// Legacy lower bound on the elite workset passed to a GMM refit.
+pub const DEFAULT_MIN_ELITE_SAMPLES: usize = 1;
+/// Variance of the neutral GMM placeholder used before the first empirical fit.
+const AUTO_GMM_PRIOR_VARIANCE: f64 = 0.1;
 /// Default bound on the number of elite samples passed to full-covariance EM.
 /// This is an implementation safeguard, not part of the abstract method, and
 /// can be overridden in [`StrategyConfig`].
@@ -479,7 +485,8 @@ enum DynStrategyInner {
 ///
 /// During the first `exploration_budget` trials, candidates are drawn from a
 /// Sobol sequence. After that, candidates are drawn from a Gaussian mixture
-/// model that is periodically refit to elite trials.
+/// model once its first empirical fit is available; the model is periodically
+/// refit to elite trials.
 ///
 /// The default exploration budget follows the formula from the paper:
 /// `min(floor(S / 5), 50 + 2n)`, where `S` is the intended number of
@@ -489,6 +496,11 @@ pub struct AutoStrategy {
     sobol: SobolStrategy<DynSpace>,
     gmm: GmmStrategy<DynSpace>,
     exploration_budget: usize,
+    ongoing_exploration_period: usize,
+    /// Whether exploitation may use the GMM rather than the uninformed prior.
+    /// This is distinct from the GMM's sampling epoch so legacy checkpoints can
+    /// preserve their historical route without pretending an epoch existed.
+    gmm_sampling_ready: bool,
     trial_count: usize,
     issued_count: AtomicUsize,
 }
@@ -514,6 +526,20 @@ impl AutoStrategy {
     }
 
     pub fn new(dim: usize, exploration_budget: usize, seed: Option<u64>) -> Self {
+        Self::new_with_exploration_period(
+            dim,
+            exploration_budget,
+            DEFAULT_ONGOING_EXPLORATION_PERIOD,
+            seed,
+        )
+    }
+
+    fn new_with_exploration_period(
+        dim: usize,
+        exploration_budget: usize,
+        ongoing_exploration_period: usize,
+        seed: Option<u64>,
+    ) -> Self {
         let (sobol_seed, gmm_seed) = match seed {
             // Fold the high 32 bits into the low 32 instead of truncating, so two
             // u64 seeds that differ only in their high bits yield distinct Sobol
@@ -523,9 +549,11 @@ impl AutoStrategy {
         };
         Self {
             sobol: SobolStrategy::new(sobol_seed),
-            gmm: GmmStrategy::uniform_prior(gmm_seed, dim, 0.1)
+            gmm: GmmStrategy::uniform_prior(gmm_seed, dim, AUTO_GMM_PRIOR_VARIANCE)
                 .expect("AutoStrategy dimensions and prior variance are validated"),
             exploration_budget,
+            ongoing_exploration_period,
+            gmm_sampling_ready: false,
             trial_count: 0,
             issued_count: AtomicUsize::new(0),
         }
@@ -538,6 +566,8 @@ impl Clone for AutoStrategy {
             sobol: self.sobol.clone(),
             gmm: self.gmm.clone(),
             exploration_budget: self.exploration_budget,
+            ongoing_exploration_period: self.ongoing_exploration_period,
+            gmm_sampling_ready: self.gmm_sampling_ready,
             trial_count: self.trial_count,
             issued_count: AtomicUsize::new(self.issued_count.load(Ordering::Relaxed)),
         }
@@ -551,10 +581,15 @@ impl Serialize for AutoStrategy {
     {
         use serde::ser::SerializeStruct;
 
-        let mut state = serializer.serialize_struct("AutoStrategy", 5)?;
+        let mut state = serializer.serialize_struct("AutoStrategy", 7)?;
         state.serialize_field("sobol", &self.sobol)?;
         state.serialize_field("gmm", &self.gmm)?;
         state.serialize_field("exploration_budget", &self.exploration_budget)?;
+        state.serialize_field(
+            "ongoing_exploration_period",
+            &self.ongoing_exploration_period,
+        )?;
+        state.serialize_field("gmm_sampling_ready", &self.gmm_sampling_ready)?;
         state.serialize_field("trial_count", &self.trial_count)?;
         state.serialize_field("issued_count", &self.issued_count.load(Ordering::Relaxed))?;
         state.end()
@@ -571,6 +606,10 @@ impl<'de> Deserialize<'de> for AutoStrategy {
             sobol: SobolStrategy<DynSpace>,
             gmm: GmmStrategy<DynSpace>,
             exploration_budget: usize,
+            #[serde(default = "default_ongoing_exploration_period")]
+            ongoing_exploration_period: usize,
+            #[serde(default)]
+            gmm_sampling_ready: Option<bool>,
             trial_count: usize,
             #[serde(default)]
             issued_count: Option<usize>,
@@ -584,10 +623,25 @@ impl<'de> Deserialize<'de> for AutoStrategy {
                 state.trial_count
             )));
         }
+        if state.ongoing_exploration_period == 1 {
+            return Err(serde::de::Error::custom(
+                "auto strategy ongoing_exploration_period must be 0 or at least 2",
+            ));
+        }
+        // Before this marker existed, Auto switched to its GMM strictly at the
+        // issued-suggestion boundary—even if that model was still the uniform
+        // prior. Preserve that route for old checkpoints. Epoch-aware fitted
+        // checkpoints can be recognized directly; the boundary inference also
+        // covers the older integer-cursor format whose epoch is necessarily 0.
+        let gmm_sampling_ready = state.gmm_sampling_ready.unwrap_or_else(|| {
+            state.gmm.refit_epoch() > 0 || issued_count >= state.exploration_budget
+        });
         Ok(Self {
             sobol: state.sobol,
             gmm: state.gmm,
             exploration_budget: state.exploration_budget,
+            ongoing_exploration_period: state.ongoing_exploration_period,
+            gmm_sampling_ready,
             trial_count: state.trial_count,
             issued_count: AtomicUsize::new(issued_count),
         })
@@ -610,9 +664,16 @@ impl Strategy for DynStrategy {
             DynStrategyInner::Gmm(s) => s.suggest(space),
             DynStrategyInner::Auto(s) => {
                 let issued = s.issued_count.fetch_add(1, Ordering::Relaxed);
-                let periodic_exploration = issued >= s.exploration_budget
-                    && (issued - s.exploration_budget + 1).is_multiple_of(AUTO_EXPLORATION_PERIOD);
-                if issued < s.exploration_budget || periodic_exploration {
+                let periodic_exploration = s.ongoing_exploration_period >= 2
+                    && issued >= s.exploration_budget
+                    && (issued - s.exploration_budget + 1)
+                        .is_multiple_of(s.ongoing_exploration_period);
+                // Until the first empirical fit is installed, the uniform GMM
+                // prior contains no information beyond global exploration. A
+                // burst of concurrent asks can outrun tells at the warm-up
+                // boundary, so keep those asks on Sobol rather than sampling
+                // the arbitrary prior.
+                if issued < s.exploration_budget || !s.gmm_sampling_ready || periodic_exploration {
                     s.sobol.suggest(space)
                 } else {
                     s.gmm.suggest(space)
@@ -743,9 +804,12 @@ impl DynStrategy {
                 }
                 let initial_sobol = issued_count.min(strategy.exploration_budget);
                 let post_exploration = issued_count.saturating_sub(strategy.exploration_budget);
-                let periodic_sobol = post_exploration / AUTO_EXPLORATION_PERIOD;
+                let periodic_sobol = if strategy.ongoing_exploration_period >= 2 {
+                    post_exploration / strategy.ongoing_exploration_period
+                } else {
+                    0
+                };
                 let expected_sobol = initial_sobol.saturating_add(periodic_sobol);
-                let expected_gmm = issued_count.saturating_sub(expected_sobol);
                 let expected_sobol_u32 = u32::try_from(expected_sobol).map_err(|_| {
                     "checkpoint auto Sobol cursor exceeds the supported u32 range".to_string()
                 })?;
@@ -756,11 +820,23 @@ impl DynStrategy {
                         strategy.sobol.index()
                     ));
                 }
-                let expected_gmm_u64 = u64::try_from(expected_gmm).unwrap_or(u64::MAX);
-                if strategy.gmm.counter() < expected_gmm_u64 || strategy.gmm.counter() == u64::MAX {
+                if strategy.gmm.counter() == u64::MAX {
                     return Err(format!(
-                        "checkpoint auto GMM cursor {} is smaller than expected {expected_gmm}",
+                        "checkpoint auto GMM cursor {} is exhausted",
                         strategy.gmm.counter()
+                    ));
+                }
+                // Concurrent asks can cross the warm-up boundary before the
+                // first fit completes. Those requests deliberately stay on
+                // Sobol, so the nominal cadence cannot provide a lower bound
+                // for the GMM cursor. Every issued request must nevertheless
+                // be represented by one of the two sampler cursors. Imported
+                // legacy history may conservatively advance both, hence `>=`.
+                let routed_count = u128::from(strategy.sobol.index())
+                    .saturating_add(u128::from(strategy.gmm.counter()));
+                if routed_count < issued_count as u128 {
+                    return Err(format!(
+                        "checkpoint auto sampler cursors account for {routed_count} suggestions, fewer than issued_count {issued_count}"
                     ));
                 }
                 if let Some(expected_budget) = config.exploration_budget {
@@ -770,6 +846,22 @@ impl DynStrategy {
                             strategy.exploration_budget
                         ));
                     }
+                }
+                let expected_period = config
+                    .ongoing_exploration_period
+                    .unwrap_or(DEFAULT_ONGOING_EXPLORATION_PERIOD);
+                if strategy.ongoing_exploration_period != expected_period {
+                    return Err(format!(
+                        "checkpoint ongoing exploration period {} does not match configured period {expected_period}",
+                        strategy.ongoing_exploration_period
+                    ));
+                }
+                let expected_components = config.max_components.unwrap_or(DEFAULT_MAX_COMPONENTS);
+                let checkpoint_components = strategy.gmm.get_refit_config().n_components();
+                if checkpoint_components != expected_components {
+                    return Err(format!(
+                        "checkpoint maximum GMM components {checkpoint_components} does not match configured maximum {expected_components}"
+                    ));
                 }
             }
             DynStrategyInner::Random(strategy) => {
@@ -831,10 +923,16 @@ impl DynStrategy {
             DynStrategyInner::Gmm(strategy) => strategy
                 .try_refit(space, trials)
                 .map_err(|error| error.to_string()),
-            DynStrategyInner::Auto(strategy) => strategy
-                .gmm
-                .try_refit(space, trials)
-                .map_err(|error| error.to_string()),
+            DynStrategyInner::Auto(strategy) => {
+                strategy
+                    .gmm
+                    .try_refit(space, trials)
+                    .map_err(|error| error.to_string())?;
+                if !trials.is_empty() {
+                    strategy.gmm_sampling_ready = true;
+                }
+                Ok(())
+            }
             DynStrategyInner::Random(_) | DynStrategyInner::Sobol(_) => Ok(()),
         }
     }
@@ -861,15 +959,36 @@ impl DynStrategy {
             }
             DynStrategyInner::Auto(strategy) => {
                 strategy.sobol.advance_to(sobol_index);
-                strategy.gmm.advance_to(sample_count);
                 strategy.trial_count = completed_count;
                 strategy
                     .issued_count
                     .fetch_max(completed_count, Ordering::Relaxed);
-                strategy
-                    .gmm
-                    .try_refit(space, trials)
+                let gmm_counter = strategy.gmm.counter().max(sample_count);
+                if trials.is_empty() {
+                    // A leaderboard-only import replaces the history. An old
+                    // fitted model cannot remain eligible when the replacement
+                    // has no adequate feasible workset, so restore the neutral
+                    // prior while preserving configuration and monotonic cursor
+                    // state. Auto will remain on Sobol until a later valid fit.
+                    let refit_config = strategy.gmm.get_refit_config().clone();
+                    let mut gmm = GmmStrategy::uniform_prior(
+                        strategy.gmm.seed(),
+                        space.dimensionality(),
+                        AUTO_GMM_PRIOR_VARIANCE,
+                    )
                     .map_err(|error| error.to_string())?;
+                    gmm.set_refit_config(refit_config);
+                    gmm.advance_to(gmm_counter);
+                    strategy.gmm = gmm;
+                    strategy.gmm_sampling_ready = false;
+                } else {
+                    strategy.gmm.advance_to(gmm_counter);
+                    strategy
+                        .gmm
+                        .try_refit(space, trials)
+                        .map_err(|error| error.to_string())?;
+                    strategy.gmm_sampling_ready = true;
+                }
             }
         }
         Ok(())
@@ -878,10 +997,8 @@ impl DynStrategy {
 
 impl opt_engine::traits::RefittableStrategy for DynStrategy {
     fn refit(&mut self, space: &DynSpace, trials: &[(serde_json::Value, f64)]) {
-        match &mut self.inner {
-            DynStrategyInner::Gmm(s) => s.refit(space, trials),
-            DynStrategyInner::Auto(s) => s.gmm.refit(space, trials),
-            _ => {}
+        if let Err(error) = self.try_refit(space, trials) {
+            eprintln!("DynStrategy::refit rejected invalid input: {error}");
         }
     }
 
@@ -893,6 +1010,8 @@ impl opt_engine::traits::RefittableStrategy for DynStrategy {
                 s.sobol = l.sobol.clone();
                 opt_engine::traits::RefittableStrategy::reconcile_after_refit(&mut s.gmm, &l.gmm);
                 s.trial_count = l.trial_count;
+                // A successful nonempty refit marks the fitted snapshot ready;
+                // an empty no-op clone carries the live value already.
                 s.issued_count
                     .store(l.issued_count.load(Ordering::Relaxed), Ordering::Relaxed);
             }
@@ -972,6 +1091,10 @@ pub struct StrategyConfig {
     /// Override the exploration budget directly instead of using the formula.
     #[serde(default)]
     pub exploration_budget: Option<usize>,
+    /// Cadence for ongoing Sobol exploration after the initial warm-up.
+    /// Missing resolves to the legacy cadence of 5; 0 disables it.
+    #[serde(default)]
+    pub ongoing_exploration_period: Option<usize>,
     /// Optional seed for reproducible runs. When `None`, strategies use their
     /// default seeding (Sobol=42, others use random seeds).
     #[serde(default)]
@@ -980,6 +1103,15 @@ pub struct StrategyConfig {
     /// Must be in (0.0, 1.0].
     #[serde(default)]
     pub elite_fraction: Option<f64>,
+    /// Maximum number of GMM components considered during fitting. Missing
+    /// resolves to the legacy cap of 3.
+    #[serde(default)]
+    pub max_components: Option<usize>,
+    /// Minimum feasible elite workset size required for refitting. A scheduled
+    /// refit is skipped until selection can supply this many trials. Missing
+    /// resolves to the legacy floor of 1.
+    #[serde(default)]
+    pub min_elite_samples: Option<usize>,
     /// Maximum elite samples used by one GMM fit. This bounds EM cost but does
     /// not change the abstract elite definition.
     #[serde(default = "default_max_refit_samples")]
@@ -994,12 +1126,30 @@ fn default_refit_interval() -> usize {
     20
 }
 
+fn default_ongoing_exploration_period() -> usize {
+    DEFAULT_ONGOING_EXPLORATION_PERIOD
+}
+
 fn default_max_refit_samples() -> usize {
     DEFAULT_MAX_REFIT_SAMPLES
 }
 
 fn default_max_refit_candidates() -> usize {
     DEFAULT_MAX_REFIT_CANDIDATES
+}
+
+impl StrategyConfig {
+    /// Resolve controls added after the original checkpoint schema. Keeping
+    /// these as optional on input lets old YAML and embedded checkpoint configs
+    /// retain their historical behavior, while exported configs record the
+    /// concrete values that actually govern sampling.
+    fn resolve_calibration_control_defaults(&mut self) {
+        self.ongoing_exploration_period
+            .get_or_insert(DEFAULT_ONGOING_EXPLORATION_PERIOD);
+        self.max_components.get_or_insert(DEFAULT_MAX_COMPONENTS);
+        self.min_elite_samples
+            .get_or_insert(DEFAULT_MIN_ELITE_SAMPLES);
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1206,6 +1356,9 @@ fn validate_strategy_config(strategy: &StrategyConfig) -> Result<(), String> {
     if strategy.refit_interval == 0 {
         return Err("strategy.refit_interval must be at least 1".to_string());
     }
+    if strategy.ongoing_exploration_period == Some(1) {
+        return Err("strategy.ongoing_exploration_period must be 0 or at least 2".to_string());
+    }
     if let Some(elite_fraction) = strategy.elite_fraction {
         if !elite_fraction.is_finite() || elite_fraction <= 0.0 || elite_fraction > 1.0 {
             return Err(format!(
@@ -1215,6 +1368,20 @@ fn validate_strategy_config(strategy: &StrategyConfig) -> Result<(), String> {
     }
     if strategy.max_refit_samples == 0 {
         return Err("strategy.max_refit_samples must be at least 1".to_string());
+    }
+    if strategy.max_components == Some(0) {
+        return Err("strategy.max_components must be at least 1".to_string());
+    }
+    if strategy.min_elite_samples == Some(0) {
+        return Err("strategy.min_elite_samples must be at least 1".to_string());
+    }
+    if let Some(min_elite_samples) = strategy.min_elite_samples {
+        if min_elite_samples > strategy.max_refit_samples {
+            return Err(format!(
+                "strategy.min_elite_samples must not exceed max_refit_samples ({}), got {min_elite_samples}",
+                strategy.max_refit_samples
+            ));
+        }
     }
     if strategy.max_refit_candidates < strategy.max_refit_samples {
         return Err(format!(
@@ -2252,6 +2419,8 @@ pub struct HolaEngine {
     max_refit_samples: usize,
     /// Implementation bound for trials ranked during elite selection.
     max_refit_candidates: usize,
+    /// Required lower bound for a refit's feasible elite workset.
+    min_elite_samples: usize,
     auto_checkpoint: Option<AutoCheckpointConfig>,
     /// Failures from unattended auto-checkpoint writes and rotation. Shared by
     /// clones and exposed to the server metrics endpoint.
@@ -2823,6 +2992,15 @@ impl HolaEngine {
         let max_refit_candidates = strategy_cfg
             .map(|strategy| strategy.max_refit_candidates)
             .unwrap_or(DEFAULT_MAX_REFIT_CANDIDATES);
+        let ongoing_exploration_period = strategy_cfg
+            .and_then(|strategy| strategy.ongoing_exploration_period)
+            .unwrap_or(DEFAULT_ONGOING_EXPLORATION_PERIOD);
+        let max_components = strategy_cfg
+            .and_then(|strategy| strategy.max_components)
+            .unwrap_or(DEFAULT_MAX_COMPONENTS);
+        let min_elite_samples = strategy_cfg
+            .and_then(|strategy| strategy.min_elite_samples)
+            .unwrap_or(DEFAULT_MIN_ELITE_SAMPLES);
         // Resolve an omitted seed exactly once. The concrete value is used by
         // every strategy and persisted in study_config/checkpoints so an
         // auto-seeded run can be reproduced rather than recording `None`.
@@ -2864,19 +3042,37 @@ impl HolaEngine {
                         AutoStrategy::default_exploration_budget(total, dim)
                     });
                 let elite_fraction = strategy_cfg.and_then(|s| s.elite_fraction).unwrap_or(0.25);
+                // Anchor the cadence at the first statistically permitted fit.
+                // With the legacy floor of one this is exactly the historical
+                // K0 schedule; an explicit larger floor waits until that many
+                // completed observations exist and then refits at the requested
+                // interval from that boundary.
+                let first_refit_trials = exploration_budget.max(min_elite_samples);
                 effective_exploration_budget = Some(exploration_budget);
                 effective_elite_fraction = Some(elite_fraction);
+                let mut auto = AutoStrategy::new_with_exploration_period(
+                    dim,
+                    exploration_budget,
+                    ongoing_exploration_period,
+                    Some(seed),
+                );
+                let default_gmm_refit = GmmRefitConfig::default();
+                auto.gmm.set_refit_config(
+                    GmmRefitConfig::new(
+                        max_components,
+                        default_gmm_refit.max_iters(),
+                        default_gmm_refit.tolerance(),
+                        default_gmm_refit.regularization(),
+                    )
+                    .map_err(|error| format!("Invalid GMM refit configuration: {error}"))?,
+                );
                 (
                     DynStrategy {
-                        inner: DynStrategyInner::Auto(AutoStrategy::new(
-                            dim,
-                            exploration_budget,
-                            Some(seed),
-                        )),
+                        inner: DynStrategyInner::Auto(auto),
                     },
                     Some(
                         RefitConfig::try_with_quantile(
-                            exploration_budget,
+                            first_refit_trials,
                             refit_interval,
                             elite_fraction,
                         )
@@ -2898,8 +3094,11 @@ impl HolaEngine {
             refit_interval,
             total_budget: max_trials,
             exploration_budget: effective_exploration_budget,
+            ongoing_exploration_period: Some(ongoing_exploration_period),
             seed: Some(seed),
             elite_fraction: effective_elite_fraction,
+            max_components: Some(max_components),
+            min_elite_samples: Some(min_elite_samples),
             max_refit_samples,
             max_refit_candidates,
         });
@@ -2943,6 +3142,7 @@ impl HolaEngine {
             refit_config,
             max_refit_samples,
             max_refit_candidates,
+            min_elite_samples,
             auto_checkpoint,
             checkpoint_failures: Arc::new(AtomicU64::new(0)),
             refit_failures: Arc::new(AtomicU64::new(0)),
@@ -3358,7 +3558,7 @@ impl HolaEngine {
         let mut post_commit_warnings = Vec::new();
 
         if let Some(ref config) = self.refit_config {
-            if config.should_refit(completed_trials) {
+            if completed_trials >= self.min_elite_samples && config.should_refit(completed_trials) {
                 // Serialize refits and take the leaderboard snapshot only after
                 // earlier work finishes. A cadence boundary that arrives while
                 // fitting must coalesce into a fit of the latest history rather
@@ -3368,13 +3568,23 @@ impl HolaEngine {
                 let refit_completed = state_guard.leaderboard.completed_count();
                 let k = config
                     .selection_count(refit_completed)
-                    .min(self.max_refit_samples);
+                    .max(self.min_elite_samples)
+                    .min(refit_completed)
+                    .min(self.max_refit_samples)
+                    .min(self.max_refit_candidates);
                 let refit_objectives = state_guard.objectives.clone();
-                let trials = state_guard.leaderboard.top_k_for_refit(
+                let mut trials = state_guard.leaderboard.top_k_for_refit(
                     k,
                     self.max_refit_candidates,
                     &refit_objectives,
                 );
+                // Infeasible trials are deliberately excluded from model
+                // fitting. If that leaves fewer than the requested adequacy
+                // floor, turn this cadence point into a no-op and keep the
+                // current model (or the pre-fit Sobol route) until a later one.
+                if trials.len() < self.min_elite_samples {
+                    trials.clear();
+                }
                 let mut strategy_snapshot = state_guard.strategy.clone();
                 let space_clone = self.space.clone();
                 drop(state_guard);
@@ -3722,17 +3932,23 @@ impl HolaEngine {
         let _refit_guard = self.refit_lock.lock().await;
         let state_guard = self.state.read().await;
         let current_completed = state_guard.leaderboard.completed_count();
-        if current_completed < config.min_trials() {
+        if current_completed < config.min_trials() || current_completed < self.min_elite_samples {
             return;
         }
         let k = config
             .selection_count(current_completed)
-            .min(self.max_refit_samples);
+            .max(self.min_elite_samples)
+            .min(current_completed)
+            .min(self.max_refit_samples)
+            .min(self.max_refit_candidates);
         let objectives = state_guard.objectives.clone();
-        let trials =
+        let mut trials =
             state_guard
                 .leaderboard
                 .top_k_for_refit(k, self.max_refit_candidates, &objectives);
+        if trials.len() < self.min_elite_samples {
+            trials.clear();
+        }
         let mut strategy_snapshot = state_guard.strategy.clone();
         let space_clone = self.space.clone();
         drop(state_guard);
@@ -3889,6 +4105,7 @@ impl HolaEngine {
         let max_leaderboard_size = self.max_leaderboard_size;
         let max_refit_samples = self.max_refit_samples;
         let max_refit_candidates = self.max_refit_candidates;
+        let min_elite_samples = self.min_elite_samples;
         let (leaderboard, strategy, n) = tokio::task::spawn_blocking(move || {
             let mut leaderboard = parse_leaderboard_checkpoint(raw, current_is_vector)?;
             leaderboard
@@ -3898,11 +4115,14 @@ impl HolaEngine {
             let n = leaderboard.len();
             leaderboard.set_max_size(max_leaderboard_size);
             let completed_count = leaderboard.completed_count();
-            let trials = leaderboard.top_k_for_refit(
+            let mut trials = leaderboard.top_k_for_refit(
                 completed_count.min(max_refit_samples),
                 max_refit_candidates,
                 &objectives,
             );
+            if trials.len() < min_elite_samples {
+                trials.clear();
+            }
             let mut strategy = strategy;
             strategy
                 .reconcile_imported_history(&space, completed_count, &trials)
@@ -4073,6 +4293,9 @@ impl HolaEngine {
         if let Some(config_value) = raw.get("config") {
             let mut saved_config: StudyConfig = serde_json::from_value(config_value.clone())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            if let Some(strategy) = &mut saved_config.strategy {
+                strategy.resolve_calibration_control_defaults();
+            }
             loaded_strategy_template = saved_config.strategy.clone();
             let mut current_config = current_study_config.clone();
             // A loaded strategy replaces its sampler state wholesale. Its seed
@@ -4952,7 +5175,7 @@ mod tests {
     }
 
     #[test]
-    fn test_strategy_config_legacy_json_uses_refit_limit_defaults() {
+    fn test_strategy_config_legacy_json_uses_refit_limit_and_control_defaults() {
         let strategy: StrategyConfig = serde_json::from_value(serde_json::json!({
             "type": "gmm",
             "refit_interval": 20
@@ -4960,7 +5183,40 @@ mod tests {
         .unwrap();
         assert_eq!(strategy.max_refit_samples, DEFAULT_MAX_REFIT_SAMPLES);
         assert_eq!(strategy.max_refit_candidates, DEFAULT_MAX_REFIT_CANDIDATES);
+        assert_eq!(strategy.ongoing_exploration_period, None);
+        assert_eq!(strategy.max_components, None);
+        assert_eq!(strategy.min_elite_samples, None);
         validate_strategy_config(&strategy).unwrap();
+    }
+
+    #[test]
+    fn test_strategy_config_rejects_invalid_calibration_controls() {
+        let mut strategy: StrategyConfig = serde_json::from_value(serde_json::json!({
+            "type": "gmm"
+        }))
+        .unwrap();
+        strategy.ongoing_exploration_period = Some(1);
+        assert!(
+            validate_strategy_config(&strategy)
+                .unwrap_err()
+                .contains("ongoing_exploration_period")
+        );
+
+        strategy.ongoing_exploration_period = Some(0);
+        strategy.max_components = Some(0);
+        assert!(
+            validate_strategy_config(&strategy)
+                .unwrap_err()
+                .contains("max_components")
+        );
+
+        strategy.max_components = Some(1);
+        strategy.min_elite_samples = Some(0);
+        assert!(
+            validate_strategy_config(&strategy)
+                .unwrap_err()
+                .contains("min_elite_samples")
+        );
     }
 
     #[test]
@@ -5295,8 +5551,11 @@ mod tests {
                 refit_interval: 20,
                 total_budget: None,
                 exploration_budget: None,
+                ongoing_exploration_period: None,
                 seed: None,
                 elite_fraction: None,
+                max_components: None,
+                min_elite_samples: None,
                 max_refit_samples: 4096,
                 max_refit_candidates: 16_384,
             })
@@ -5366,8 +5625,11 @@ mod tests {
                 refit_interval: default_refit_interval(),
                 total_budget: None,
                 exploration_budget: None,
+                ongoing_exploration_period: None,
                 seed: Some(7),
                 elite_fraction: None,
+                max_components: None,
+                min_elite_samples: None,
                 max_refit_samples: 4096,
                 max_refit_candidates: 16_384,
             }),
@@ -5375,6 +5637,355 @@ mod tests {
             max_trials: None,
             max_leaderboard_size: None,
         }
+    }
+
+    #[test]
+    fn auto_strategy_period_has_no_off_by_one_and_zero_disables_it() {
+        use opt_engine::strategies::GmmParams;
+
+        let space = DynSpace::new().add_real("x", 0.0, 1.0);
+        let routed = |period: usize| {
+            let mut auto = AutoStrategy::new_with_exploration_period(1, 2, period, Some(7));
+            // Mark the model as empirically fitted so this test isolates the
+            // initial/periodic routing schedule from the pre-fit Sobol guard.
+            auto.gmm
+                .set_params(GmmParams::uniform_prior(1, 0.1).unwrap())
+                .unwrap();
+            auto.gmm_sampling_ready = true;
+            let strategy = DynStrategy {
+                inner: DynStrategyInner::Auto(auto),
+            };
+            let mut routes = Vec::new();
+            for _ in 0..8 {
+                let (sobol_before, gmm_before) = match &strategy.inner {
+                    DynStrategyInner::Auto(auto) => (auto.sobol.index(), auto.gmm.counter()),
+                    _ => unreachable!(),
+                };
+                strategy.suggest(&space);
+                let (sobol_after, gmm_after) = match &strategy.inner {
+                    DynStrategyInner::Auto(auto) => (auto.sobol.index(), auto.gmm.counter()),
+                    _ => unreachable!(),
+                };
+                routes.push(match (sobol_after - sobol_before, gmm_after - gmm_before) {
+                    (1, 0) => 's',
+                    (0, 1) => 'g',
+                    other => panic!("one and only one sampler must advance, got {other:?}"),
+                });
+            }
+            routes
+        };
+
+        // With period 3, the third and sixth post-warm-up requests are Sobol.
+        assert_eq!(routed(3), vec!['s', 's', 'g', 'g', 's', 'g', 'g', 's']);
+        assert_eq!(routed(0), vec!['s', 's', 'g', 'g', 'g', 'g', 'g', 'g']);
+    }
+
+    #[test]
+    fn auto_strategy_legacy_period_is_used_when_serde_field_is_missing() {
+        let auto = AutoStrategy::new(1, 4, Some(7));
+        let mut encoded = serde_json::to_value(auto).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("ongoing_exploration_period");
+
+        let restored: AutoStrategy = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            restored.ongoing_exploration_period,
+            DEFAULT_ONGOING_EXPLORATION_PERIOD
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_calibration_controls_resolve_to_legacy_values() {
+        let config = single_objective_config("gmm");
+        let explicit_legacy = {
+            let mut config = config.clone();
+            let strategy = config.strategy.as_mut().unwrap();
+            strategy.ongoing_exploration_period = Some(DEFAULT_ONGOING_EXPLORATION_PERIOD);
+            strategy.max_components = Some(DEFAULT_MAX_COMPONENTS);
+            strategy.min_elite_samples = Some(DEFAULT_MIN_ELITE_SAMPLES);
+            config
+        };
+
+        let implicit = HolaEngine::from_config(config).unwrap();
+        let explicit = HolaEngine::from_config(explicit_legacy).unwrap();
+        let exported = implicit.study_config().await;
+        let exported = exported.strategy.unwrap();
+        assert_eq!(
+            exported.ongoing_exploration_period,
+            Some(DEFAULT_ONGOING_EXPLORATION_PERIOD)
+        );
+        assert_eq!(exported.max_components, Some(DEFAULT_MAX_COMPONENTS));
+        assert_eq!(exported.min_elite_samples, Some(DEFAULT_MIN_ELITE_SAMPLES));
+
+        // The omitted and explicit legacy forms must remain behaviorally
+        // identical, including the first refit and periodic exploration.
+        for _ in 0..40 {
+            let implicit_trial = implicit.ask().await.unwrap();
+            let explicit_trial = explicit.ask().await.unwrap();
+            assert_eq!(implicit_trial.params, explicit_trial.params);
+            let loss = implicit_trial.params["x"].as_f64().unwrap();
+            implicit
+                .tell(implicit_trial.trial_id, serde_json::json!({"loss": loss}))
+                .await
+                .unwrap();
+            explicit
+                .tell(explicit_trial.trial_id, serde_json::json!({"loss": loss}))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn min_elite_samples_delays_first_refit_and_max_components_is_applied() {
+        let mut config = single_objective_config("gmm");
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(1);
+        strategy.refit_interval = 1;
+        strategy.min_elite_samples = Some(4);
+        strategy.max_components = Some(2);
+        let engine = HolaEngine::from_config(config).unwrap();
+
+        {
+            let state = engine.state.read().await;
+            let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+                panic!("expected auto strategy");
+            };
+            assert_eq!(auto.gmm.get_refit_config().n_components(), 2);
+        }
+
+        for completed in 1..=4 {
+            let trial = engine.ask().await.unwrap();
+            let loss = trial.params["x"].as_f64().unwrap();
+            engine
+                .tell(trial.trial_id, serde_json::json!({"loss": loss}))
+                .await
+                .unwrap();
+            let state = engine.state.read().await;
+            let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+                panic!("expected auto strategy");
+            };
+            assert_eq!(
+                auto.gmm.refit_epoch(),
+                u64::from(completed == 4),
+                "the first refit must wait for the requested elite floor"
+            );
+            assert!(auto.gmm.params().unwrap().n_components() <= 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn min_elite_samples_counts_only_feasible_fit_inputs() {
+        let mut config = single_objective_config("gmm");
+        config.objectives[0].target = Some(0.0);
+        config.objectives[0].limit = Some(1.0);
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(1);
+        strategy.refit_interval = 1;
+        strategy.min_elite_samples = Some(4);
+        let engine = HolaEngine::from_config(config).unwrap();
+
+        for completed in 1..=5 {
+            let trial = engine.ask().await.unwrap();
+            let loss = if completed == 1 { 2.0 } else { 0.5 };
+            engine
+                .tell(trial.trial_id, serde_json::json!({"loss": loss}))
+                .await
+                .unwrap();
+            let state = engine.state.read().await;
+            let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+                panic!("expected auto strategy");
+            };
+            assert_eq!(
+                auto.gmm.refit_epoch(),
+                u64::from(completed == 5),
+                "an infeasible observation must not satisfy the elite floor"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_prefit_sobol_checkpoint_roundtrip_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefit-pending.json");
+        let mut config = single_objective_config("gmm");
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(2);
+        strategy.ongoing_exploration_period = Some(3);
+        let source = HolaEngine::from_config(config).unwrap();
+
+        // No tells have arrived, so every request beyond K0 must remain on
+        // Sobol rather than use the uninformed uniform GMM prior.
+        for _ in 0..8 {
+            source.ask().await.unwrap();
+        }
+        {
+            let state = source.state.read().await;
+            let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+                panic!("expected auto strategy");
+            };
+            assert_eq!(auto.sobol.index(), 8);
+            assert_eq!(auto.gmm.counter(), 0);
+            assert_eq!(auto.gmm.refit_epoch(), 0);
+        }
+
+        source.save_full_checkpoint(&path, None).await.unwrap();
+        let resumed = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+        let source_next = source.ask().await.unwrap();
+        let resumed_next = resumed.ask().await.unwrap();
+        assert_eq!(source_next.trial_id, resumed_next.trial_id);
+        assert_eq!(source_next.params, resumed_next.params);
+
+        // The route-accounting validation must still reject a checkpoint whose
+        // sampler cursors cannot account for its issued pending requests.
+        let mut forged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        // Four Sobol points meet the nominal K0+periodic lower bound for eight
+        // requests (K0=2, period=3), but cannot account for all eight requests
+        // when the GMM cursor is also zero.
+        forged["checkpoint"]["strategy_state"]["inner"]["sobol"]["index"] = serde_json::json!(4);
+        forged["checkpoint"]["strategy_state"]["inner"]["gmm"]["counter"]["value"] =
+            serde_json::json!(0);
+        let target = HolaEngine::from_config(source.study_config().await).unwrap();
+        let error = target
+            .load_full_checkpoint_document(forged)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("sampler cursors account"));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_missing_calibration_fields_loads_with_legacy_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-controls.json");
+        let source = HolaEngine::from_config(single_objective_config("gmm")).unwrap();
+        let trial = source.ask().await.unwrap();
+        source
+            .tell(trial.trial_id, serde_json::json!({"loss": 0.5}))
+            .await
+            .unwrap();
+        source.save_full_checkpoint(&path, None).await.unwrap();
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let strategy_config = legacy["config"]["strategy"].as_object_mut().unwrap();
+        strategy_config.remove("ongoing_exploration_period");
+        strategy_config.remove("max_components");
+        strategy_config.remove("min_elite_samples");
+        legacy["checkpoint"]["strategy_state"]["inner"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ongoing_exploration_period");
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+        let strategy = restored.study_config().await.strategy.unwrap();
+        assert_eq!(
+            strategy.ongoing_exploration_period,
+            Some(DEFAULT_ONGOING_EXPLORATION_PERIOD)
+        );
+        assert_eq!(strategy.max_components, Some(DEFAULT_MAX_COMPONENTS));
+        assert_eq!(strategy.min_elite_samples, Some(DEFAULT_MIN_ELITE_SAMPLES));
+    }
+
+    #[tokio::test]
+    async fn legacy_auto_checkpoint_preserves_saved_gmm_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-auto-route.json");
+        let mut config = single_objective_config("gmm");
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(1);
+        strategy.refit_interval = 1;
+        let source = HolaEngine::from_config(config).unwrap();
+
+        let warmup = source.ask().await.unwrap();
+        source
+            .tell(warmup.trial_id, serde_json::json!({"loss": 0.5}))
+            .await
+            .unwrap();
+        let _pending_gmm = source.ask().await.unwrap();
+        source.save_full_checkpoint(&path, None).await.unwrap();
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let auto = legacy["checkpoint"]["strategy_state"]["inner"]
+            .as_object_mut()
+            .unwrap();
+        auto.remove("gmm_sampling_ready");
+        let gmm = auto["gmm"].as_object_mut().unwrap();
+        let counter = gmm["counter"]["value"].as_u64().unwrap();
+        gmm.insert("counter".to_string(), serde_json::json!(counter));
+        gmm.remove("epoch_start");
+        gmm.remove("refit_epoch");
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+        let (sobol_before, gmm_before) = {
+            let state = restored.state.read().await;
+            let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+                panic!("expected auto strategy");
+            };
+            assert!(auto.gmm_sampling_ready);
+            (auto.sobol.index(), auto.gmm.counter())
+        };
+        restored.ask().await.unwrap();
+        let state = restored.state.read().await;
+        let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+            panic!("expected auto strategy");
+        };
+        assert_eq!(auto.sobol.index(), sobol_before);
+        assert_eq!(auto.gmm.counter(), gmm_before + 1);
+    }
+
+    #[tokio::test]
+    async fn leaderboard_import_honors_feasible_elite_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("three-trials.json");
+        let source = HolaEngine::from_config(single_objective_config("random")).unwrap();
+        for loss in [0.1, 0.2, 0.3] {
+            let trial = source.ask().await.unwrap();
+            source
+                .tell(trial.trial_id, serde_json::json!({"loss": loss}))
+                .await
+                .unwrap();
+        }
+        source
+            .save_leaderboard_checkpoint_to(&path, None)
+            .await
+            .unwrap();
+
+        let mut config = single_objective_config("gmm");
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(1);
+        strategy.min_elite_samples = Some(4);
+        let restored = HolaEngine::from_config(config).unwrap();
+        for loss in [0.9, 0.8, 0.7, 0.6] {
+            let trial = restored.ask().await.unwrap();
+            restored
+                .tell(trial.trial_id, serde_json::json!({"loss": loss}))
+                .await
+                .unwrap();
+        }
+        let old_gmm_counter = {
+            let state = restored.state.read().await;
+            let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+                panic!("expected auto strategy");
+            };
+            assert_eq!(auto.gmm.refit_epoch(), 1);
+            assert!(auto.gmm_sampling_ready);
+            auto.gmm.counter()
+        };
+
+        restored.load_leaderboard_checkpoint(&path).await.unwrap();
+
+        let state = restored.state.read().await;
+        let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+            panic!("expected auto strategy");
+        };
+        assert_eq!(auto.gmm.refit_epoch(), 0);
+        assert!(auto.gmm.counter() >= old_gmm_counter);
+        assert!(!auto.gmm_sampling_ready);
     }
 
     #[tokio::test]
@@ -5404,12 +6015,18 @@ mod tests {
         let strategy = config.strategy.as_mut().unwrap();
         strategy.max_refit_samples = 17;
         strategy.max_refit_candidates = 53;
+        strategy.ongoing_exploration_period = Some(0);
+        strategy.max_components = Some(2);
+        strategy.min_elite_samples = Some(7);
 
         let engine = HolaEngine::from_config(config).unwrap();
         let exported = engine.study_config().await;
         let exported_strategy = exported.strategy.as_ref().unwrap();
         assert_eq!(exported_strategy.max_refit_samples, 17);
         assert_eq!(exported_strategy.max_refit_candidates, 53);
+        assert_eq!(exported_strategy.ongoing_exploration_period, Some(0));
+        assert_eq!(exported_strategy.max_components, Some(2));
+        assert_eq!(exported_strategy.min_elite_samples, Some(7));
 
         engine
             .save_full_checkpoint(&checkpoint_path, None)
@@ -5419,6 +6036,20 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
         assert_eq!(checkpoint["config"]["strategy"]["max_refit_samples"], 17);
         assert_eq!(checkpoint["config"]["strategy"]["max_refit_candidates"], 53);
+        assert_eq!(
+            checkpoint["config"]["strategy"]["ongoing_exploration_period"],
+            0
+        );
+        assert_eq!(checkpoint["config"]["strategy"]["max_components"], 2);
+        assert_eq!(checkpoint["config"]["strategy"]["min_elite_samples"], 7);
+        assert_eq!(
+            checkpoint["checkpoint"]["strategy_state"]["inner"]["ongoing_exploration_period"],
+            0
+        );
+        assert_eq!(
+            checkpoint["checkpoint"]["strategy_state"]["inner"]["gmm"]["refit_config"]["n_components"],
+            2
+        );
 
         let restored = HolaEngine::load_from_checkpoint(&checkpoint_path)
             .await
@@ -5427,6 +6058,9 @@ mod tests {
         let restored_strategy = restored_config.strategy.unwrap();
         assert_eq!(restored_strategy.max_refit_samples, 17);
         assert_eq!(restored_strategy.max_refit_candidates, 53);
+        assert_eq!(restored_strategy.ongoing_exploration_period, Some(0));
+        assert_eq!(restored_strategy.max_components, Some(2));
+        assert_eq!(restored_strategy.min_elite_samples, Some(7));
     }
 
     #[tokio::test]

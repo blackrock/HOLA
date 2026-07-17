@@ -113,8 +113,11 @@ fn valid_config_for_validation() -> StudyConfig {
             refit_interval: 20,
             total_budget: None,
             exploration_budget: None,
+            ongoing_exploration_period: None,
             seed: None,
             elite_fraction: None,
+            max_components: None,
+            min_elite_samples: None,
             max_refit_samples: 4096,
             max_refit_candidates: 16_384,
         }),
@@ -650,8 +653,11 @@ async fn test_dyn_engine_strategy_types() {
             refit_interval: 20,
             total_budget: None,
             exploration_budget: None,
+            ongoing_exploration_period: None,
             seed: None,
             elite_fraction: None,
+            max_components: None,
+            min_elite_samples: None,
             max_refit_samples: 4096,
             max_refit_candidates: 16_384,
         }),
@@ -685,8 +691,11 @@ async fn test_dyn_engine_strategy_types() {
             refit_interval: 20,
             total_budget: None,
             exploration_budget: None,
+            ongoing_exploration_period: None,
             seed: None,
             elite_fraction: None,
+            max_components: None,
+            min_elite_samples: None,
             max_refit_samples: 4096,
             max_refit_candidates: 16_384,
         }),
@@ -1240,8 +1249,11 @@ async fn test_dyn_engine_gmm_with_refit() {
             refit_interval: 5,
             total_budget: None,
             exploration_budget: None,
+            ongoing_exploration_period: None,
             seed: None,
             elite_fraction: None,
+            max_components: None,
+            min_elite_samples: None,
             max_refit_samples: 4096,
             max_refit_candidates: 16_384,
         }),
@@ -1287,8 +1299,11 @@ async fn test_refit_excludes_infeasible_scalar() {
             refit_interval: 1,
             total_budget: None,
             exploration_budget: None,
+            ongoing_exploration_period: None,
             seed: None,
             elite_fraction: None,
+            max_components: None,
+            min_elite_samples: None,
             max_refit_samples: 4096,
             max_refit_candidates: 16_384,
         }),
@@ -1340,8 +1355,11 @@ async fn test_update_objectives_triggers_refit() {
             refit_interval: 10,
             total_budget: None,
             exploration_budget: None,
+            ongoing_exploration_period: None,
             seed: None,
             elite_fraction: None,
+            max_components: None,
+            min_elite_samples: None,
             max_refit_samples: 4096,
             max_refit_candidates: 16_384,
         }),
@@ -1427,8 +1445,11 @@ async fn test_dyn_engine_concurrent_refit_serialization() {
             refit_interval: 5,
             total_budget: None,
             exploration_budget: Some(4),
+            ongoing_exploration_period: None,
             seed: Some(7),
             elite_fraction: None,
+            max_components: None,
+            min_elite_samples: None,
             max_refit_samples: 4096,
             max_refit_candidates: 16_384,
         }),
@@ -1803,8 +1824,11 @@ async fn test_full_version_one_checkpoint_migrates_without_runtime_state() {
         refit_interval: 20,
         total_budget: None,
         exploration_budget: None,
+        ongoing_exploration_period: None,
         seed: Some(17),
         elite_fraction: None,
+        max_components: None,
+        min_elite_samples: None,
         max_refit_samples: 4096,
         max_refit_candidates: 16_384,
     });
@@ -2011,8 +2035,11 @@ async fn leaderboard_reimport_uses_completed_count_not_sparse_trial_ids_as_sampl
             refit_interval: 20,
             total_budget: Some(100),
             exploration_budget: Some(10),
+            ongoing_exploration_period: None,
             seed: Some(73),
             elite_fraction: Some(0.5),
+            max_components: None,
+            min_elite_samples: None,
             max_refit_samples: 4096,
             max_refit_candidates: 16_384,
         });
@@ -2106,8 +2133,11 @@ fn auto_strategy_test_config(exploration_budget: usize, seed: u64) -> StudyConfi
             refit_interval: 5,
             total_budget: None,
             exploration_budget: Some(exploration_budget),
+            ongoing_exploration_period: None,
             seed: Some(seed),
             elite_fraction: None,
+            max_components: None,
+            min_elite_samples: None,
             max_refit_samples: 4096,
             max_refit_candidates: 16_384,
         }),
@@ -2124,8 +2154,11 @@ fn sobol_strategy_test_config(seed: u64) -> StudyConfig {
         refit_interval: 20,
         total_budget: None,
         exploration_budget: None,
+        ongoing_exploration_period: None,
         seed: Some(seed),
         elite_fraction: None,
+        max_components: None,
+        min_elite_samples: None,
         max_refit_samples: 4096,
         max_refit_candidates: 16_384,
     });
@@ -2200,8 +2233,11 @@ async fn test_auto_strategy_with_explicit_exploration_budget() {
             refit_interval: 5,
             total_budget: None,
             exploration_budget: Some(10), // switch to GMM after 10 trials
+            ongoing_exploration_period: None,
             seed: None,
             elite_fraction: None,
+            max_components: None,
+            min_elite_samples: None,
             max_refit_samples: 4096,
             max_refit_candidates: 16_384,
         }),
@@ -2250,7 +2286,6 @@ fn test_auto_strategy_default_exploration_budget() {
 async fn test_auto_strategy_counts_pending_asks_against_exploration_budget() {
     let auto = HolaEngine::from_config(auto_strategy_test_config(2, 17)).unwrap();
     let sobol = HolaEngine::from_config(sobol_strategy_test_config(17)).unwrap();
-    let gmm = HolaEngine::from_config(auto_strategy_test_config(0, 17)).unwrap();
 
     let auto_trials = [
         auto.ask().await.unwrap(),
@@ -2259,10 +2294,9 @@ async fn test_auto_strategy_counts_pending_asks_against_exploration_budget() {
         auto.ask().await.unwrap(),
     ];
 
-    assert_eq!(auto_trials[0].params, sobol.ask().await.unwrap().params);
-    assert_eq!(auto_trials[1].params, sobol.ask().await.unwrap().params);
-    assert_eq!(auto_trials[2].params, gmm.ask().await.unwrap().params);
-    assert_eq!(auto_trials[3].params, gmm.ask().await.unwrap().params);
+    for auto_trial in auto_trials {
+        assert_eq!(auto_trial.params, sobol.ask().await.unwrap().params);
+    }
     assert_eq!(auto.trial_count().await, 0);
 }
 
@@ -2282,9 +2316,11 @@ async fn test_auto_strategy_full_checkpoint_preserves_pending_ask_accounting() {
 
     let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
 
-    let gmm = HolaEngine::from_config(auto_strategy_test_config(0, 17)).unwrap();
-    gmm.ask().await.unwrap();
-    let expected = gmm.ask().await.unwrap();
+    let sobol = HolaEngine::from_config(sobol_strategy_test_config(17)).unwrap();
+    for _ in 0..3 {
+        sobol.ask().await.unwrap();
+    }
+    let expected = sobol.ask().await.unwrap();
     let resumed = restored.ask().await.unwrap();
 
     assert_eq!(resumed.params, expected.params);
@@ -2319,8 +2355,11 @@ async fn test_seed_determinism_sobol() {
                 refit_interval: 20,
                 total_budget: None,
                 exploration_budget: None,
+                ongoing_exploration_period: None,
                 seed: Some(seed),
                 elite_fraction: None,
+                max_components: None,
+                min_elite_samples: None,
                 max_refit_samples: 4096,
                 max_refit_candidates: 16_384,
             }),
@@ -2369,8 +2408,11 @@ async fn test_seed_determinism_random() {
                 refit_interval: 20,
                 total_budget: None,
                 exploration_budget: None,
+                ongoing_exploration_period: None,
                 seed: Some(seed),
                 elite_fraction: None,
+                max_components: None,
+                min_elite_samples: None,
                 max_refit_samples: 4096,
                 max_refit_candidates: 16_384,
             }),
@@ -2432,8 +2474,11 @@ async fn test_pareto_front_multi_objective() {
             refit_interval: 20,
             total_budget: None,
             exploration_budget: None,
+            ongoing_exploration_period: None,
             seed: Some(0),
             elite_fraction: None,
+            max_components: None,
+            min_elite_samples: None,
             max_refit_samples: 4096,
             max_refit_candidates: 16_384,
         }),
@@ -2504,8 +2549,11 @@ async fn test_live_vector_ranks_respect_direction_and_never_promote_infeasible_t
             refit_interval: 20,
             total_budget: None,
             exploration_budget: None,
+            ongoing_exploration_period: None,
             seed: Some(7),
             elite_fraction: None,
+            max_components: None,
+            min_elite_samples: None,
             max_refit_samples: 4096,
             max_refit_candidates: 16_384,
         }),
@@ -2672,8 +2720,11 @@ fn concurrency_test_config() -> StudyConfig {
             refit_interval: 5,
             total_budget: None,
             exploration_budget: Some(8),
+            ongoing_exploration_period: None,
             seed: Some(7),
             elite_fraction: None,
+            max_components: None,
+            min_elite_samples: None,
             max_refit_samples: 4096,
             max_refit_candidates: 16_384,
         }),

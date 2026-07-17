@@ -80,3 +80,12 @@ def test_property_access():
     assert m.field == "loss"
     assert m.priority == 2.0
     assert m.target is None
+
+    strategy = hola.Gmm(
+        ongoing_exploration_period=0,
+        max_components=4,
+        min_elite_samples=2,
+    )
+    assert strategy.ongoing_exploration_period == 0
+    assert strategy.max_components == 4
+    assert strategy.min_elite_samples == 2

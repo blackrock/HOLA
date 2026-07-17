@@ -461,8 +461,10 @@ by GMM exploitation. Refits a GMM to the top `elite_fraction`
 (default 25%) of trials every `refit_interval` (default 20)
 completed trials. With multiple objective groups, elites are ordered
 by non-domination rank and then descending crowding distance. The
-exploration budget counts issued `ask`
-suggestions, including pending trials. Uses the
+exploration budget counts issued `ask` suggestions, including pending
+trials. If concurrent asks reach that boundary before any empirical fit is
+installed, HOLA continues the Sobol' sequence rather than sampling the
+uninformed GMM prior. Uses the
 [HOLA algorithm](concepts.md#gmm-strategy).
 GMM exploitation uses seeded Owen-scrambled Gauss–Sobol' points: one
 Sobol' coordinate selects the component, and inverse-normal coordinates
@@ -487,7 +489,10 @@ Study(strategy=Gmm(refit_interval=10, elite_fraction=0.1), ...)
 |-----------|------|---------|-------------|
 | `refit_interval` | `int` or `None` | 20 | How often the GMM is refit, in completed trials |
 | `elite_fraction` | `float` or `None` | 0.25 | Fraction of top trials used for refitting. Must be in (0, 1]. |
-| `exploration_budget` | `int` or `None` | auto | Number of issued Sobol exploration suggestions before GMM exploitation begins. Pending asks count against this budget. When omitted, computed automatically from the number of dimensions. |
+| `exploration_budget` | `int` or `None` | auto | Number of issued Sobol exploration suggestions before GMM exploitation begins. Pending asks count against this budget. When omitted, computed automatically from the total budget and number of dimensions. |
+| `ongoing_exploration_period` | `int` or `None` | 5 | Continue global Sobol' exploration every Nth post-warmup suggestion. Use `0` to disable; explicit periods must be at least 2. |
+| `max_components` | `int` or `None` | 3 | Maximum fitted mixture components. The effective count can be lower when the elite set is small. |
+| `min_elite_samples` | `int` or `None` | 1 | Minimum feasible elite workset required before fitting. Must not exceed `max_refit_samples`. |
 | `max_refit_samples` | `int` or `None` | 4096 | Maximum elite samples used by one GMM fit. Must be at least 1. |
 | `max_refit_candidates` | `int` or `None` | 16384 | Maximum retained trials ranked during elite selection. Must be at least `max_refit_samples`; longer histories use deterministic stratified coverage. |
 

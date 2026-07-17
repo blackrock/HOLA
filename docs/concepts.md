@@ -112,11 +112,14 @@ rank followed by descending crowding distance.
 
 The lifecycle follows three phases.
 
-1. **Warmup.** The first trials build up the leaderboard.
+1. **Warmup.** The first trials build up the leaderboard. HOLA continues
+   Sobol' sampling until the first empirical fit is installed.
 2. **Refit.** Every `refit_interval` trials (default 20), we refit
-   the GMM to the top 25% of trials.
+   the GMM to the top 25% of trials, subject to the configured minimum
+   feasible elite workset.
 3. **Exploit.** New samples are drawn from the updated GMM,
-   focusing on promising regions.
+   focusing on promising regions. By default, every fifth post-warmup
+   suggestion remains a global Sobol' exploration point.
 
 GMM exploitation uses seeded Owen-scrambled Gauss–Sobol' points.
 One Sobol' coordinate selects the mixture component, and inverse-normal
@@ -127,7 +130,14 @@ refits.
 
 The exploration budget counts issued suggestions from `ask`,
 including suggestions that are still pending. GMM refits are based
-on completed trials in the leaderboard.
+on completed trials in the leaderboard. Pending asks that cross the nominal
+warmup boundary before the first completed-data fit remain Sobol' suggestions;
+the unfitted prior is never used as exploitation.
+
+`max_components` bounds mixture complexity (default 3), while
+`min_elite_samples` can delay fitting until a feasible elite workset reaches a
+requested size (default 1). The effective component count may be smaller: the
+implementation requires enough elite samples to support each component.
 
 Two implementation limits keep refitting bounded on unusually long studies.
 At most `max_refit_samples` elite points enter one fit (default 4096), and at
