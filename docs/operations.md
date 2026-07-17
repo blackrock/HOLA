@@ -56,7 +56,8 @@ Alert when pending trials grow continuously without completions, failure
 counters rise, a worker's durable tell outbox is nonempty for an extended
 period, or readiness fails. A refit failure does not roll back the already
 committed trial or objective update; inspect the warning log and repair the
-model/data issue before the next scheduled refit.
+model/data issue. Before its first empirical model, GMM maintenance retries on
+the next completion; subsequent models use the configured refit cadence.
 HOLA emits structured HTTP tracing at INFO level with the `x-request-id` in its
 request span and response. Preserve that ID in proxy logs when correlating a
 worker error with the server.

@@ -116,7 +116,9 @@ The lifecycle follows three phases.
    Sobol' sampling until the first empirical fit is installed.
 2. **Refit.** Every `refit_interval` trials (default 20), we refit
    the GMM to the top 25% of trials, subject to the configured minimum
-   feasible elite workset.
+   feasible elite workset. If the first scheduled fit lacks that workset,
+   each subsequent completion retries until the first empirical model is
+   installed; later refits return to the configured cadence.
 3. **Exploit.** New samples are drawn from the updated GMM,
    focusing on promising regions. By default, every fifth post-warmup
    suggestion remains a global Sobol' exploration point.
