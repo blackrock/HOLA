@@ -698,6 +698,19 @@ impl Strategy for DynStrategy {
 }
 
 impl DynStrategy {
+    /// Epoch of an `auto` strategy that is still waiting for its first
+    /// empirical GMM fit. Capturing this before queued maintenance and
+    /// comparing it again under `refit_lock` coalesces concurrent retries once
+    /// another completion has installed the model.
+    fn pending_initial_fit_epoch(&self) -> Option<u64> {
+        match &self.inner {
+            DynStrategyInner::Auto(strategy) if !strategy.gmm_sampling_ready => {
+                Some(strategy.gmm.refit_epoch())
+            }
+            _ => None,
+        }
+    }
+
     /// The exploration budget of the underlying `auto` strategy, if any.
     ///
     /// Used after a resume to re-anchor the refit schedule to the checkpoint's
@@ -2396,6 +2409,32 @@ fn count_priority_groups(objectives: &[ObjectiveConfig]) -> usize {
     groups.len()
 }
 
+fn should_attempt_post_commit_refit(
+    scheduled_refit: bool,
+    captured_initial_fit_epoch: Option<u64>,
+    current_initial_fit_epoch: Option<u64>,
+    refit_is_eligible: bool,
+    initial_fit_has_new_history: bool,
+) -> bool {
+    if !refit_is_eligible {
+        return false;
+    }
+
+    match current_initial_fit_epoch {
+        Some(epoch) => {
+            (scheduled_refit || captured_initial_fit_epoch == Some(epoch))
+                && initial_fit_has_new_history
+        }
+        // Another queued task installed the initial model. A cadence boundary
+        // still needs to run if it represents completions beyond that fitted
+        // snapshot, but must not immediately refit identical history.
+        None if captured_initial_fit_epoch.is_some() => {
+            scheduled_refit && initial_fit_has_new_history
+        }
+        None => scheduled_refit,
+    }
+}
+
 /// The HOLA engine. Single entry point for Python FFI and REST API.
 ///
 /// A self-contained optimization engine built on `opt_engine`'s building blocks
@@ -2421,6 +2460,10 @@ pub struct HolaEngine {
     max_refit_candidates: usize,
     /// Required lower bound for a refit's feasible elite workset.
     min_elite_samples: usize,
+    /// Latest completed-history count already tried while the auto strategy
+    /// was waiting for its first empirical model. This coalesces queued
+    /// retries after both successful and unsuccessful attempts.
+    initial_fit_attempted_completed: Arc<AtomicUsize>,
     auto_checkpoint: Option<AutoCheckpointConfig>,
     /// Failures from unattended auto-checkpoint writes and rotation. Shared by
     /// clones and exposed to the server metrics endpoint.
@@ -2431,6 +2474,8 @@ pub struct HolaEngine {
     refit_failures: Arc<AtomicU64>,
     #[cfg(test)]
     force_refit_failure: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    refit_attempts: Arc<AtomicU64>,
     max_trials: Option<usize>,
     /// Opt-in leaderboard retention cap (`None` = unbounded). Recorded here so
     /// `study_config()` can emit it into checkpoints and a resumed study rebuilds
@@ -3143,11 +3188,14 @@ impl HolaEngine {
             max_refit_samples,
             max_refit_candidates,
             min_elite_samples,
+            initial_fit_attempted_completed: Arc::new(AtomicUsize::new(0)),
             auto_checkpoint,
             checkpoint_failures: Arc::new(AtomicU64::new(0)),
             refit_failures: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             force_refit_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            refit_attempts: Arc::new(AtomicU64::new(0)),
             max_trials,
             max_leaderboard_size: config.max_leaderboard_size,
         })
@@ -3558,77 +3606,113 @@ impl HolaEngine {
         let mut post_commit_warnings = Vec::new();
 
         if let Some(ref config) = self.refit_config {
-            if completed_trials >= self.min_elite_samples && config.should_refit(completed_trials) {
+            let scheduled_refit =
+                completed_trials >= self.min_elite_samples && config.should_refit(completed_trials);
+            let pending_initial_fit_epoch = if completed_trials >= config.min_trials()
+                && completed_trials >= self.min_elite_samples
+            {
+                self.state.read().await.strategy.pending_initial_fit_epoch()
+            } else {
+                None
+            };
+
+            if scheduled_refit || pending_initial_fit_epoch.is_some() {
                 // Serialize refits and take the leaderboard snapshot only after
                 // earlier work finishes. A cadence boundary that arrives while
                 // fitting must coalesce into a fit of the latest history rather
-                // than being silently dropped.
+                // than being silently dropped. Initial-fit retries additionally
+                // compare the model epoch and latest attempted history after
+                // acquiring the lock, so queued retries do not repeat either a
+                // successful fit or an unsuccessful attempt on identical data.
                 let _refit_guard = self.refit_lock.lock().await;
                 let state_guard = self.state.read().await;
                 let refit_completed = state_guard.leaderboard.completed_count();
-                let k = config
-                    .selection_count(refit_completed)
-                    .max(self.min_elite_samples)
-                    .min(refit_completed)
-                    .min(self.max_refit_samples)
-                    .min(self.max_refit_candidates);
-                let refit_objectives = state_guard.objectives.clone();
-                let mut trials = state_guard.leaderboard.top_k_for_refit(
-                    k,
-                    self.max_refit_candidates,
-                    &refit_objectives,
+                let current_initial_fit_epoch = state_guard.strategy.pending_initial_fit_epoch();
+                let refit_is_eligible = refit_completed >= config.min_trials()
+                    && refit_completed >= self.min_elite_samples;
+                let initial_fit_has_new_history =
+                    refit_completed > self.initial_fit_attempted_completed.load(Ordering::Relaxed);
+                let should_attempt = should_attempt_post_commit_refit(
+                    scheduled_refit,
+                    pending_initial_fit_epoch,
+                    current_initial_fit_epoch,
+                    refit_is_eligible,
+                    initial_fit_has_new_history,
                 );
-                // Infeasible trials are deliberately excluded from model
-                // fitting. If that leaves fewer than the requested adequacy
-                // floor, turn this cadence point into a no-op and keep the
-                // current model (or the pre-fit Sobol route) until a later one.
-                if trials.len() < self.min_elite_samples {
-                    trials.clear();
-                }
-                let mut strategy_snapshot = state_guard.strategy.clone();
-                let space_clone = self.space.clone();
-                drop(state_guard);
-
-                let force_refit_failure = {
+                if !should_attempt {
+                    drop(state_guard);
+                    drop(_refit_guard);
+                } else {
+                    if current_initial_fit_epoch.is_some() {
+                        self.initial_fit_attempted_completed
+                            .store(refit_completed, Ordering::Relaxed);
+                    }
                     #[cfg(test)]
-                    {
-                        self.force_refit_failure.swap(false, Ordering::SeqCst)
+                    self.refit_attempts.fetch_add(1, Ordering::Relaxed);
+                    let k = config
+                        .selection_count(refit_completed)
+                        .max(self.min_elite_samples)
+                        .min(refit_completed)
+                        .min(self.max_refit_samples)
+                        .min(self.max_refit_candidates);
+                    let refit_objectives = state_guard.objectives.clone();
+                    let mut trials = state_guard.leaderboard.top_k_for_refit(
+                        k,
+                        self.max_refit_candidates,
+                        &refit_objectives,
+                    );
+                    // Infeasible trials are deliberately excluded from model
+                    // fitting. If that leaves fewer than the requested adequacy
+                    // floor, turn this cadence point into a no-op and keep the
+                    // current model (or the pre-fit Sobol route) until a later one.
+                    if trials.len() < self.min_elite_samples {
+                        trials.clear();
                     }
-                    #[cfg(not(test))]
-                    {
-                        false
-                    }
-                };
+                    let mut strategy_snapshot = state_guard.strategy.clone();
+                    let space_clone = self.space.clone();
+                    drop(state_guard);
 
-                let fitted_result = tokio::task::spawn_blocking(move || {
-                    if force_refit_failure {
-                        Err("forced refit failure for observability test".to_string())
-                    } else {
-                        strategy_snapshot
-                            .try_refit(&space_clone, &trials)
-                            .map(|()| strategy_snapshot)
-                    }
-                })
-                .await;
+                    let force_refit_failure = {
+                        #[cfg(test)]
+                        {
+                            self.force_refit_failure.swap(false, Ordering::SeqCst)
+                        }
+                        #[cfg(not(test))]
+                        {
+                            false
+                        }
+                    };
 
-                match fitted_result {
-                    Ok(Ok(mut fitted)) => {
-                        use opt_engine::traits::RefittableStrategy;
-                        let mut guard = self.state.write().await;
-                        fitted.reconcile_after_refit(&guard.strategy);
-                        guard.strategy = fitted;
-                    }
-                    Ok(Err(error)) => {
-                        self.refit_failures.fetch_add(1, Ordering::Relaxed);
-                        let warning = format!("post-commit refit failed: {error}");
-                        eprintln!("[hola] Warning: {warning}");
-                        post_commit_warnings.push(warning);
-                    }
-                    Err(error) => {
-                        self.refit_failures.fetch_add(1, Ordering::Relaxed);
-                        let warning = format!("post-commit refit task failed: {error}");
-                        eprintln!("[hola] Warning: {warning}");
-                        post_commit_warnings.push(warning);
+                    let fitted_result = tokio::task::spawn_blocking(move || {
+                        if force_refit_failure {
+                            Err("forced refit failure for observability test".to_string())
+                        } else {
+                            strategy_snapshot
+                                .try_refit(&space_clone, &trials)
+                                .map(|()| strategy_snapshot)
+                        }
+                    })
+                    .await;
+
+                    match fitted_result {
+                        Ok(Ok(mut fitted)) => {
+                            use opt_engine::traits::RefittableStrategy;
+                            let mut guard = self.state.write().await;
+                            fitted.reconcile_after_refit(&guard.strategy);
+                            guard.strategy = fitted;
+                        }
+                        Ok(Err(error)) => {
+                            self.refit_failures.fetch_add(1, Ordering::Relaxed);
+                            let warning = format!("post-commit refit failed: {error}");
+                            eprintln!("[hola] Warning: {warning}");
+                            post_commit_warnings.push(warning);
+                        }
+                        Err(error) => {
+                            self.refit_failures.fetch_add(1, Ordering::Relaxed);
+                            let warning = format!("post-commit refit task failed: {error}");
+                            eprintln!("[hola] Warning: {warning}");
+                            post_commit_warnings.push(warning);
+                        }
                     }
                 }
             }
@@ -3951,6 +4035,12 @@ impl HolaEngine {
         }
         let mut strategy_snapshot = state_guard.strategy.clone();
         let space_clone = self.space.clone();
+        if state_guard.strategy.pending_initial_fit_epoch().is_some() {
+            self.initial_fit_attempted_completed
+                .store(current_completed, Ordering::Relaxed);
+        }
+        #[cfg(test)]
+        self.refit_attempts.fetch_add(1, Ordering::Relaxed);
         drop(state_guard);
 
         let fitted_result = tokio::task::spawn_blocking(move || {
@@ -4148,6 +4238,8 @@ impl HolaEngine {
         state.strategy = strategy;
         state.leaderboard = leaderboard;
         state.reset_transient_trial_state_after_load();
+        self.initial_fit_attempted_completed
+            .store(state.leaderboard.completed_count(), Ordering::Relaxed);
         state.next_pending_id = state.next_pending_id.max(fresh_legacy_trial_id_floor());
         eprintln!("[hola] Loaded leaderboard checkpoint with {n} trials");
         Ok(())
@@ -4410,6 +4502,8 @@ impl HolaEngine {
             ));
         }
         *state = replacement;
+        self.initial_fit_attempted_completed
+            .store(state.leaderboard.completed_count(), Ordering::Relaxed);
         eprintln!("[hola] Loaded full checkpoint with {n_loaded} trials");
         Ok(())
     }
@@ -5806,6 +5900,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_fit_retries_before_the_next_periodic_cadence() {
+        let mut config = single_objective_config("gmm");
+        config.objectives[0].target = Some(0.0);
+        config.objectives[0].limit = Some(1.0);
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(10);
+        strategy.refit_interval = 20;
+        strategy.min_elite_samples = Some(10);
+        let engine = HolaEngine::from_config(config).unwrap();
+
+        for completed in 1..=10 {
+            let trial = engine.ask().await.unwrap();
+            let loss = if completed == 1 { 2.0 } else { 0.5 };
+            engine
+                .tell(trial.trial_id, serde_json::json!({"loss": loss}))
+                .await
+                .unwrap();
+        }
+        {
+            let state = engine.state.read().await;
+            let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+                panic!("expected auto strategy");
+            };
+            assert_eq!(auto.gmm.refit_epoch(), 0);
+            assert!(!auto.gmm_sampling_ready);
+        }
+
+        let trial = engine.ask().await.unwrap();
+        engine
+            .tell(trial.trial_id, serde_json::json!({"loss": 0.5}))
+            .await
+            .unwrap();
+        let state = engine.state.read().await;
+        let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+            panic!("expected auto strategy");
+        };
+        assert_eq!(auto.gmm.refit_epoch(), 1);
+        assert!(auto.gmm_sampling_ready);
+    }
+
+    #[tokio::test]
+    async fn successful_initial_retry_restores_periodic_cadence() {
+        let mut config = single_objective_config("gmm");
+        config.objectives[0].target = Some(0.0);
+        config.objectives[0].limit = Some(1.0);
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(4);
+        strategy.refit_interval = 3;
+        strategy.min_elite_samples = Some(4);
+        let engine = HolaEngine::from_config(config).unwrap();
+
+        for completed in 1..=7 {
+            let trial = engine.ask().await.unwrap();
+            let loss = if completed == 1 { 2.0 } else { 0.5 };
+            engine
+                .tell(trial.trial_id, serde_json::json!({"loss": loss}))
+                .await
+                .unwrap();
+            let state = engine.state.read().await;
+            let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+                panic!("expected auto strategy");
+            };
+            let expected_epoch = match completed {
+                1..=4 => 0,
+                5..=6 => 1,
+                7 => 2,
+                _ => unreachable!(),
+            };
+            assert_eq!(auto.gmm.refit_epoch(), expected_epoch);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_initial_fit_retries_do_not_repeat_failed_history() {
+        let mut config = single_objective_config("gmm");
+        config.objectives[0].target = Some(0.0);
+        config.objectives[0].limit = Some(1.0);
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(4);
+        strategy.refit_interval = 20;
+        strategy.min_elite_samples = Some(4);
+        let engine = HolaEngine::from_config(config).unwrap();
+
+        for completed in 1..=4 {
+            let trial = engine.ask().await.unwrap();
+            let loss = if completed == 1 { 2.0 } else { 0.5 };
+            engine
+                .tell(trial.trial_id, serde_json::json!({"loss": loss}))
+                .await
+                .unwrap();
+        }
+        assert_eq!(engine.refit_attempts.load(Ordering::Relaxed), 1);
+
+        // Keep every new completion's maintenance task queued until all eight
+        // tells have committed. The first task will see the complete shared
+        // history; the others must not repeat that same attempt after it fails.
+        let refit_guard = engine.refit_lock.lock().await;
+        engine.force_refit_failure.store(true, Ordering::SeqCst);
+
+        let mut trials = Vec::new();
+        for _ in 0..8 {
+            trials.push(engine.ask().await.unwrap());
+        }
+        let mut handles = Vec::new();
+        for trial in trials {
+            let engine = engine.clone();
+            handles.push(tokio::spawn(async move {
+                engine
+                    .tell(trial.trial_id, serde_json::json!({"loss": 0.5}))
+                    .await
+                    .unwrap();
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while engine.trial_count().await < 12 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all tells must commit before refit maintenance is released");
+        drop(refit_guard);
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        {
+            let state = engine.state.read().await;
+            let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+                panic!("expected auto strategy");
+            };
+            assert_eq!(auto.gmm.refit_epoch(), 0);
+            assert!(!auto.gmm_sampling_ready);
+        }
+        assert_eq!(engine.refit_attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(engine.refit_failure_count(), 1);
+
+        // One genuinely new completion supplies a new history generation and
+        // therefore gets one fresh retry, which installs the first model.
+        let trial = engine.ask().await.unwrap();
+        engine
+            .tell(trial.trial_id, serde_json::json!({"loss": 0.5}))
+            .await
+            .unwrap();
+        let state = engine.state.read().await;
+        let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+            panic!("expected auto strategy");
+        };
+        assert_eq!(auto.gmm.refit_epoch(), 1);
+        assert!(auto.gmm_sampling_ready);
+        assert_eq!(engine.refit_attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
     async fn concurrent_prefit_sobol_checkpoint_roundtrip_is_deterministic() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("prefit-pending.json");
@@ -6949,7 +7196,7 @@ mod tests {
         let mut config = single_objective_config("gmm");
         let strategy = config.strategy.as_mut().unwrap();
         strategy.exploration_budget = Some(1);
-        strategy.refit_interval = 1;
+        strategy.refit_interval = 20;
         let engine = HolaEngine::from_config(config).unwrap();
         engine.force_refit_failure.store(true, Ordering::SeqCst);
 
@@ -6970,6 +7217,21 @@ mod tests {
             .unwrap();
         assert!(!retry.newly_committed);
         assert_eq!(retry.post_commit_warnings, outcome.post_commit_warnings);
+        assert_eq!(engine.refit_failure_count(), 1);
+
+        // A genuinely new completion retries the missing initial fit even
+        // though the next periodic cadence is still far away.
+        let next_trial = engine.ask().await.unwrap();
+        engine
+            .tell(next_trial.trial_id, serde_json::json!({"loss": 0.125}))
+            .await
+            .unwrap();
+        let state = engine.state.read().await;
+        let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+            panic!("expected auto strategy");
+        };
+        assert_eq!(auto.gmm.refit_epoch(), 1);
+        assert!(auto.gmm_sampling_ready);
         assert_eq!(engine.refit_failure_count(), 1);
     }
 
@@ -7015,6 +7277,30 @@ mod tests {
         assert_eq!(refit_at, vec![2, 4, 6]);
         assert_eq!(leaderboard.len(), 3);
         assert_eq!(leaderboard.completed_count(), 6);
+    }
+
+    #[test]
+    fn queued_cadence_does_not_repeat_a_successful_initial_retry() {
+        // The cadence task observed the pre-fit epoch, then a retry installed
+        // the model from the same completed history before the cadence task
+        // acquired `refit_lock`.
+        assert!(!should_attempt_post_commit_refit(
+            true,
+            Some(0),
+            None,
+            true,
+            false,
+        ));
+
+        // If additional completions arrived after that fitted snapshot, the
+        // cadence task remains meaningful and must refit the newer history.
+        assert!(should_attempt_post_commit_refit(
+            true,
+            Some(0),
+            None,
+            true,
+            true,
+        ));
     }
 
     #[test]
