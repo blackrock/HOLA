@@ -297,19 +297,11 @@ def test_gmm_counts_pending_asks_against_exploration_budget():
         seed=17,
     )
     sobol = Study(space=space, objectives=[Minimize("loss")], strategy="sobol", seed=17)
-    gmm = Study(
-        space=space,
-        objectives=[Minimize("loss")],
-        strategy=Gmm(exploration_budget=0),
-        seed=17,
-    )
 
     trials = [study.ask() for _ in range(4)]
 
-    _assert_same_params(trials[0].params, sobol.ask().params)
-    _assert_same_params(trials[1].params, sobol.ask().params)
-    _assert_same_params(trials[2].params, gmm.ask().params)
-    _assert_same_params(trials[3].params, gmm.ask().params)
+    for trial in trials:
+        _assert_same_params(trial.params, sobol.ask().params)
     assert study.trial_count() == 0
 
 
@@ -328,14 +320,10 @@ def test_gmm_save_load_preserves_pending_ask_accounting(tmp_path):
     study.save(str(path))
     restored = Study.load(str(path))
 
-    gmm = Study(
-        space=space,
-        objectives=[Minimize("loss")],
-        strategy=Gmm(exploration_budget=0),
-        seed=17,
-    )
-    gmm.ask()
-    expected = gmm.ask()
+    sobol = Study(space=space, objectives=[Minimize("loss")], strategy="sobol", seed=17)
+    for _ in range(3):
+        sobol.ask()
+    expected = sobol.ask()
     resumed = restored.ask()
 
     _assert_same_params(resumed.params, expected.params)

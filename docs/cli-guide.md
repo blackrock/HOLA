@@ -175,6 +175,9 @@ strategy:
   seed: 42                 # optional seed for reproducible runs
   exploration_budget: 50   # number of Sobol asks before switching to GMM
   elite_fraction: 0.25     # fraction of top trials used for GMM fitting (default: 0.25)
+  ongoing_exploration_period: 5  # every Nth post-warmup ask is Sobol (0 disables)
+  max_components: 3        # maximum fitted GMM components
+  min_elite_samples: 1     # minimum feasible elite workset before fitting
   max_refit_samples: 4096  # maximum elite samples passed to one GMM fit
   max_refit_candidates: 16384  # maximum trials ranked to choose elites
 ```
@@ -184,8 +187,11 @@ strategy:
 | `type` | `"gmm"` | Strategy type: `"gmm"`, `"sobol"`, or `"random"` |
 | `refit_interval` | `20` | How often the GMM refits (only used by `"gmm"`) |
 | `seed` | none | Seed for reproducible runs. When omitted, HOLA draws one seed once and records it in full checkpoints. |
-| `exploration_budget` | none | Number of issued Sobol exploration suggestions before switching to GMM exploitation. Pending asks count against this budget. When omitted, we use a formula based on `total_budget`. |
+| `exploration_budget` | none | Number of issued Sobol exploration suggestions before switching to GMM exploitation. Pending asks count against this budget. When omitted, we use a formula based on `total_budget` and the search dimension. |
 | `elite_fraction` | `0.25` | Fraction of top trials used for GMM refitting. Must be in (0.0, 1.0]. |
+| `ongoing_exploration_period` | `5` | Continue global Sobol' exploration every Nth post-warmup suggestion. Use `0` to disable; explicit periods must be at least 2. |
+| `max_components` | `3` | Maximum fitted GMM components. The effective count can be lower for small elite sets. |
+| `min_elite_samples` | `1` | Minimum feasible elite workset required before fitting. Must not exceed `max_refit_samples`. |
 | `max_refit_samples` | `4096` | Maximum elite samples passed to one GMM fit. Must be at least 1. |
 | `max_refit_candidates` | `16384` | Maximum retained trials ranked to choose elites. Must be at least `max_refit_samples`; longer histories use deterministic stratified coverage of the full retained history. |
 

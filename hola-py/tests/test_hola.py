@@ -18,6 +18,7 @@ variants, multi-param spaces, objectives, Trial repr, Study.connect(),
 categorical parameters, and study.run().
 """
 
+import json
 import os
 
 import pytest
@@ -226,6 +227,72 @@ def test_gmm_refit_limit_configuration_and_validation():
         Gmm(max_refit_samples=0)
     with pytest.raises(ConfigurationError, match=r"at least max_refit_samples \(100\)"):
         Gmm(max_refit_samples=100, max_refit_candidates=99)
+
+
+def test_gmm_legacy_positional_arguments_remain_compatible():
+    from hola_opt import Gmm
+
+    strategy = Gmm(11, 0.3, 7, 101, 202)
+    assert strategy.refit_interval == 11
+    assert strategy.elite_fraction == 0.3
+    assert strategy.exploration_budget == 7
+    assert strategy.max_refit_samples == 101
+    assert strategy.max_refit_candidates == 202
+    assert strategy.ongoing_exploration_period is None
+    assert strategy.max_components is None
+    assert strategy.min_elite_samples is None
+
+
+def test_gmm_calibration_controls_configuration_and_validation(tmp_path):
+    from hola_opt import ConfigurationError, Gmm, Minimize, Real, Space, Study
+
+    strategy = Gmm(
+        refit_interval=11,
+        ongoing_exploration_period=0,
+        max_components=5,
+        min_elite_samples=3,
+    )
+    assert strategy.refit_interval == 11
+    assert strategy.ongoing_exploration_period == 0
+    assert strategy.max_components == 5
+    assert strategy.min_elite_samples == 3
+    study = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("loss")],
+        strategy=strategy,
+    )
+    path = tmp_path / "calibration-controls.json"
+    study.save(str(path))
+    saved_strategy = json.loads(path.read_text())["config"]["strategy"]
+    assert saved_strategy["refit_interval"] == 11
+    assert saved_strategy["ongoing_exploration_period"] == 0
+    assert saved_strategy["max_components"] == 5
+    assert saved_strategy["min_elite_samples"] == 3
+
+    defaults = Gmm()
+    assert defaults.ongoing_exploration_period is None
+    assert defaults.max_components is None
+    assert defaults.min_elite_samples is None
+    default_study = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("loss")],
+        strategy=defaults,
+    )
+    default_path = tmp_path / "resolved-defaults.json"
+    default_study.save(str(default_path))
+    resolved_defaults = json.loads(default_path.read_text())["config"]["strategy"]
+    assert resolved_defaults["ongoing_exploration_period"] == 5
+    assert resolved_defaults["max_components"] == 3
+    assert resolved_defaults["min_elite_samples"] == 1
+
+    with pytest.raises(ConfigurationError, match=r"0 \(disabled\) or at least 2"):
+        Gmm(ongoing_exploration_period=1)
+    with pytest.raises(ConfigurationError, match="max_components must be at least 1"):
+        Gmm(max_components=0)
+    with pytest.raises(ConfigurationError, match="min_elite_samples must be at least 1"):
+        Gmm(min_elite_samples=0)
+    with pytest.raises(ConfigurationError, match="must not exceed max_refit_samples"):
+        Gmm(min_elite_samples=5, max_refit_samples=4)
 
 
 # ==========================================================================
