@@ -1356,6 +1356,27 @@ impl Study {
         }
     }
 
+    /// Read-only strategy routing and fitted-model diagnostics.
+    ///
+    /// GMM-specific values are ``None`` for Random and Sobol strategies. The
+    /// cumulative GMM-origin count is also ``None`` when exact route provenance
+    /// was unavailable in a legacy or leaderboard-only checkpoint.
+    fn strategy_diagnostics(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let StudyInner::Local { engine } = &self.inner else {
+            return Err(ConfigurationError::new_err(
+                "strategy_diagnostics() is only available for local studies, not remote connections",
+            ));
+        };
+        let runtime = shared_runtime()?;
+        let diagnostics = py.detach(|| runtime.block_on(engine.strategy_diagnostics()));
+        let result = PyDict::new(py);
+        result.set_item("gmm_fit_epoch", diagnostics.gmm_fit_epoch)?;
+        result.set_item("gmm_origin_suggestions", diagnostics.gmm_origin_suggestions)?;
+        result.set_item("gmm_sampling_ready", diagnostics.gmm_sampling_ready)?;
+        result.set_item("issued_suggestions", diagnostics.issued_suggestions)?;
+        Ok(result.unbind())
+    }
+
     /// Update objectives mid-run, re-scalarizing all trials.
     fn update_objectives(&self, py: Python<'_>, objectives: &Bound<'_, PyList>) -> PyResult<()> {
         // Convert objectives to owned Rust configs before releasing the GIL.

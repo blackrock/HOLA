@@ -503,6 +503,13 @@ pub struct AutoStrategy {
     gmm_sampling_ready: bool,
     trial_count: usize,
     issued_count: AtomicUsize,
+    /// Cumulative suggestions routed through the empirical GMM.
+    ///
+    /// `None` means the exact historical count is unknowable because strategy
+    /// state came from an older checkpoint or history was imported without its
+    /// sampler state. Keeping unknown state explicit avoids treating the GMM
+    /// sampling cursor's conservative import watermark as real exploitation.
+    gmm_origin_suggestions: Option<AtomicU64>,
 }
 
 impl AutoStrategy {
@@ -556,6 +563,7 @@ impl AutoStrategy {
             gmm_sampling_ready: false,
             trial_count: 0,
             issued_count: AtomicUsize::new(0),
+            gmm_origin_suggestions: Some(AtomicU64::new(0)),
         }
     }
 }
@@ -570,6 +578,10 @@ impl Clone for AutoStrategy {
             gmm_sampling_ready: self.gmm_sampling_ready,
             trial_count: self.trial_count,
             issued_count: AtomicUsize::new(self.issued_count.load(Ordering::Relaxed)),
+            gmm_origin_suggestions: self
+                .gmm_origin_suggestions
+                .as_ref()
+                .map(|count| AtomicU64::new(count.load(Ordering::Relaxed))),
         }
     }
 }
@@ -581,7 +593,7 @@ impl Serialize for AutoStrategy {
     {
         use serde::ser::SerializeStruct;
 
-        let mut state = serializer.serialize_struct("AutoStrategy", 7)?;
+        let mut state = serializer.serialize_struct("AutoStrategy", 8)?;
         state.serialize_field("sobol", &self.sobol)?;
         state.serialize_field("gmm", &self.gmm)?;
         state.serialize_field("exploration_budget", &self.exploration_budget)?;
@@ -592,6 +604,11 @@ impl Serialize for AutoStrategy {
         state.serialize_field("gmm_sampling_ready", &self.gmm_sampling_ready)?;
         state.serialize_field("trial_count", &self.trial_count)?;
         state.serialize_field("issued_count", &self.issued_count.load(Ordering::Relaxed))?;
+        let gmm_origin_suggestions = self
+            .gmm_origin_suggestions
+            .as_ref()
+            .map(|count| count.load(Ordering::Relaxed));
+        state.serialize_field("gmm_origin_suggestions", &gmm_origin_suggestions)?;
         state.end()
     }
 }
@@ -613,6 +630,8 @@ impl<'de> Deserialize<'de> for AutoStrategy {
             trial_count: usize,
             #[serde(default)]
             issued_count: Option<usize>,
+            #[serde(default)]
+            gmm_origin_suggestions: Option<u64>,
         }
 
         let state = AutoStrategySerde::deserialize(deserializer)?;
@@ -644,6 +663,7 @@ impl<'de> Deserialize<'de> for AutoStrategy {
             gmm_sampling_ready,
             trial_count: state.trial_count,
             issued_count: AtomicUsize::new(issued_count),
+            gmm_origin_suggestions: state.gmm_origin_suggestions.map(AtomicU64::new),
         })
     }
 }
@@ -676,7 +696,11 @@ impl Strategy for DynStrategy {
                 if issued < s.exploration_budget || !s.gmm_sampling_ready || periodic_exploration {
                     s.sobol.suggest(space)
                 } else {
-                    s.gmm.suggest(space)
+                    let suggestion = s.gmm.suggest(space);
+                    if let Some(count) = &s.gmm_origin_suggestions {
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    suggestion
                 }
             }
         }
@@ -698,6 +722,43 @@ impl Strategy for DynStrategy {
 }
 
 impl DynStrategy {
+    fn diagnostics(&self) -> StrategyDiagnostics {
+        match &self.inner {
+            DynStrategyInner::Random(strategy) => StrategyDiagnostics {
+                gmm_fit_epoch: None,
+                gmm_origin_suggestions: None,
+                gmm_sampling_ready: None,
+                issued_suggestions: strategy.counter(),
+            },
+            DynStrategyInner::Sobol(strategy) => StrategyDiagnostics {
+                gmm_fit_epoch: None,
+                gmm_origin_suggestions: None,
+                gmm_sampling_ready: None,
+                issued_suggestions: u64::from(strategy.index()),
+            },
+            DynStrategyInner::Gmm(strategy) => StrategyDiagnostics {
+                gmm_fit_epoch: Some(strategy.refit_epoch()),
+                // This legacy variant predates route provenance. Its sampling
+                // cursor may also have been conservatively advanced during an
+                // import, so it cannot truthfully stand in for the dedicated
+                // empirical-origin counter owned by AutoStrategy.
+                gmm_origin_suggestions: None,
+                gmm_sampling_ready: Some(true),
+                issued_suggestions: strategy.counter(),
+            },
+            DynStrategyInner::Auto(strategy) => StrategyDiagnostics {
+                gmm_fit_epoch: Some(strategy.gmm.refit_epoch()),
+                gmm_origin_suggestions: strategy
+                    .gmm_origin_suggestions
+                    .as_ref()
+                    .map(|count| count.load(Ordering::Relaxed)),
+                gmm_sampling_ready: Some(strategy.gmm_sampling_ready),
+                issued_suggestions: u64::try_from(strategy.issued_count.load(Ordering::Relaxed))
+                    .expect("supported targets have at most 64-bit usize"),
+            },
+        }
+    }
+
     /// Epoch of an `auto` strategy that is still waiting for its first
     /// empirical GMM fit. Capturing this before queued maintenance and
     /// comparing it again under `refit_lock` coalesces concurrent retries once
@@ -806,6 +867,23 @@ impl DynStrategy {
                         "checkpoint auto issued_count {issued_count} is outside the valid range {minimum_issued_count}..{}",
                         usize::MAX - 1
                     ));
+                }
+                if let Some(gmm_origin_suggestions) = strategy
+                    .gmm_origin_suggestions
+                    .as_ref()
+                    .map(|count| count.load(Ordering::Relaxed))
+                {
+                    if gmm_origin_suggestions != strategy.gmm.counter() {
+                        return Err(format!(
+                            "checkpoint auto GMM-origin count {gmm_origin_suggestions} does not match GMM sampling cursor {}",
+                            strategy.gmm.counter()
+                        ));
+                    }
+                    if u128::from(gmm_origin_suggestions) > issued_count as u128 {
+                        return Err(format!(
+                            "checkpoint auto GMM-origin count {gmm_origin_suggestions} exceeds issued_count {issued_count}"
+                        ));
+                    }
                 }
                 if let Some(seed) = config.seed {
                     let expected_sobol_seed = (seed ^ (seed >> 32)) as u32;
@@ -971,6 +1049,10 @@ impl DynStrategy {
                     .map_err(|error| error.to_string())?;
             }
             DynStrategyInner::Auto(strategy) => {
+                // Imported history has no exact sampler-route provenance. The
+                // GMM cursor below is only a conservative watermark, so it must
+                // never be exposed as a cumulative empirical-origin count.
+                strategy.gmm_origin_suggestions = None;
                 strategy.sobol.advance_to(sobol_index);
                 strategy.trial_count = completed_count;
                 strategy
@@ -1027,6 +1109,10 @@ impl opt_engine::traits::RefittableStrategy for DynStrategy {
                 // an empty no-op clone carries the live value already.
                 s.issued_count
                     .store(l.issued_count.load(Ordering::Relaxed), Ordering::Relaxed);
+                s.gmm_origin_suggestions = l
+                    .gmm_origin_suggestions
+                    .as_ref()
+                    .map(|count| AtomicU64::new(count.load(Ordering::Relaxed)));
             }
             (DynStrategyInner::Gmm(s), DynStrategyInner::Gmm(l)) => s.reconcile_after_refit(l),
             // Sobol/Random refit is a no-op, so the off-lock snapshot is stale;
@@ -1415,6 +1501,24 @@ fn validate_strategy_config(strategy: &StrategyConfig) -> Result<(), String> {
 pub struct DynTrial {
     pub trial_id: u64,
     pub params: serde_json::Value,
+}
+
+/// Read-only strategy state used to attribute calibration outcomes.
+///
+/// The three GMM-specific fields are `None` for non-GMM strategies. An
+/// `auto` strategy can also report an unknown GMM-origin count after loading
+/// history whose exact sampler routes were not persisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrategyDiagnostics {
+    /// Number of successfully installed GMM parameter sets after the prior.
+    pub gmm_fit_epoch: Option<u64>,
+    /// Exact cumulative GMM-origin suggestions, when route provenance is known.
+    /// For `auto`, only routes through a ready empirical model are counted.
+    pub gmm_origin_suggestions: Option<u64>,
+    /// Whether the auto strategy may currently sample its fitted GMM.
+    pub gmm_sampling_ready: Option<bool>,
+    /// Total suggestions issued by the strategy cursor.
+    pub issued_suggestions: u64,
 }
 
 /// A completed trial with full scoring, ranking, and Pareto front information.
@@ -3809,6 +3913,11 @@ impl HolaEngine {
         self.state.read().await.leaderboard.len()
     }
 
+    /// Return a read-only snapshot of strategy routing and fit state.
+    pub async fn strategy_diagnostics(&self) -> StrategyDiagnostics {
+        self.state.read().await.strategy.diagnostics()
+    }
+
     /// Number of unattended auto-checkpoint or rotation failures observed by
     /// this engine process.
     pub fn checkpoint_failure_count(&self) -> u64 {
@@ -5867,6 +5976,196 @@ mod tests {
             );
             assert!(auto.gmm.params().unwrap().n_components() <= 2);
         }
+    }
+
+    #[tokio::test]
+    async fn strategy_diagnostics_count_only_empirical_gmm_routes() {
+        let mut config = single_objective_config("gmm");
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(1);
+        strategy.ongoing_exploration_period = Some(4);
+        strategy.refit_interval = 1;
+        let engine = HolaEngine::from_config(config).unwrap();
+
+        assert_eq!(
+            engine.strategy_diagnostics().await,
+            StrategyDiagnostics {
+                gmm_fit_epoch: Some(0),
+                gmm_origin_suggestions: Some(0),
+                gmm_sampling_ready: Some(false),
+                issued_suggestions: 0,
+            }
+        );
+
+        // Concurrent asks can cross the nominal warm-up boundary before any
+        // tell has produced an empirical model. All three stay on Sobol and
+        // must therefore leave the GMM-origin count at zero.
+        let warmup = engine.ask().await.unwrap();
+        let _prefit_overflow_a = engine.ask().await.unwrap();
+        let _prefit_overflow_b = engine.ask().await.unwrap();
+        assert_eq!(
+            engine.strategy_diagnostics().await,
+            StrategyDiagnostics {
+                gmm_fit_epoch: Some(0),
+                gmm_origin_suggestions: Some(0),
+                gmm_sampling_ready: Some(false),
+                issued_suggestions: 3,
+            }
+        );
+
+        engine
+            .tell(warmup.trial_id, serde_json::json!({"loss": 0.5}))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.strategy_diagnostics().await,
+            StrategyDiagnostics {
+                gmm_fit_epoch: Some(1),
+                gmm_origin_suggestions: Some(0),
+                gmm_sampling_ready: Some(true),
+                issued_suggestions: 3,
+            }
+        );
+
+        // The third post-warm-up request is empirical GMM; the fourth is the
+        // configured periodic Sobol request and must not increment the count.
+        engine.ask().await.unwrap();
+        assert_eq!(
+            engine.strategy_diagnostics().await.gmm_origin_suggestions,
+            Some(1)
+        );
+        engine.ask().await.unwrap();
+        assert_eq!(
+            engine.strategy_diagnostics().await,
+            StrategyDiagnostics {
+                gmm_fit_epoch: Some(1),
+                gmm_origin_suggestions: Some(1),
+                gmm_sampling_ready: Some(true),
+                issued_suggestions: 5,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn non_gmm_strategy_diagnostics_have_no_gmm_fields() {
+        for strategy_type in ["random", "sobol"] {
+            let engine = HolaEngine::from_config(single_objective_config(strategy_type)).unwrap();
+            assert_eq!(
+                engine.strategy_diagnostics().await,
+                StrategyDiagnostics {
+                    gmm_fit_epoch: None,
+                    gmm_origin_suggestions: None,
+                    gmm_sampling_ready: None,
+                    issued_suggestions: 0,
+                }
+            );
+            engine.ask().await.unwrap();
+            assert_eq!(engine.strategy_diagnostics().await.issued_suggestions, 1);
+        }
+    }
+
+    #[test]
+    fn legacy_direct_gmm_diagnostics_do_not_claim_empirical_origin() {
+        let space = DynSpace::new().add_real("x", 0.0, 1.0);
+        let strategy = DynStrategy {
+            inner: DynStrategyInner::Gmm(
+                GmmStrategy::uniform_prior(7, 1, AUTO_GMM_PRIOR_VARIANCE).unwrap(),
+            ),
+        };
+        strategy.suggest(&space);
+        assert_eq!(
+            strategy.diagnostics(),
+            StrategyDiagnostics {
+                gmm_fit_epoch: Some(0),
+                gmm_origin_suggestions: None,
+                gmm_sampling_ready: Some(true),
+                issued_suggestions: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn gmm_origin_diagnostics_roundtrip_and_legacy_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagnostics.json");
+        let mut config = single_objective_config("gmm");
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(1);
+        strategy.ongoing_exploration_period = Some(0);
+        strategy.refit_interval = 1;
+        let source = HolaEngine::from_config(config).unwrap();
+
+        let warmup = source.ask().await.unwrap();
+        source
+            .tell(warmup.trial_id, serde_json::json!({"loss": 0.5}))
+            .await
+            .unwrap();
+        source.ask().await.unwrap();
+        let expected = source.strategy_diagnostics().await;
+        assert_eq!(expected.gmm_origin_suggestions, Some(1));
+        source.save_full_checkpoint(&path, None).await.unwrap();
+
+        let resumed = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+        assert_eq!(resumed.strategy_diagnostics().await, expected);
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        legacy["checkpoint"]["strategy_state"]["inner"]
+            .as_object_mut()
+            .unwrap()
+            .remove("gmm_origin_suggestions");
+        std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let legacy_resumed = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+        let legacy_diagnostics = legacy_resumed.strategy_diagnostics().await;
+        assert_eq!(legacy_diagnostics.gmm_origin_suggestions, None);
+        assert_eq!(legacy_diagnostics.gmm_fit_epoch, expected.gmm_fit_epoch);
+        assert_eq!(
+            legacy_diagnostics.gmm_sampling_ready,
+            expected.gmm_sampling_ready
+        );
+        assert_eq!(
+            legacy_diagnostics.issued_suggestions,
+            expected.issued_suggestions
+        );
+
+        // Once cumulative history is unknown, later GMM suggestions cannot
+        // reconstruct it and must leave the diagnostic unknown.
+        legacy_resumed.ask().await.unwrap();
+        assert_eq!(
+            legacy_resumed
+                .strategy_diagnostics()
+                .await
+                .gmm_origin_suggestions,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn leaderboard_import_makes_gmm_origin_count_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leaderboard.json");
+        let source = HolaEngine::from_config(single_objective_config("random")).unwrap();
+        let trial = source.ask().await.unwrap();
+        source
+            .tell(trial.trial_id, serde_json::json!({"loss": 0.5}))
+            .await
+            .unwrap();
+        source
+            .save_leaderboard_checkpoint_to(&path, None)
+            .await
+            .unwrap();
+
+        let target = HolaEngine::from_config(single_objective_config("gmm")).unwrap();
+        assert_eq!(
+            target.strategy_diagnostics().await.gmm_origin_suggestions,
+            Some(0)
+        );
+        target.load_leaderboard_checkpoint(&path).await.unwrap();
+        assert_eq!(
+            target.strategy_diagnostics().await.gmm_origin_suggestions,
+            None
+        );
     }
 
     #[tokio::test]

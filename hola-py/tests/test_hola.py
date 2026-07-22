@@ -211,6 +211,53 @@ def test_study_strategy_gmm():
     assert study.trial_count() == 1
 
 
+def test_strategy_diagnostics_python_exposure():
+    from hola_opt import Gmm, Minimize, Real, Space, Study
+
+    study = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("loss")],
+        strategy=Gmm(
+            exploration_budget=1,
+            refit_interval=1,
+            ongoing_exploration_period=0,
+        ),
+    )
+    assert study.strategy_diagnostics() == {
+        "gmm_fit_epoch": 0,
+        "gmm_origin_suggestions": 0,
+        "gmm_sampling_ready": False,
+        "issued_suggestions": 0,
+    }
+
+    warmup = study.ask()
+    assert study.strategy_diagnostics()["gmm_origin_suggestions"] == 0
+    study.tell(warmup.trial_id, {"loss": 0.5})
+    fitted = study.strategy_diagnostics()
+    assert fitted["gmm_fit_epoch"] == 1
+    assert fitted["gmm_sampling_ready"] is True
+
+    study.ask()
+    assert study.strategy_diagnostics() == {
+        "gmm_fit_epoch": 1,
+        "gmm_origin_suggestions": 1,
+        "gmm_sampling_ready": True,
+        "issued_suggestions": 2,
+    }
+
+    random_study = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("loss")],
+        strategy="random",
+    )
+    assert random_study.strategy_diagnostics() == {
+        "gmm_fit_epoch": None,
+        "gmm_origin_suggestions": None,
+        "gmm_sampling_ready": None,
+        "issued_suggestions": 0,
+    }
+
+
 def test_gmm_refit_limit_configuration_and_validation():
     from hola_opt import ConfigurationError, Gmm, Minimize, Real, Space, Study
 

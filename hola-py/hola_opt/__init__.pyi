@@ -355,6 +355,9 @@ class Study:
     def trial_count(self) -> int:
         """Number of completed trials."""
         ...
+    def strategy_diagnostics(self) -> dict[str, int | bool | None]:
+        """Return read-only strategy routing and fitted-model diagnostics."""
+        ...
     def update_objectives(self, objectives: list[Minimize | Maximize]) -> None:
         """Update objectives mid-run, re-scalarizing all trials."""
         ...
