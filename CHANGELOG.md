@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fresh GMM studies now use the held-out-calibrated defaults: twice the raw
+  warm-up rule before power-of-two rounding, a 12.5% elite fraction, no ongoing
+  post-warm-up Sobol' cadence, one mixture component, and a five-sample elite
+  floor. Checkpoints that predate these explicit fields continue to resolve to
+  the historical defaults when loaded.
 - Multi-group GMM refits now select elites by Pareto rank and crowding
   distance, and grouped objectives apply priority weights only within their
   explicit group.

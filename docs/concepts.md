@@ -113,15 +113,19 @@ rank followed by descending crowding distance.
 The lifecycle follows three phases.
 
 1. **Warmup.** The first trials build up the leaderboard. HOLA continues
-   Sobol' sampling until the first empirical fit is installed.
+   Sobol' sampling until the first empirical fit is installed. With no explicit
+   exploration budget, the implementation doubles
+   `min(floor(S/5), 50 + 2n)` and rounds down to a power of two, for total
+   budget `S` and dimension `n`. The warm-up calculation uses `S=200` when no
+   total trial budget is configured; this fallback does not impose a trial cap.
 2. **Refit.** Every `refit_interval` trials (default 20), we refit
-   the GMM to the top 25% of trials, subject to the configured minimum
+   the GMM to the top 12.5% of trials, subject to the configured minimum
    feasible elite workset. If the first scheduled fit lacks that workset,
    each subsequent completion retries until the first empirical model is
    installed; later refits return to the configured cadence.
 3. **Exploit.** New samples are drawn from the updated GMM,
-   focusing on promising regions. By default, every fifth post-warmup
-   suggestion remains a global Sobol' exploration point.
+   focusing on promising regions. Ongoing post-warmup Sobol' exploration is
+   disabled by default and can be enabled with an explicit period.
 
 GMM exploitation uses seeded Owen-scrambled Gauss–Sobol' points.
 One Sobol' coordinate selects the mixture component, and inverse-normal
@@ -136,9 +140,9 @@ on completed trials in the leaderboard. Pending asks that cross the nominal
 warmup boundary before the first completed-data fit remain Sobol' suggestions;
 the unfitted prior is never used as exploitation.
 
-`max_components` bounds mixture complexity (default 3), while
+`max_components` bounds mixture complexity (default 1), while
 `min_elite_samples` can delay fitting until a feasible elite workset reaches a
-requested size (default 1). The effective component count may be smaller: the
+requested size (default 5). The effective component count may be smaller: the
 implementation requires enough elite samples to support each component.
 
 Two implementation limits keep refitting bounded on unusually long studies.

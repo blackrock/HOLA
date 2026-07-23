@@ -1526,16 +1526,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .checkpoint
                 .as_ref()
                 .map(|checkpoint| PathBuf::from(&checkpoint.directory));
-            let engine = HolaEngine::from_config(study_config)
-                .map_err(|e| format!("Failed to create engine: {e}"))?;
-
-            if let Some(path) = load_from {
-                let checkpoint_kind = engine
-                    .load_checkpoint_with_fallback(&path)
-                    .await
-                    .map_err(|e| format!("Failed to load checkpoint '{path}': {e}"))?;
+            let engine = if let Some(path) = load_from {
+                let (engine, checkpoint_kind) =
+                    HolaEngine::load_configured_checkpoint(study_config, &path)
+                        .await
+                        .map_err(|e| format!("Failed to load checkpoint '{path}': {e}"))?;
                 eprintln!("Loaded {} checkpoint from {path}", checkpoint_kind.as_str());
-            }
+                engine
+            } else {
+                HolaEngine::from_config(study_config)
+                    .map_err(|e| format!("Failed to create engine: {e}"))?
+            };
 
             let auth_token = configured_token(auth_token);
             if !is_local_host(&host) && auth_token.is_none() {

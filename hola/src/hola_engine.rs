@@ -70,14 +70,22 @@ const MAX_ASK_IDEMPOTENCY_KEYS: usize = MAX_PENDING_TRIALS;
 /// the idempotency ledger into unbounded study history.
 const MAX_COMPLETION_RECEIPTS: usize = 4096;
 
-/// Legacy cadence for low-discrepancy exploration after the initial warm-up.
-/// This prevents a fitted GMM from permanently collapsing around sparse early
-/// elites.
-pub const DEFAULT_ONGOING_EXPLORATION_PERIOD: usize = 5;
-/// Legacy upper bound on fitted GMM components.
-pub const DEFAULT_MAX_COMPONENTS: usize = 3;
-/// Legacy lower bound on the elite workset passed to a GMM refit.
-pub const DEFAULT_MIN_ELITE_SAMPLES: usize = 1;
+/// Default fraction of the ranked trial set used for GMM refitting.
+pub const DEFAULT_ELITE_FRACTION: f64 = 0.125;
+/// Default cadence for low-discrepancy exploration after the initial warm-up.
+/// Zero disables periodic exploration once an empirical GMM is available.
+pub const DEFAULT_ONGOING_EXPLORATION_PERIOD: usize = 0;
+/// Default upper bound on fitted GMM components.
+pub const DEFAULT_MAX_COMPONENTS: usize = 1;
+/// Default lower bound on the elite workset passed to a GMM refit.
+pub const DEFAULT_MIN_ELITE_SAMPLES: usize = 5;
+/// Defaults used only to migrate checkpoints written before these controls
+/// were recorded explicitly. They must remain fixed to preserve the behavior
+/// of historical studies when an old checkpoint omits the corresponding field.
+const LEGACY_DEFAULT_ELITE_FRACTION: f64 = 0.25;
+const LEGACY_DEFAULT_ONGOING_EXPLORATION_PERIOD: usize = 5;
+const LEGACY_DEFAULT_MAX_COMPONENTS: usize = 3;
+const LEGACY_DEFAULT_MIN_ELITE_SAMPLES: usize = 1;
 /// Variance of the neutral GMM placeholder used before the first empirical fit.
 const AUTO_GMM_PRIOR_VARIANCE: f64 = 0.1;
 /// Default bound on the number of elite samples passed to full-covariance EM.
@@ -88,6 +96,10 @@ pub const DEFAULT_MAX_REFIT_SAMPLES: usize = 4096;
 /// Histories beyond this size are covered by deterministic chronological
 /// strata rather than a newest-only window.
 pub const DEFAULT_MAX_REFIT_CANDIDATES: usize = 16_384;
+
+fn fold_sobol_seed(seed: u64) -> u32 {
+    (seed ^ (seed >> 32)) as u32
+}
 
 fn unix_time_millis() -> u64 {
     SystemTime::now()
@@ -488,8 +500,9 @@ enum DynStrategyInner {
 /// model once its first empirical fit is available; the model is periodically
 /// refit to elite trials.
 ///
-/// The default exploration budget follows the formula from the paper:
-/// `min(floor(S / 5), 50 + 2n)`, where `S` is the intended number of
+/// The default exploration budget doubles the raw formula from the paper
+/// before rounding down to a power of two:
+/// `2 * min(floor(S / 5), 50 + 2n)`, where `S` is the intended number of
 /// simulations and `n` is the dimensionality.
 #[derive(Debug)]
 pub struct AutoStrategy {
@@ -513,16 +526,31 @@ pub struct AutoStrategy {
 }
 
 impl AutoStrategy {
-    /// Compute the default exploration budget from the paper's formula,
-    /// rounded down to the nearest power of two to preserve the balanced
-    /// space-filling properties of the Sobol sequence.
+    /// Compute the default exploration budget by doubling the paper's raw
+    /// formula before rounding down to the nearest power of two. Applying the
+    /// multiplier before rounding preserves the balanced space-filling
+    /// properties of the Sobol sequence.
     ///
     /// `total_budget` is `S`, the intended total number of simulations.
     /// `dim` is `n`, the dimensionality of the search space.
     pub fn default_exploration_budget(total_budget: usize, dim: usize) -> usize {
+        Self::exploration_budget_with_multiplier(total_budget, dim, 2)
+    }
+
+    /// Reconstruct the pre-calibration warm-up for a checkpoint whose embedded
+    /// config predates the concrete exploration-budget field.
+    fn legacy_default_exploration_budget(total_budget: usize, dim: usize) -> usize {
+        Self::exploration_budget_with_multiplier(total_budget, dim, 1)
+    }
+
+    fn exploration_budget_with_multiplier(
+        total_budget: usize,
+        dim: usize,
+        multiplier: usize,
+    ) -> usize {
         let a = total_budget / 5;
-        let b = 50 + 2 * dim;
-        let raw = a.min(b);
+        let b = 50usize.saturating_add(2usize.saturating_mul(dim));
+        let raw = a.min(b).saturating_mul(multiplier);
         // Round down to the nearest power of two so the Sobol sequence
         // retains its low-discrepancy guarantee.
         if raw < 2 {
@@ -551,7 +579,7 @@ impl AutoStrategy {
             // Fold the high 32 bits into the low 32 instead of truncating, so two
             // u64 seeds that differ only in their high bits yield distinct Sobol
             // seeds. Deterministic: the same u64 always folds to the same u32.
-            Some(s) => ((s ^ (s >> 32)) as u32, s),
+            Some(s) => (fold_sobol_seed(s), s),
             None => (42, rand::random()),
         };
         Self {
@@ -623,7 +651,7 @@ impl<'de> Deserialize<'de> for AutoStrategy {
             sobol: SobolStrategy<DynSpace>,
             gmm: GmmStrategy<DynSpace>,
             exploration_budget: usize,
-            #[serde(default = "default_ongoing_exploration_period")]
+            #[serde(default = "legacy_default_ongoing_exploration_period")]
             ongoing_exploration_period: usize,
             #[serde(default)]
             gmm_sampling_ready: Option<bool>,
@@ -886,11 +914,23 @@ impl DynStrategy {
                     }
                 }
                 if let Some(seed) = config.seed {
-                    let expected_sobol_seed = (seed ^ (seed >> 32)) as u32;
+                    let expected_sobol_seed = fold_sobol_seed(seed);
                     if strategy.gmm.seed() != seed || strategy.sobol.seed() != expected_sobol_seed {
                         return Err(format!(
                             "checkpoint auto strategy seeds do not match configured seed {seed}"
                         ));
+                    }
+                } else {
+                    let sobol_seed = strategy.sobol.seed();
+                    let gmm_seed = strategy.gmm.seed();
+                    let current_pair = sobol_seed == fold_sobol_seed(gmm_seed);
+                    let historical_auto_seed = sobol_seed == 42;
+                    let historical_explicit_seed = sobol_seed == gmm_seed as u32;
+                    if !current_pair && !historical_auto_seed && !historical_explicit_seed {
+                        return Err(
+                            "checkpoint auto strategy with seed null has no supported current or historical seed relationship"
+                                .to_string(),
+                        );
                     }
                 }
                 let initial_sobol = issued_count.min(strategy.exploration_budget);
@@ -973,7 +1013,7 @@ impl DynStrategy {
             }
             DynStrategyInner::Sobol(strategy) => {
                 if let Some(seed) = config.seed {
-                    let expected_seed = (seed ^ (seed >> 32)) as u32;
+                    let expected_seed = fold_sobol_seed(seed);
                     if strategy.seed() != expected_seed {
                         return Err(format!(
                             "checkpoint Sobol seed {} does not match configured folded seed {expected_seed}",
@@ -996,12 +1036,21 @@ impl DynStrategy {
         Ok(())
     }
 
-    fn resolved_seed(&self) -> u64 {
+    /// Return a public seed only when constructing the strategy from that seed
+    /// under the current rules reproduces the serialized sampler seed(s).
+    ///
+    /// Historical Auto strategies could contain independent Sobol/GMM seeds,
+    /// or a truncated Sobol seed for an explicit `u64`. Such a pair has no
+    /// truthful single-seed representation in today's folded scheme.
+    fn representable_config_seed(&self) -> Option<u64> {
         match &self.inner {
-            DynStrategyInner::Random(strategy) => strategy.seed(),
-            DynStrategyInner::Sobol(strategy) => u64::from(strategy.seed()),
-            DynStrategyInner::Gmm(strategy) => strategy.seed(),
-            DynStrategyInner::Auto(strategy) => strategy.gmm.seed(),
+            DynStrategyInner::Random(strategy) => Some(strategy.seed()),
+            DynStrategyInner::Sobol(strategy) => Some(u64::from(strategy.seed())),
+            DynStrategyInner::Gmm(strategy) => Some(strategy.seed()),
+            DynStrategyInner::Auto(strategy) => {
+                let seed = strategy.gmm.seed();
+                (strategy.sobol.seed() == fold_sobol_seed(seed)).then_some(seed)
+            }
         }
     }
 
@@ -1184,31 +1233,31 @@ pub struct StrategyConfig {
     pub strategy_type: String,
     #[serde(default = "default_refit_interval")]
     pub refit_interval: usize,
-    /// Total simulation budget S (used by "auto" to compute exploration threshold).
+    /// Total simulation budget S (used by GMM/auto to compute the exploration threshold).
     #[serde(default)]
     pub total_budget: Option<usize>,
     /// Override the exploration budget directly instead of using the formula.
     #[serde(default)]
     pub exploration_budget: Option<usize>,
     /// Cadence for ongoing Sobol exploration after the initial warm-up.
-    /// Missing resolves to the legacy cadence of 5; 0 disables it.
+    /// In a new study, missing resolves to 0 (disabled).
     #[serde(default)]
     pub ongoing_exploration_period: Option<usize>,
     /// Optional seed for reproducible runs. When `None`, strategies use their
     /// default seeding (Sobol=42, others use random seeds).
     #[serde(default)]
     pub seed: Option<u64>,
-    /// Fraction of top trials used for GMM refitting (default: 0.25).
+    /// Fraction of top trials used for GMM refitting (default: 0.125).
     /// Must be in (0.0, 1.0].
     #[serde(default)]
     pub elite_fraction: Option<f64>,
     /// Maximum number of GMM components considered during fitting. Missing
-    /// resolves to the legacy cap of 3.
+    /// resolves to 1 in a new study.
     #[serde(default)]
     pub max_components: Option<usize>,
     /// Minimum feasible elite workset size required for refitting. A scheduled
     /// refit is skipped until selection can supply this many trials. Missing
-    /// resolves to the legacy floor of 1.
+    /// resolves to 5 in a new study.
     #[serde(default)]
     pub min_elite_samples: Option<usize>,
     /// Maximum elite samples used by one GMM fit. This bounds EM cost but does
@@ -1225,8 +1274,8 @@ fn default_refit_interval() -> usize {
     20
 }
 
-fn default_ongoing_exploration_period() -> usize {
-    DEFAULT_ONGOING_EXPLORATION_PERIOD
+fn legacy_default_ongoing_exploration_period() -> usize {
+    LEGACY_DEFAULT_ONGOING_EXPLORATION_PERIOD
 }
 
 fn default_max_refit_samples() -> usize {
@@ -1238,16 +1287,25 @@ fn default_max_refit_candidates() -> usize {
 }
 
 impl StrategyConfig {
-    /// Resolve controls added after the original checkpoint schema. Keeping
-    /// these as optional on input lets old YAML and embedded checkpoint configs
-    /// retain their historical behavior, while exported configs record the
-    /// concrete values that actually govern sampling.
-    fn resolve_calibration_control_defaults(&mut self) {
+    /// Resolve controls omitted by an embedded historical checkpoint config.
+    ///
+    /// This is deliberately not used for ordinary config deserialization:
+    /// omitted settings in a new study use the current calibrated defaults,
+    /// while missing checkpoint fields must retain the pre-calibration route.
+    fn resolve_legacy_checkpoint_defaults(&mut self, total_budget: usize, dim: usize) {
         self.ongoing_exploration_period
-            .get_or_insert(DEFAULT_ONGOING_EXPLORATION_PERIOD);
-        self.max_components.get_or_insert(DEFAULT_MAX_COMPONENTS);
+            .get_or_insert(LEGACY_DEFAULT_ONGOING_EXPLORATION_PERIOD);
+        self.max_components
+            .get_or_insert(LEGACY_DEFAULT_MAX_COMPONENTS);
         self.min_elite_samples
-            .get_or_insert(DEFAULT_MIN_ELITE_SAMPLES);
+            .get_or_insert(LEGACY_DEFAULT_MIN_ELITE_SAMPLES);
+        if matches!(self.strategy_type.as_str(), "gmm" | "auto") {
+            self.elite_fraction
+                .get_or_insert(LEGACY_DEFAULT_ELITE_FRACTION);
+            self.exploration_budget.get_or_insert_with(|| {
+                AutoStrategy::legacy_default_exploration_budget(total_budget, dim)
+            });
+        }
     }
 }
 
@@ -1272,6 +1330,382 @@ pub struct StudyConfig {
     /// history would otherwise grow without bound.
     #[serde(default)]
     pub max_leaderboard_size: Option<usize>,
+}
+
+impl StudyConfig {
+    /// Materialize only historical checkpoint defaults. Fresh user configs
+    /// intentionally bypass this migration and resolve against current values
+    /// in [`HolaEngine::from_config`].
+    fn resolve_legacy_checkpoint_defaults(
+        &mut self,
+        checkpoint_document: &serde_json::Value,
+    ) -> Result<(), String> {
+        let dim = self.space.len();
+        if self.strategy.is_none() {
+            self.strategy = Some(infer_legacy_strategy_config(
+                checkpoint_document,
+                self.max_trials,
+                dim,
+            )?);
+        }
+        if let Some(strategy) = &mut self.strategy {
+            let total_budget = self.max_trials.or(strategy.total_budget).unwrap_or(200);
+            strategy.resolve_legacy_checkpoint_defaults(total_budget, dim);
+
+            // Version-one Auto checkpoints used the GMM's full `u64` seed but
+            // truncated that value for Sobol (and used an independent pair for
+            // an omitted seed). A high-bit explicit seed can therefore be
+            // historically valid without being reproducible from one seed
+            // under the current folding rule. Preserve the exact sampler state
+            // while refusing to export a misleading public seed. A malformed
+            // legacy pair is left intact here so ordinary strict validation
+            // rejects it below.
+            if checkpoint_embedded_strategy_was_absent_or_null(checkpoint_document)
+                && checkpoint_format_version(checkpoint_document) == Some(1)
+                && matches!(strategy.strategy_type.as_str(), "gmm" | "auto")
+                && let Some(pair) = serialized_auto_seed_pair(checkpoint_document)?
+                && let Some(seed) = strategy.seed
+                && pair.current_config_seed() != Some(seed)
+                && pair.matches_legacy_explicit_seed(seed)
+            {
+                strategy.seed = None;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn checkpoint_embedded_strategy_was_absent_or_null(
+    checkpoint_document: &serde_json::Value,
+) -> bool {
+    checkpoint_document
+        .get("config")
+        .and_then(|config| config.get("strategy"))
+        .is_none_or(serde_json::Value::is_null)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SerializedAutoSeedPair {
+    sobol: u32,
+    gmm: u64,
+}
+
+impl SerializedAutoSeedPair {
+    fn current_config_seed(self) -> Option<u64> {
+        (self.sobol == fold_sobol_seed(self.gmm)).then_some(self.gmm)
+    }
+
+    fn matches_legacy_explicit_seed(self, seed: u64) -> bool {
+        self.gmm == seed && self.sobol == seed as u32
+    }
+}
+
+fn checkpoint_format_version(checkpoint_document: &serde_json::Value) -> Option<u64> {
+    checkpoint_document
+        .get("checkpoint")
+        .unwrap_or(checkpoint_document)
+        .get("metadata")
+        .and_then(|metadata| metadata.get("format_version"))
+        .and_then(serde_json::Value::as_u64)
+}
+
+fn serialized_auto_seed_pair(
+    checkpoint_document: &serde_json::Value,
+) -> Result<Option<SerializedAutoSeedPair>, String> {
+    let inner = checkpoint_document
+        .get("checkpoint")
+        .unwrap_or(checkpoint_document)
+        .get("strategy_state")
+        .and_then(|state| state.get("inner"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "checkpoint strategy_state has no object-valued inner state".to_string())?;
+    if inner.get("type").and_then(serde_json::Value::as_str) != Some("auto") {
+        return Ok(None);
+    }
+
+    let sobol = checkpoint_u64(
+        inner.get("sobol").and_then(|sobol| sobol.get("seed")),
+        "checkpoint Sobol seed",
+    )?;
+    let sobol = u32::try_from(sobol)
+        .map_err(|_| "checkpoint Sobol seed exceeds the supported u32 range".to_string())?;
+    let gmm = checkpoint_u64(
+        inner.get("gmm").and_then(|gmm| gmm.get("seed")),
+        "checkpoint GMM seed",
+    )?;
+    Ok(Some(SerializedAutoSeedPair { sobol, gmm }))
+}
+
+fn serialized_sobol_seed(checkpoint_document: &serde_json::Value) -> Result<Option<u32>, String> {
+    let inner = checkpoint_document
+        .get("checkpoint")
+        .unwrap_or(checkpoint_document)
+        .get("strategy_state")
+        .and_then(|state| state.get("inner"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "checkpoint strategy_state has no object-valued inner state".to_string())?;
+    if inner.get("type").and_then(serde_json::Value::as_str) != Some("sobol") {
+        return Ok(None);
+    }
+    let seed = checkpoint_u64(inner.get("seed"), "checkpoint Sobol seed")?;
+    u32::try_from(seed)
+        .map(Some)
+        .map_err(|_| "checkpoint Sobol seed exceeds the supported u32 range".to_string())
+}
+
+/// Reconstruct the strategy config omitted by the original full-checkpoint
+/// schema. Only strategy-state variants that map unambiguously onto a current
+/// configured strategy are accepted; legacy direct-GMM state has no supported
+/// two-phase config equivalent and therefore fails closed.
+fn infer_legacy_strategy_config(
+    checkpoint_document: &serde_json::Value,
+    max_trials: Option<usize>,
+    dim: usize,
+) -> Result<StrategyConfig, String> {
+    let state = checkpoint_document
+        .get("checkpoint")
+        .unwrap_or(checkpoint_document)
+        .get("strategy_state")
+        .ok_or_else(|| "checkpoint with strategy: null has no strategy_state".to_string())?;
+    let inner = state
+        .get("inner")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "checkpoint strategy_state has no object-valued inner state".to_string())?;
+    let state_type = inner
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "checkpoint strategy inner state has no string type".to_string())?;
+
+    let mut strategy = StrategyConfig {
+        strategy_type: match state_type {
+            "auto" => "gmm",
+            "random" => "random",
+            "sobol" => "sobol",
+            "gmm" => {
+                return Err(
+                    "legacy direct-GMM strategy state cannot be reconstructed as a configured strategy"
+                        .to_string(),
+                );
+            }
+            other => {
+                return Err(format!(
+                    "unsupported legacy checkpoint strategy state type '{other}'"
+                ));
+            }
+        }
+        .to_string(),
+        refit_interval: default_refit_interval(),
+        total_budget: max_trials,
+        exploration_budget: None,
+        ongoing_exploration_period: None,
+        seed: None,
+        elite_fraction: None,
+        max_components: None,
+        min_elite_samples: None,
+        max_refit_samples: DEFAULT_MAX_REFIT_SAMPLES,
+        max_refit_candidates: DEFAULT_MAX_REFIT_CANDIDATES,
+    };
+
+    if state_type == "auto" {
+        strategy.exploration_budget = Some(checkpoint_usize(
+            inner.get("exploration_budget"),
+            "checkpoint strategy exploration_budget",
+        )?);
+        strategy.ongoing_exploration_period = Some(match inner.get("ongoing_exploration_period") {
+            Some(value) => checkpoint_usize(
+                Some(value),
+                "checkpoint strategy ongoing_exploration_period",
+            )?,
+            None => LEGACY_DEFAULT_ONGOING_EXPLORATION_PERIOD,
+        });
+        strategy.max_components = Some(
+            inner
+                .get("gmm")
+                .and_then(|gmm| gmm.get("refit_config"))
+                .and_then(|config| config.get("n_components"))
+                .map(|value| checkpoint_usize(Some(value), "checkpoint GMM n_components"))
+                .transpose()?
+                .unwrap_or(LEGACY_DEFAULT_MAX_COMPONENTS),
+        );
+        strategy.elite_fraction = Some(LEGACY_DEFAULT_ELITE_FRACTION);
+        strategy.min_elite_samples = Some(LEGACY_DEFAULT_MIN_ELITE_SAMPLES);
+        strategy.seed = serialized_auto_seed_pair(checkpoint_document)?
+            .and_then(SerializedAutoSeedPair::current_config_seed);
+    } else {
+        strategy.resolve_legacy_checkpoint_defaults(max_trials.unwrap_or(200), dim);
+        strategy.seed = Some(checkpoint_u64(
+            inner.get("seed"),
+            "checkpoint strategy seed",
+        )?);
+    }
+    Ok(strategy)
+}
+
+fn checkpoint_u64(value: Option<&serde_json::Value>, field: &str) -> Result<u64, String> {
+    value
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{field} must be a non-negative integer"))
+}
+
+fn apply_v1_caller_controls_not_encoded_in_state(
+    migrated: &mut StudyConfig,
+    requested: &StudyConfig,
+    checkpoint_document: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(requested_strategy) = requested.strategy.as_ref() else {
+        return Ok(());
+    };
+    let migrated_strategy = migrated
+        .strategy
+        .as_mut()
+        .ok_or_else(|| "legacy checkpoint strategy could not be reconstructed".to_string())?;
+    let inner = checkpoint_document
+        .get("checkpoint")
+        .unwrap_or(checkpoint_document)
+        .get("strategy_state")
+        .and_then(|state| state.get("inner"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "checkpoint strategy_state has no object-valued inner state".to_string())?;
+
+    // Both configured names map to the serialized Auto strategy. The v1 file
+    // cannot distinguish which spelling the caller originally used.
+    if migrated_strategy.strategy_type == "gmm"
+        && matches!(requested_strategy.strategy_type.as_str(), "gmm" | "auto")
+    {
+        migrated_strategy.strategy_type = requested_strategy.strategy_type.clone();
+    }
+
+    // The original embedded config omitted all engine-level refit controls.
+    // Caller values are therefore the only source for non-default intent.
+    migrated_strategy.refit_interval = requested_strategy.refit_interval;
+    if requested_strategy.elite_fraction.is_some() {
+        migrated_strategy.elite_fraction = requested_strategy.elite_fraction;
+    }
+    if requested_strategy.min_elite_samples.is_some() {
+        migrated_strategy.min_elite_samples = requested_strategy.min_elite_samples;
+    }
+    migrated_strategy.max_refit_samples = requested_strategy.max_refit_samples;
+    migrated_strategy.max_refit_candidates = requested_strategy.max_refit_candidates;
+
+    // Later Auto-state revisions encoded these controls. Only inherit a caller
+    // value when the legacy state itself lacks the corresponding evidence.
+    if inner.get("ongoing_exploration_period").is_none()
+        && requested_strategy.ongoing_exploration_period.is_some()
+    {
+        migrated_strategy.ongoing_exploration_period =
+            requested_strategy.ongoing_exploration_period;
+    }
+    let state_has_components = inner
+        .get("gmm")
+        .and_then(|gmm| gmm.get("refit_config"))
+        .and_then(|config| config.get("n_components"))
+        .is_some();
+    if !state_has_components && requested_strategy.max_components.is_some() {
+        migrated_strategy.max_components = requested_strategy.max_components;
+    }
+    Ok(())
+}
+
+fn checkpoint_usize(value: Option<&serde_json::Value>, field: &str) -> Result<usize, String> {
+    let value = value
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{field} must be a non-negative integer"))?;
+    usize::try_from(value).map_err(|_| format!("{field} exceeds the supported integer range"))
+}
+
+fn validate_configured_checkpoint_request(
+    requested: &StudyConfig,
+    saved: &StudyConfig,
+    serialized_auto_seeds: Option<SerializedAutoSeedPair>,
+    legacy_truncated_sobol_seed: Option<u32>,
+) -> Result<(), String> {
+    if serde_json::to_value(&requested.space).map_err(|error| error.to_string())?
+        != serde_json::to_value(&saved.space).map_err(|error| error.to_string())?
+    {
+        return Err("checkpoint search space does not match the caller config".to_string());
+    }
+    if serde_json::to_value(&requested.objectives).map_err(|error| error.to_string())?
+        != serde_json::to_value(&saved.objectives).map_err(|error| error.to_string())?
+    {
+        return Err("checkpoint objectives do not match the caller config".to_string());
+    }
+    if requested.max_leaderboard_size != saved.max_leaderboard_size {
+        return Err("checkpoint max_leaderboard_size does not match the caller config".to_string());
+    }
+
+    let requested_max_trials = requested.max_trials.or_else(|| {
+        requested
+            .strategy
+            .as_ref()
+            .and_then(|strategy| strategy.total_budget)
+    });
+    if requested_max_trials != saved.max_trials {
+        return Err("checkpoint trial budget does not match the caller config".to_string());
+    }
+
+    let saved_strategy = saved
+        .strategy
+        .as_ref()
+        .ok_or_else(|| "checkpoint has no reconstructable strategy config".to_string())?;
+    if saved_strategy.total_budget != requested_max_trials {
+        return Err("checkpoint strategy budget does not match the caller config".to_string());
+    }
+
+    // An absent caller strategy delegates the entire strategy choice to the
+    // full checkpoint. When one is supplied, its non-optional fields and each
+    // explicitly populated optional control are compatibility constraints.
+    let Some(requested_strategy) = requested.strategy.as_ref() else {
+        return Ok(());
+    };
+    if requested_strategy.strategy_type != saved_strategy.strategy_type {
+        return Err("checkpoint strategy type does not match the caller config".to_string());
+    }
+    if requested_strategy.refit_interval != saved_strategy.refit_interval {
+        return Err("checkpoint refit_interval does not match the caller config".to_string());
+    }
+    if requested_strategy.max_refit_samples != saved_strategy.max_refit_samples {
+        return Err("checkpoint max_refit_samples does not match the caller config".to_string());
+    }
+    if requested_strategy.max_refit_candidates != saved_strategy.max_refit_candidates {
+        return Err("checkpoint max_refit_candidates does not match the caller config".to_string());
+    }
+
+    macro_rules! require_explicit_match {
+        ($field:ident) => {
+            if requested_strategy.$field.is_some()
+                && requested_strategy.$field != saved_strategy.$field
+            {
+                return Err(format!(
+                    "checkpoint {} does not match the caller config",
+                    stringify!($field)
+                ));
+            }
+        };
+    }
+    require_explicit_match!(exploration_budget);
+    require_explicit_match!(ongoing_exploration_period);
+    if let Some(requested_seed) = requested_strategy.seed
+        && saved_strategy.seed != Some(requested_seed)
+    {
+        // A migrated Auto pair that cannot be reconstructed under today's
+        // folded-seed rule is deliberately represented as `seed: null`. An
+        // explicitly configured resume can still prove it is the original
+        // historical seed by matching both serialized sampler seeds exactly.
+        let matches_serialized_pair = saved_strategy.seed.is_none()
+            && serialized_auto_seeds.is_some_and(|pair| {
+                pair.current_config_seed() == Some(requested_seed)
+                    || pair.matches_legacy_explicit_seed(requested_seed)
+            });
+        let matches_legacy_sobol = legacy_truncated_sobol_seed
+            .is_some_and(|sobol_seed| sobol_seed == requested_seed as u32);
+        if !matches_serialized_pair && !matches_legacy_sobol {
+            return Err("checkpoint seed does not match the caller config".to_string());
+        }
+    }
+    require_explicit_match!(elite_fraction);
+    require_explicit_match!(max_components);
+    require_explicit_match!(min_elite_samples);
+    Ok(())
 }
 
 /// Configuration for automatic checkpointing.
@@ -1474,7 +1908,10 @@ fn validate_strategy_config(strategy: &StrategyConfig) -> Result<(), String> {
     if strategy.min_elite_samples == Some(0) {
         return Err("strategy.min_elite_samples must be at least 1".to_string());
     }
-    if let Some(min_elite_samples) = strategy.min_elite_samples {
+    if matches!(strategy.strategy_type.as_str(), "gmm" | "auto") {
+        let min_elite_samples = strategy
+            .min_elite_samples
+            .unwrap_or(DEFAULT_MIN_ELITE_SAMPLES);
         if min_elite_samples > strategy.max_refit_samples {
             return Err(format!(
                 "strategy.min_elite_samples must not exceed max_refit_samples ({}), got {min_elite_samples}",
@@ -3177,7 +3614,7 @@ impl HolaEngine {
                     inner: DynStrategyInner::Sobol(SobolStrategy::new(
                         // Fold high bits into low instead of truncating so seeds
                         // differing only in bits >= 32 produce distinct sequences.
-                        (seed ^ (seed >> 32)) as u32,
+                        fold_sobol_seed(seed),
                     )),
                 },
                 None,
@@ -3190,12 +3627,14 @@ impl HolaEngine {
                         let total = max_trials.unwrap_or(200);
                         AutoStrategy::default_exploration_budget(total, dim)
                     });
-                let elite_fraction = strategy_cfg.and_then(|s| s.elite_fraction).unwrap_or(0.25);
+                let elite_fraction = strategy_cfg
+                    .and_then(|s| s.elite_fraction)
+                    .unwrap_or(DEFAULT_ELITE_FRACTION);
                 // Anchor the cadence at the first statistically permitted fit.
-                // With the legacy floor of one this is exactly the historical
-                // K0 schedule; an explicit larger floor waits until that many
-                // completed observations exist and then refits at the requested
-                // interval from that boundary.
+                // With the historical floor of one this is exactly the old K0
+                // schedule; a larger floor waits until that many completed
+                // observations exist and then refits at the requested interval
+                // from that boundary.
                 let first_refit_trials = exploration_budget.max(min_elite_samples);
                 effective_exploration_budget = Some(exploration_budget);
                 effective_elite_fraction = Some(elite_fraction);
@@ -4229,6 +4668,149 @@ impl HolaEngine {
         }
     }
 
+    /// Construct and load a study from a caller configuration plus checkpoint.
+    ///
+    /// This is the configured-resume counterpart to [`Self::load_from_checkpoint`].
+    /// A full checkpoint owns its exact sampling semantics, so the returned
+    /// engine is reconstructed from the checkpoint's migrated embedded config
+    /// rather than from newly resolved defaults. Structural study fields and
+    /// every strategy control explicitly supplied by the caller must match;
+    /// calibration controls omitted by the caller inherit the checkpoint's
+    /// recorded or historical value. The caller's operational checkpoint
+    /// settings (directory, cadence, retention, and load path) are reapplied.
+    /// Leaderboard-only checkpoints instead use the caller config unchanged.
+    ///
+    /// The existing [`Self::load_checkpoint_with_fallback`] method remains
+    /// strict because an already-constructed engine cannot replace immutable
+    /// refit controls safely.
+    pub async fn load_configured_checkpoint(
+        requested_config: StudyConfig,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<(Self, CheckpointLoadKind)> {
+        let path = path.as_ref().to_path_buf();
+        let mut raw = tokio::task::spawn_blocking(move || read_checkpoint_document(&path))
+            .await
+            .map_err(|error| std::io::Error::other(format!("checkpoint task failed: {error}")))??;
+        let has_strategy_state = raw
+            .get("checkpoint")
+            .unwrap_or(&raw)
+            .get("strategy_state")
+            .is_some();
+
+        if !has_strategy_state {
+            let engine = Self::from_config(requested_config)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            engine.load_leaderboard_checkpoint_document(raw).await?;
+            return Ok((engine, CheckpointLoadKind::Leaderboard));
+        }
+
+        let operational_checkpoint = requested_config.checkpoint.clone();
+        let mut resume_config = if let Some(config_value) = raw.get("config") {
+            let strategy_was_null = checkpoint_embedded_strategy_was_absent_or_null(&raw);
+            let mut saved_config: StudyConfig = serde_json::from_value(config_value.clone())
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            saved_config
+                .resolve_legacy_checkpoint_defaults(&raw)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            if strategy_was_null {
+                apply_v1_caller_controls_not_encoded_in_state(
+                    &mut saved_config,
+                    &requested_config,
+                    &raw,
+                )
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            }
+            let serialized_auto_seeds = serialized_auto_seed_pair(&raw)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let legacy_truncated_sobol_seed = if strategy_was_null
+                && checkpoint_format_version(&raw) == Some(1)
+            {
+                serialized_sobol_seed(&raw)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+            } else {
+                None
+            };
+            validate_configured_checkpoint_request(
+                &requested_config,
+                &saved_config,
+                serialized_auto_seeds,
+                legacy_truncated_sobol_seed,
+            )
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            saved_config
+        } else {
+            // Direct full checkpoints predate embedded study configs. The
+            // caller supplies the structure; omitted strategy controls are
+            // migrated from the supported serialized legacy strategy state.
+            let mut legacy_config = requested_config.clone();
+            legacy_config
+                .resolve_legacy_checkpoint_defaults(&raw)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            if let Some(pair) = serialized_auto_seed_pair(&raw)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+            {
+                let strategy = legacy_config.strategy.as_mut().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "legacy Auto checkpoint requires a configured strategy",
+                    )
+                })?;
+                if let Some(requested_seed) = strategy.seed
+                    && pair.current_config_seed() != Some(requested_seed)
+                    && !pair.matches_legacy_explicit_seed(requested_seed)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "checkpoint seed does not match the caller config",
+                    ));
+                }
+                strategy.seed = pair.current_config_seed();
+            } else if let Some(sobol_seed) = serialized_sobol_seed(&raw)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+            {
+                let strategy = legacy_config.strategy.as_mut().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "legacy Sobol checkpoint requires a configured strategy",
+                    )
+                })?;
+                if let Some(requested_seed) = strategy.seed
+                    && sobol_seed != requested_seed as u32
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "checkpoint seed does not match the caller config",
+                    ));
+                }
+                // The serialized `u32` is a truthful current public seed. The
+                // original high bits cannot be recovered, so do not re-export
+                // the caller's pre-fold `u64` as if current folding reproduced
+                // this state.
+                strategy.seed = Some(u64::from(sobol_seed));
+            }
+            legacy_config
+        };
+        resume_config.checkpoint = operational_checkpoint;
+        let mut embedded_resume_config = resume_config.clone();
+        embedded_resume_config.checkpoint = None;
+        raw.as_object_mut()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "full checkpoint document must be a JSON object",
+                )
+            })?
+            .insert(
+                "config".to_string(),
+                serde_json::to_value(embedded_resume_config)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+            );
+        let engine = Self::from_config(resume_config)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        engine.load_full_checkpoint_document(raw).await?;
+        Ok((engine, CheckpointLoadKind::Full))
+    }
+
     // =========================================================================
     // Persistence (internal)
     // =========================================================================
@@ -4494,9 +5076,9 @@ impl HolaEngine {
         if let Some(config_value) = raw.get("config") {
             let mut saved_config: StudyConfig = serde_json::from_value(config_value.clone())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            if let Some(strategy) = &mut saved_config.strategy {
-                strategy.resolve_calibration_control_defaults();
-            }
+            saved_config
+                .resolve_legacy_checkpoint_defaults(&raw)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
             loaded_strategy_template = saved_config.strategy.clone();
             let mut current_config = current_study_config.clone();
             // A loaded strategy replaces its sampler state wholesale. Its seed
@@ -4543,7 +5125,7 @@ impl HolaEngine {
                 ),
             };
             let mut strategy_template = strategy_template;
-            let resolved_seed = strategy.resolved_seed();
+            let representable_seed = strategy.representable_config_seed();
             let strategy_config = strategy_template.as_mut().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -4551,10 +5133,20 @@ impl HolaEngine {
                 )
             })?;
             // Older direct full checkpoints did not carry config metadata. Use
-            // the loaded sampler's real seed so subsequent exports never claim
-            // the discarded target engine's seed.
-            if !has_embedded_config || strategy_config.seed.is_none() {
-                strategy_config.seed = Some(resolved_seed);
+            // a seed only when it truthfully reconstructs the serialized
+            // sampler state; a historical Auto pair can require `None` because
+            // its Sobol and GMM seeds were independent or used truncation.
+            // Embedded Auto `seed: null` is itself legacy provenance and must
+            // remain null through subsequent save/load cycles. Other sampler
+            // variants always have a truthful single-seed representation, so
+            // retain the established behavior of materializing their seed.
+            let preserve_embedded_auto_none = has_embedded_config
+                && strategy_config.seed.is_none()
+                && matches!(&strategy.inner, DynStrategyInner::Auto(_));
+            if !preserve_embedded_auto_none
+                && (!has_embedded_config || strategy_config.seed.is_none())
+            {
+                strategy_config.seed = representable_seed;
             }
             let strategy_config = strategy_config.clone();
             let mut replacement = HolaEngineState {
@@ -4638,8 +5230,9 @@ impl HolaEngine {
                 .to_string()
         })?;
 
-        let config: StudyConfig = serde_json::from_value(config_value.clone())
+        let mut config: StudyConfig = serde_json::from_value(config_value.clone())
             .map_err(|e| format!("Failed to parse StudyConfig from checkpoint: {e}"))?;
+        config.resolve_legacy_checkpoint_defaults(&raw)?;
 
         let engine = Self::from_config(config)?;
         engine
@@ -5420,6 +6013,18 @@ mod tests {
                 .unwrap_err()
                 .contains("min_elite_samples")
         );
+
+        strategy.min_elite_samples = None;
+        strategy.max_refit_samples = DEFAULT_MIN_ELITE_SAMPLES - 1;
+        assert!(
+            validate_strategy_config(&strategy)
+                .unwrap_err()
+                .contains("must not exceed max_refit_samples")
+        );
+
+        strategy.strategy_type = "random".to_string();
+        validate_strategy_config(&strategy)
+            .expect("unused GMM elite defaults must not constrain random strategies");
     }
 
     #[test]
@@ -5842,6 +6447,65 @@ mod tests {
         }
     }
 
+    fn downgrade_full_checkpoint_to_historical_v1(document: &mut serde_json::Value) {
+        document["config"]["strategy"] = serde_json::Value::Null;
+        document["checkpoint"]["metadata"]["format_version"] = serde_json::json!(1);
+        document.as_object_mut().unwrap().remove("runtime_state");
+
+        let inner = document["checkpoint"]["strategy_state"]["inner"]
+            .as_object_mut()
+            .unwrap();
+        if inner.get("type").and_then(serde_json::Value::as_str) == Some("auto") {
+            inner.remove("ongoing_exploration_period");
+            inner.remove("gmm_sampling_ready");
+            inner.remove("issued_count");
+            inner.remove("gmm_origin_suggestions");
+            let gmm = inner["gmm"].as_object_mut().unwrap();
+            if let Some(counter) = gmm["counter"].get("value").cloned() {
+                gmm.insert("counter".to_string(), counter);
+            }
+            gmm.remove("epoch_start");
+            gmm.remove("refit_epoch");
+        }
+    }
+
+    fn downgrade_full_checkpoint_to_v1_with_embedded_strategy(document: &mut serde_json::Value) {
+        let strategy = document["config"]["strategy"].clone();
+        downgrade_full_checkpoint_to_historical_v1(document);
+        document["config"]["strategy"] = strategy;
+    }
+
+    fn historical_auto_config(seed: Option<u64>) -> StudyConfig {
+        let mut config = single_objective_config("gmm");
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(8);
+        strategy.ongoing_exploration_period = Some(LEGACY_DEFAULT_ONGOING_EXPLORATION_PERIOD);
+        strategy.seed = seed;
+        strategy.elite_fraction = Some(LEGACY_DEFAULT_ELITE_FRACTION);
+        strategy.max_components = Some(LEGACY_DEFAULT_MAX_COMPONENTS);
+        strategy.min_elite_samples = Some(LEGACY_DEFAULT_MIN_ELITE_SAMPLES);
+        config
+    }
+
+    async fn install_historical_auto_seed_pair(
+        engine: &HolaEngine,
+        sobol_seed: u32,
+        gmm_seed: u64,
+        exposed_seed: Option<u64>,
+    ) {
+        let mut state = engine.state.write().await;
+        let DynStrategyInner::Auto(auto) = &mut state.strategy.inner else {
+            panic!("expected auto strategy");
+        };
+        assert_eq!(auto.trial_count, 0);
+        assert_eq!(auto.issued_count.load(Ordering::Relaxed), 0);
+        let refit_config = auto.gmm.get_refit_config().clone();
+        auto.sobol = SobolStrategy::new(sobol_seed);
+        auto.gmm = GmmStrategy::uniform_prior(gmm_seed, 1, AUTO_GMM_PRIOR_VARIANCE).unwrap();
+        auto.gmm.set_refit_config(refit_config);
+        state.strategy_template.as_mut().unwrap().seed = exposed_seed;
+    }
+
     #[test]
     fn auto_strategy_period_has_no_off_by_one_and_zero_disables_it() {
         use opt_engine::strategies::GmmParams;
@@ -5895,16 +6559,18 @@ mod tests {
         let restored: AutoStrategy = serde_json::from_value(encoded).unwrap();
         assert_eq!(
             restored.ongoing_exploration_period,
-            DEFAULT_ONGOING_EXPLORATION_PERIOD
+            LEGACY_DEFAULT_ONGOING_EXPLORATION_PERIOD
         );
     }
 
     #[tokio::test]
-    async fn omitted_calibration_controls_resolve_to_legacy_values() {
+    async fn omitted_calibration_controls_resolve_to_calibrated_values() {
         let config = single_objective_config("gmm");
-        let explicit_legacy = {
+        let explicit_defaults = {
             let mut config = config.clone();
             let strategy = config.strategy.as_mut().unwrap();
+            strategy.exploration_budget = Some(AutoStrategy::default_exploration_budget(200, 1));
+            strategy.elite_fraction = Some(DEFAULT_ELITE_FRACTION);
             strategy.ongoing_exploration_period = Some(DEFAULT_ONGOING_EXPLORATION_PERIOD);
             strategy.max_components = Some(DEFAULT_MAX_COMPONENTS);
             strategy.min_elite_samples = Some(DEFAULT_MIN_ELITE_SAMPLES);
@@ -5912,9 +6578,14 @@ mod tests {
         };
 
         let implicit = HolaEngine::from_config(config).unwrap();
-        let explicit = HolaEngine::from_config(explicit_legacy).unwrap();
+        let explicit = HolaEngine::from_config(explicit_defaults).unwrap();
         let exported = implicit.study_config().await;
         let exported = exported.strategy.unwrap();
+        assert_eq!(
+            exported.exploration_budget,
+            Some(AutoStrategy::default_exploration_budget(200, 1))
+        );
+        assert_eq!(exported.elite_fraction, Some(DEFAULT_ELITE_FRACTION));
         assert_eq!(
             exported.ongoing_exploration_period,
             Some(DEFAULT_ONGOING_EXPLORATION_PERIOD)
@@ -5922,7 +6593,7 @@ mod tests {
         assert_eq!(exported.max_components, Some(DEFAULT_MAX_COMPONENTS));
         assert_eq!(exported.min_elite_samples, Some(DEFAULT_MIN_ELITE_SAMPLES));
 
-        // The omitted and explicit legacy forms must remain behaviorally
+        // The omitted and explicit calibrated forms must remain behaviorally
         // identical, including the first refit and periodic exploration.
         for _ in 0..40 {
             let implicit_trial = implicit.ask().await.unwrap();
@@ -5984,6 +6655,7 @@ mod tests {
         let strategy = config.strategy.as_mut().unwrap();
         strategy.exploration_budget = Some(1);
         strategy.ongoing_exploration_period = Some(4);
+        strategy.min_elite_samples = Some(1);
         strategy.refit_interval = 1;
         let engine = HolaEngine::from_config(config).unwrap();
 
@@ -6092,6 +6764,7 @@ mod tests {
         let strategy = config.strategy.as_mut().unwrap();
         strategy.exploration_budget = Some(1);
         strategy.ongoing_exploration_period = Some(0);
+        strategy.min_elite_samples = Some(1);
         strategy.refit_interval = 1;
         let source = HolaEngine::from_config(config).unwrap();
 
@@ -6405,7 +7078,15 @@ mod tests {
     async fn checkpoint_missing_calibration_fields_loads_with_legacy_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy-controls.json");
-        let source = HolaEngine::from_config(single_objective_config("gmm")).unwrap();
+        let mut config = single_objective_config("gmm");
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(AutoStrategy::legacy_default_exploration_budget(200, 1));
+        strategy.elite_fraction = Some(LEGACY_DEFAULT_ELITE_FRACTION);
+        strategy.ongoing_exploration_period = Some(LEGACY_DEFAULT_ONGOING_EXPLORATION_PERIOD);
+        strategy.max_components = Some(LEGACY_DEFAULT_MAX_COMPONENTS);
+        strategy.min_elite_samples = Some(LEGACY_DEFAULT_MIN_ELITE_SAMPLES);
+        strategy.max_refit_samples = 4;
+        let source = HolaEngine::from_config(config).unwrap();
         let trial = source.ask().await.unwrap();
         source
             .tell(trial.trial_id, serde_json::json!({"loss": 0.5}))
@@ -6416,6 +7097,8 @@ mod tests {
         let mut legacy: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let strategy_config = legacy["config"]["strategy"].as_object_mut().unwrap();
+        strategy_config.remove("exploration_budget");
+        strategy_config.remove("elite_fraction");
         strategy_config.remove("ongoing_exploration_period");
         strategy_config.remove("max_components");
         strategy_config.remove("min_elite_samples");
@@ -6428,11 +7111,616 @@ mod tests {
         let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
         let strategy = restored.study_config().await.strategy.unwrap();
         assert_eq!(
-            strategy.ongoing_exploration_period,
-            Some(DEFAULT_ONGOING_EXPLORATION_PERIOD)
+            strategy.exploration_budget,
+            Some(AutoStrategy::legacy_default_exploration_budget(200, 1))
         );
-        assert_eq!(strategy.max_components, Some(DEFAULT_MAX_COMPONENTS));
-        assert_eq!(strategy.min_elite_samples, Some(DEFAULT_MIN_ELITE_SAMPLES));
+        assert_eq!(strategy.elite_fraction, Some(LEGACY_DEFAULT_ELITE_FRACTION));
+        assert_eq!(
+            strategy.ongoing_exploration_period,
+            Some(LEGACY_DEFAULT_ONGOING_EXPLORATION_PERIOD)
+        );
+        assert_eq!(strategy.max_components, Some(LEGACY_DEFAULT_MAX_COMPONENTS));
+        assert_eq!(
+            strategy.min_elite_samples,
+            Some(LEGACY_DEFAULT_MIN_ELITE_SAMPLES)
+        );
+        assert_eq!(strategy.max_refit_samples, 4);
+
+        let source_next = source.ask().await.unwrap();
+        let restored_next = restored.ask().await.unwrap();
+        assert_eq!(source_next.trial_id, restored_next.trial_id);
+        assert_eq!(source_next.params, restored_next.params);
+    }
+
+    #[tokio::test]
+    async fn configured_checkpoint_load_inherits_only_omitted_calibration_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-adoption.json");
+        let checkpoint_dir = dir.path().join("continued-checkpoints");
+        let mut legacy_config = single_objective_config("gmm");
+        let strategy = legacy_config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(AutoStrategy::legacy_default_exploration_budget(200, 1));
+        strategy.elite_fraction = Some(LEGACY_DEFAULT_ELITE_FRACTION);
+        strategy.ongoing_exploration_period = Some(LEGACY_DEFAULT_ONGOING_EXPLORATION_PERIOD);
+        strategy.max_components = Some(LEGACY_DEFAULT_MAX_COMPONENTS);
+        strategy.min_elite_samples = Some(LEGACY_DEFAULT_MIN_ELITE_SAMPLES);
+        let source = HolaEngine::from_config(legacy_config).unwrap();
+        let first = source.ask().await.unwrap();
+        source
+            .tell(
+                first.trial_id,
+                serde_json::json!({"loss": first.params["x"]}),
+            )
+            .await
+            .unwrap();
+        source.save_full_checkpoint(&path, None).await.unwrap();
+
+        let mut requested = single_objective_config("gmm");
+        requested.checkpoint = Some(CheckpointConfig {
+            directory: checkpoint_dir.to_string_lossy().into_owned(),
+            interval: 1,
+            max_checkpoints: Some(2),
+            load_from: Some(path.to_string_lossy().into_owned()),
+        });
+        let (restored, kind) = HolaEngine::load_configured_checkpoint(requested.clone(), &path)
+            .await
+            .unwrap();
+        assert_eq!(kind, CheckpointLoadKind::Full);
+        let restored_strategy = restored.study_config().await.strategy.unwrap();
+        assert_eq!(
+            restored_strategy.exploration_budget,
+            Some(AutoStrategy::legacy_default_exploration_budget(200, 1))
+        );
+        assert_eq!(
+            restored_strategy.elite_fraction,
+            Some(LEGACY_DEFAULT_ELITE_FRACTION)
+        );
+        assert_eq!(
+            restored_strategy.ongoing_exploration_period,
+            Some(LEGACY_DEFAULT_ONGOING_EXPLORATION_PERIOD)
+        );
+        assert_eq!(
+            restored_strategy.max_components,
+            Some(LEGACY_DEFAULT_MAX_COMPONENTS)
+        );
+        assert_eq!(
+            restored_strategy.min_elite_samples,
+            Some(LEGACY_DEFAULT_MIN_ELITE_SAMPLES)
+        );
+
+        let source_next = source.ask().await.unwrap();
+        let restored_next = restored.ask().await.unwrap();
+        assert_eq!(source_next.trial_id, restored_next.trial_id);
+        assert_eq!(source_next.params, restored_next.params);
+        restored
+            .tell(
+                restored_next.trial_id,
+                serde_json::json!({"loss": restored_next.params["x"]}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            std::fs::read_dir(&checkpoint_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json")),
+            "caller auto-checkpoint settings must remain active after full resume"
+        );
+
+        requested.strategy.as_mut().unwrap().elite_fraction = Some(DEFAULT_ELITE_FRACTION);
+        let checkpoint_before_conflict = std::fs::read(&path).unwrap();
+        let error = HolaEngine::load_configured_checkpoint(requested, &path)
+            .await
+            .err()
+            .expect("an explicit conflicting control must reject configured resume");
+        assert!(error.to_string().contains("elite_fraction"));
+        assert_eq!(std::fs::read(&path).unwrap(), checkpoint_before_conflict);
+    }
+
+    #[tokio::test]
+    async fn configured_v1_null_strategy_uses_caller_refit_controls_and_continues_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1-null-strategy.json");
+        let mut source_config = single_objective_config("gmm");
+        let strategy = source_config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(4);
+        strategy.refit_interval = 7;
+        strategy.elite_fraction = Some(0.4);
+        strategy.ongoing_exploration_period = Some(LEGACY_DEFAULT_ONGOING_EXPLORATION_PERIOD);
+        strategy.max_components = Some(2);
+        strategy.min_elite_samples = Some(2);
+        strategy.max_refit_samples = 17;
+        strategy.max_refit_candidates = 53;
+        let source = HolaEngine::from_config(source_config.clone()).unwrap();
+        for _ in 0..3 {
+            let trial = source.ask().await.unwrap();
+            source
+                .tell(
+                    trial.trial_id,
+                    serde_json::json!({"loss": trial.params["x"]}),
+                )
+                .await
+                .unwrap();
+        }
+        source.save_full_checkpoint(&path, None).await.unwrap();
+        let mut v1: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        downgrade_full_checkpoint_to_historical_v1(&mut v1);
+        std::fs::write(&path, serde_json::to_vec_pretty(&v1).unwrap()).unwrap();
+
+        let (restored, kind) = HolaEngine::load_configured_checkpoint(source_config, &path)
+            .await
+            .unwrap();
+        assert_eq!(kind, CheckpointLoadKind::Full);
+        let restored_strategy = restored.study_config().await.strategy.unwrap();
+        assert_eq!(restored_strategy.refit_interval, 7);
+        assert_eq!(restored_strategy.elite_fraction, Some(0.4));
+        assert_eq!(restored_strategy.min_elite_samples, Some(2));
+        assert_eq!(restored_strategy.max_refit_samples, 17);
+        assert_eq!(restored_strategy.max_refit_candidates, 53);
+        assert_eq!(restored_strategy.exploration_budget, Some(4));
+        assert_eq!(restored_strategy.max_components, Some(2));
+
+        let source_next = source.ask().await.unwrap();
+        let restored_next = restored.ask().await.unwrap();
+        assert_eq!(source_next.trial_id, restored_next.trial_id);
+        assert_eq!(source_next.params, restored_next.params);
+        let next_loss = source_next.params["x"].as_f64().unwrap();
+        source
+            .tell(source_next.trial_id, serde_json::json!({"loss": next_loss}))
+            .await
+            .unwrap();
+        restored
+            .tell(
+                restored_next.trial_id,
+                serde_json::json!({"loss": next_loss}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(source.strategy_diagnostics().await.gmm_fit_epoch, Some(1));
+        assert_eq!(restored.strategy_diagnostics().await.gmm_fit_epoch, Some(1));
+        let source_after_refit = source.ask().await.unwrap();
+        let restored_after_refit = restored.ask().await.unwrap();
+        assert_eq!(source_after_refit.params, restored_after_refit.params);
+    }
+
+    #[tokio::test]
+    async fn v1_null_strategy_without_caller_uses_historical_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1-defaults.json");
+        let mut legacy_config = single_objective_config("gmm");
+        let strategy = legacy_config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(AutoStrategy::legacy_default_exploration_budget(200, 1));
+        strategy.elite_fraction = Some(LEGACY_DEFAULT_ELITE_FRACTION);
+        strategy.ongoing_exploration_period = Some(LEGACY_DEFAULT_ONGOING_EXPLORATION_PERIOD);
+        strategy.max_components = Some(LEGACY_DEFAULT_MAX_COMPONENTS);
+        strategy.min_elite_samples = Some(LEGACY_DEFAULT_MIN_ELITE_SAMPLES);
+        let source = HolaEngine::from_config(legacy_config).unwrap();
+        let trial = source.ask().await.unwrap();
+        source
+            .tell(
+                trial.trial_id,
+                serde_json::json!({"loss": trial.params["x"]}),
+            )
+            .await
+            .unwrap();
+        source.save_full_checkpoint(&path, None).await.unwrap();
+        let mut v1: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        downgrade_full_checkpoint_to_historical_v1(&mut v1);
+        std::fs::write(&path, serde_json::to_vec_pretty(&v1).unwrap()).unwrap();
+
+        let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+        let restored_strategy = restored.study_config().await.strategy.unwrap();
+        assert_eq!(
+            restored_strategy.elite_fraction,
+            Some(LEGACY_DEFAULT_ELITE_FRACTION)
+        );
+        assert_eq!(
+            restored_strategy.ongoing_exploration_period,
+            Some(LEGACY_DEFAULT_ONGOING_EXPLORATION_PERIOD)
+        );
+        assert_eq!(
+            restored_strategy.max_components,
+            Some(LEGACY_DEFAULT_MAX_COMPONENTS)
+        );
+        assert_eq!(
+            restored_strategy.min_elite_samples,
+            Some(LEGACY_DEFAULT_MIN_ELITE_SAMPLES)
+        );
+        let source_next = source.ask().await.unwrap();
+        let restored_next = restored.ask().await.unwrap();
+        assert_eq!(source_next.params, restored_next.params);
+    }
+
+    #[tokio::test]
+    async fn v1_null_strategy_infers_random_and_sobol_state() {
+        let dir = tempfile::tempdir().unwrap();
+        for strategy_type in ["random", "sobol"] {
+            let path = dir.path().join(format!("v1-{strategy_type}.json"));
+            let source = HolaEngine::from_config(single_objective_config(strategy_type)).unwrap();
+            let first = source.ask().await.unwrap();
+            source
+                .tell(
+                    first.trial_id,
+                    serde_json::json!({"loss": first.params["x"]}),
+                )
+                .await
+                .unwrap();
+            source.save_full_checkpoint(&path, None).await.unwrap();
+            let mut v1: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            downgrade_full_checkpoint_to_historical_v1(&mut v1);
+            std::fs::write(&path, serde_json::to_vec_pretty(&v1).unwrap()).unwrap();
+
+            let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+            assert_eq!(
+                restored
+                    .study_config()
+                    .await
+                    .strategy
+                    .unwrap()
+                    .strategy_type,
+                strategy_type
+            );
+            let source_next = source.ask().await.unwrap();
+            let restored_next = restored.ask().await.unwrap();
+            assert_eq!(source_next.trial_id, restored_next.trial_id);
+            assert_eq!(source_next.params, restored_next.params);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_auto_independent_seed_pair_stays_unrepresented_across_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy-independent-seeds.json");
+        let resaved_path = dir.path().join("resaved-independent-seeds.json");
+        let gmm_seed = 0x0123_4567_89ab_cdef;
+
+        // This is the exact old `seed: null` construction: deterministic Sobol
+        // seed 42 plus an independently generated full-width GMM seed.
+        let source = HolaEngine::from_config(historical_auto_config(None)).unwrap();
+        install_historical_auto_seed_pair(&source, 42, gmm_seed, None).await;
+        for _ in 0..3 {
+            let trial = source.ask().await.unwrap();
+            source
+                .tell(
+                    trial.trial_id,
+                    serde_json::json!({"loss": trial.params["x"]}),
+                )
+                .await
+                .unwrap();
+        }
+        source
+            .save_full_checkpoint(&legacy_path, None)
+            .await
+            .unwrap();
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&legacy_path).unwrap()).unwrap();
+        downgrade_full_checkpoint_to_historical_v1(&mut legacy);
+        let mut direct = legacy.clone();
+        direct.as_object_mut().unwrap().remove("config");
+        std::fs::write(&legacy_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let restored = HolaEngine::load_from_checkpoint(&legacy_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.study_config().await.strategy.unwrap().seed,
+            None,
+            "an independent historical pair has no truthful current config seed"
+        );
+
+        // A direct legacy full load must replace the temporary target's seed
+        // metadata with the same honest `None`, while retaining exact sampler
+        // continuation.
+        let direct_target = HolaEngine::from_config(historical_auto_config(Some(999))).unwrap();
+        direct_target
+            .load_full_checkpoint_document(direct)
+            .await
+            .unwrap();
+        assert_eq!(
+            direct_target.study_config().await.strategy.unwrap().seed,
+            None
+        );
+
+        let source_next = source.ask().await.unwrap();
+        let restored_next = restored.ask().await.unwrap();
+        let direct_next = direct_target.ask().await.unwrap();
+        assert_eq!(source_next.params, restored_next.params);
+        assert_eq!(source_next.params, direct_next.params);
+        for (engine, trial) in [
+            (&source, source_next),
+            (&restored, restored_next),
+            (&direct_target, direct_next),
+        ] {
+            engine
+                .tell(
+                    trial.trial_id,
+                    serde_json::json!({"loss": trial.params["x"]}),
+                )
+                .await
+                .unwrap();
+        }
+
+        restored
+            .save_full_checkpoint(&resaved_path, None)
+            .await
+            .unwrap();
+        let resaved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&resaved_path).unwrap()).unwrap();
+        assert!(resaved["config"]["strategy"]["seed"].is_null());
+        let reloaded = HolaEngine::load_from_checkpoint(&resaved_path)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.study_config().await.strategy.unwrap().seed, None);
+        assert_eq!(
+            restored.ask().await.unwrap().params,
+            reloaded.ask().await.unwrap().params,
+            "resaving must not reinterpret the independent pair as a folded seed"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_v1_auto_resume_accepts_only_the_exact_truncated_high_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let modern_path = dir.path().join("modern-inconsistent-seeds.json");
+        let non_null_v1_path = dir.path().join("v1-non-null-inconsistent-seeds.json");
+        let unsupported_null_path = dir.path().join("modern-unsupported-null-seeds.json");
+        let legacy_path = dir.path().join("legacy-high-seed.json");
+        let resaved_path = dir.path().join("resaved-high-seed.json");
+        let high_seed = 0x0000_0001_0000_0007;
+        assert_ne!(fold_sobol_seed(high_seed), high_seed as u32);
+
+        let source = HolaEngine::from_config(historical_auto_config(Some(high_seed))).unwrap();
+        // Old explicit-seed semantics retained the full seed for the GMM and
+        // truncated it to the low 32 bits for Sobol.
+        install_historical_auto_seed_pair(&source, high_seed as u32, high_seed, Some(high_seed))
+            .await;
+        for _ in 0..3 {
+            let trial = source.ask().await.unwrap();
+            source
+                .tell(
+                    trial.trial_id,
+                    serde_json::json!({"loss": trial.params["x"]}),
+                )
+                .await
+                .unwrap();
+        }
+        source
+            .save_full_checkpoint(&modern_path, None)
+            .await
+            .unwrap();
+
+        // The same mismatch is not accepted as a modern checkpoint: an
+        // embedded concrete seed still requires the current folded pair.
+        let modern_error = HolaEngine::load_from_checkpoint(&modern_path)
+            .await
+            .err()
+            .expect("a modern checkpoint must enforce current seed folding");
+        assert!(modern_error.contains("auto strategy seeds"));
+
+        // The fold and the non-null strategy template shipped together while
+        // checkpoint format version was still one. Such a checkpoint must not
+        // be reinterpreted as a pre-fold null-strategy artifact.
+        let mut non_null_v1: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&modern_path).unwrap()).unwrap();
+        downgrade_full_checkpoint_to_v1_with_embedded_strategy(&mut non_null_v1);
+        std::fs::write(
+            &non_null_v1_path,
+            serde_json::to_vec_pretty(&non_null_v1).unwrap(),
+        )
+        .unwrap();
+        let non_null_v1_error = HolaEngine::load_from_checkpoint(&non_null_v1_path)
+            .await
+            .err()
+            .expect("v1 with a concrete strategy must enforce current seed folding");
+        assert!(non_null_v1_error.contains("auto strategy seeds"));
+
+        let mut unsupported_null: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&modern_path).unwrap()).unwrap();
+        unsupported_null["config"]["strategy"]["seed"] = serde_json::Value::Null;
+        unsupported_null["checkpoint"]["strategy_state"]["inner"]["sobol"]["seed"] =
+            serde_json::json!(8);
+        std::fs::write(
+            &unsupported_null_path,
+            serde_json::to_vec_pretty(&unsupported_null).unwrap(),
+        )
+        .unwrap();
+        let unsupported_error = HolaEngine::load_from_checkpoint(&unsupported_null_path)
+            .await
+            .err()
+            .expect("seed null must only admit a supported historical pair");
+        assert!(unsupported_error.contains("seed relationship"));
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&modern_path).unwrap()).unwrap();
+        downgrade_full_checkpoint_to_historical_v1(&mut legacy);
+        std::fs::write(&legacy_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let mut wrong_config = historical_auto_config(Some(high_seed ^ (1 << 40)));
+        wrong_config.max_trials = None;
+        let wrong = HolaEngine::load_configured_checkpoint(wrong_config, &legacy_path)
+            .await
+            .err()
+            .expect("a different explicit seed must be rejected");
+        assert!(wrong.to_string().contains("seed"));
+
+        let (restored, kind) = HolaEngine::load_configured_checkpoint(
+            historical_auto_config(Some(high_seed)),
+            &legacy_path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(kind, CheckpointLoadKind::Full);
+        assert_eq!(
+            restored.study_config().await.strategy.unwrap().seed,
+            None,
+            "the exact old seed authorizes resume but cannot describe the pair under current folding"
+        );
+        assert_eq!(
+            source.ask().await.unwrap().params,
+            restored.ask().await.unwrap().params
+        );
+        restored
+            .save_full_checkpoint(&resaved_path, None)
+            .await
+            .unwrap();
+        let resaved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&resaved_path).unwrap()).unwrap();
+        assert!(resaved["config"]["strategy"]["seed"].is_null());
+        let reloaded = HolaEngine::load_from_checkpoint(&resaved_path)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.study_config().await.strategy.unwrap().seed, None);
+        assert_eq!(
+            restored.ask().await.unwrap().params,
+            reloaded.ask().await.unwrap().params
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_non_null_auto_with_folded_high_seed_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1-folded-high-seed.json");
+        let high_seed = 0x0000_0001_0000_0007;
+        let source = HolaEngine::from_config(historical_auto_config(Some(high_seed))).unwrap();
+        for _ in 0..3 {
+            let trial = source.ask().await.unwrap();
+            source
+                .tell(
+                    trial.trial_id,
+                    serde_json::json!({"loss": trial.params["x"]}),
+                )
+                .await
+                .unwrap();
+        }
+        source.save_full_checkpoint(&path, None).await.unwrap();
+        let mut v1: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        downgrade_full_checkpoint_to_v1_with_embedded_strategy(&mut v1);
+        std::fs::write(&path, serde_json::to_vec_pretty(&v1).unwrap()).unwrap();
+
+        let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+        assert_eq!(
+            restored.study_config().await.strategy.unwrap().seed,
+            Some(high_seed)
+        );
+        assert_eq!(
+            source.ask().await.unwrap().params,
+            restored.ask().await.unwrap().params
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_non_null_auto_with_independent_omitted_seed_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1-independent-omitted-seed.json");
+        let gmm_seed = 0x0123_4567_89ab_cdef;
+        let source = HolaEngine::from_config(historical_auto_config(None)).unwrap();
+        install_historical_auto_seed_pair(&source, 42, gmm_seed, None).await;
+        for _ in 0..3 {
+            let trial = source.ask().await.unwrap();
+            source
+                .tell(
+                    trial.trial_id,
+                    serde_json::json!({"loss": trial.params["x"]}),
+                )
+                .await
+                .unwrap();
+        }
+        source.save_full_checkpoint(&path, None).await.unwrap();
+        let mut v1: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        downgrade_full_checkpoint_to_v1_with_embedded_strategy(&mut v1);
+        std::fs::write(&path, serde_json::to_vec_pretty(&v1).unwrap()).unwrap();
+
+        let restored = HolaEngine::load_from_checkpoint(&path).await.unwrap();
+        assert_eq!(restored.study_config().await.strategy.unwrap().seed, None);
+        assert_eq!(
+            source.ask().await.unwrap().params,
+            restored.ask().await.unwrap().params
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_v1_sobol_resume_accepts_the_historical_truncated_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let modern_path = dir.path().join("modern-sobol-seed-mismatch.json");
+        let legacy_path = dir.path().join("legacy-sobol-high-seed.json");
+        let direct_path = dir.path().join("direct-sobol-high-seed.json");
+        let high_seed = 0x0000_0001_0000_0007;
+
+        let mut source_config = single_objective_config("sobol");
+        source_config.strategy.as_mut().unwrap().seed = Some(high_seed);
+        let source = HolaEngine::from_config(source_config.clone()).unwrap();
+        {
+            let mut state = source.state.write().await;
+            state.strategy.inner = DynStrategyInner::Sobol(SobolStrategy::new(high_seed as u32));
+            state.strategy_template.as_mut().unwrap().seed = Some(high_seed);
+        }
+        for _ in 0..3 {
+            let trial = source.ask().await.unwrap();
+            source
+                .tell(
+                    trial.trial_id,
+                    serde_json::json!({"loss": trial.params["x"]}),
+                )
+                .await
+                .unwrap();
+        }
+        source
+            .save_full_checkpoint(&modern_path, None)
+            .await
+            .unwrap();
+
+        let modern_error = HolaEngine::load_from_checkpoint(&modern_path)
+            .await
+            .err()
+            .expect("modern Sobol checkpoints must enforce current seed folding");
+        assert!(modern_error.contains("folded seed"));
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&modern_path).unwrap()).unwrap();
+        downgrade_full_checkpoint_to_historical_v1(&mut legacy);
+        let mut direct = legacy.clone();
+        direct.as_object_mut().unwrap().remove("config");
+        std::fs::write(&legacy_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        std::fs::write(&direct_path, serde_json::to_vec_pretty(&direct).unwrap()).unwrap();
+
+        let mut wrong_config = source_config.clone();
+        wrong_config.strategy.as_mut().unwrap().seed = Some(high_seed + 1);
+        let wrong = HolaEngine::load_configured_checkpoint(wrong_config, &legacy_path)
+            .await
+            .err()
+            .expect("a different truncated Sobol seed must be rejected");
+        assert!(wrong.to_string().contains("seed"));
+
+        let (restored, kind) =
+            HolaEngine::load_configured_checkpoint(source_config.clone(), &legacy_path)
+                .await
+                .unwrap();
+        assert_eq!(kind, CheckpointLoadKind::Full);
+        assert_eq!(
+            restored.study_config().await.strategy.unwrap().seed,
+            Some(u64::from(high_seed as u32)),
+            "the serialized u32 is a truthful current seed even though the original high bits are not"
+        );
+        let (direct_restored, direct_kind) =
+            HolaEngine::load_configured_checkpoint(source_config, &direct_path)
+                .await
+                .unwrap();
+        assert_eq!(direct_kind, CheckpointLoadKind::Full);
+        assert_eq!(
+            direct_restored.study_config().await.strategy.unwrap().seed,
+            Some(u64::from(high_seed as u32))
+        );
+        let source_next = source.ask().await.unwrap();
+        assert_eq!(source_next.params, restored.ask().await.unwrap().params);
+        assert_eq!(
+            source_next.params,
+            direct_restored.ask().await.unwrap().params
+        );
     }
 
     #[tokio::test]
@@ -7495,6 +8783,7 @@ mod tests {
         let mut config = single_objective_config("gmm");
         let strategy = config.strategy.as_mut().unwrap();
         strategy.exploration_budget = Some(1);
+        strategy.min_elite_samples = Some(1);
         strategy.refit_interval = 20;
         let engine = HolaEngine::from_config(config).unwrap();
         engine.force_refit_failure.store(true, Ordering::SeqCst);

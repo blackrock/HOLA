@@ -135,10 +135,13 @@ class Gmm:
         refit_interval: How often the GMM is refit, in completed trials
             (default: 20).
         elite_fraction: Fraction of top trials used for GMM refitting
-            (default: 0.25). Must be between 0.0 and 1.0.
+            (default: 0.125). Must be between 0.0 and 1.0.
         exploration_budget: Number of Sobol exploration trials before GMM
-            exploitation begins. When omitted, computed automatically from
-            the total budget and number of dimensions.
+            exploitation begins. When omitted, doubles
+            ``min(floor(S/5), 50 + 2n)`` and rounds down to a power of two,
+            for total budget ``S`` and dimension ``n``. When ``max_trials``
+            is also omitted, the warm-up calculation uses ``S=200`` without
+            imposing a trial cap.
         max_refit_samples: Maximum elite samples used by one GMM fit
             (default: 4096).
         max_refit_candidates: Maximum retained trials ranked during elite
@@ -146,12 +149,11 @@ class Gmm:
             stratified coverage.
         ongoing_exploration_period: Period between Sobol exploration trials
             after GMM exploitation begins. ``None`` uses the default (currently
-            5), ``0`` disables ongoing exploration, and explicit periods must
-            be at least 2.
+            0, disabled), and explicit periods must be at least 2.
         max_components: Maximum number of Gaussian mixture components. When
-            omitted, uses the default (currently 3). Must be at least 1.
+            omitted, uses the default (currently 1). Must be at least 1.
         min_elite_samples: Minimum feasible elite samples required before GMM
-            fitting. When omitted, uses the default (currently 1). Must be at
+            fitting. When omitted, uses the default (currently 5). Must be at
             least 1 and must not exceed ``max_refit_samples``.
 
     Raises:
