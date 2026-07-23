@@ -15,7 +15,8 @@ from typing import Any, cast
 import optuna
 import pytest
 
-from benchmarks.adapters.base import HpoOptimizationResult
+import benchmarks.adapters.hpo as hpo_adapter_module
+from benchmarks.adapters.base import EmpiricalExploitationError, HpoOptimizationResult
 from benchmarks.adapters.hpo import (
     HolaHpoAdapter,
     OptunaTpeHpoAdapter,
@@ -139,7 +140,6 @@ def test_native_space_translation_preserves_types_scales_and_choices() -> None:
     [
         HolaHpoAdapter("random"),
         HolaHpoAdapter("sobol"),
-        HolaHpoAdapter("gmm"),
         OptunaTpeHpoAdapter(),
     ],
     ids=lambda adapter: adapter.name,
@@ -159,6 +159,42 @@ def test_native_hpo_adapters_use_exact_validation_budget(adapter: object) -> Non
     assert isinstance(result.best_params["n_estimators"], int)
     assert isinstance(result.best_params["max_depth"], int)
     assert result.best_params["loss"] in {"squared_error", "huber"}
+
+
+def test_gmm_gate_failure_preserves_validation_count_and_never_calls_heldout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evaluator = RecordingEvaluator(_toy_problem(), validation_budget=5)
+    problem = _toy_problem(evaluator)
+    evaluator.problem = problem
+
+    def fail_gate(study: object, completed_evaluations: int) -> None:
+        del study
+        raise EmpiricalExploitationError(
+            completed_evaluations,
+            {
+                "completed_evaluations": completed_evaluations,
+                "gmm_fit_epoch": 1,
+                "gmm_origin_suggestions": 4,
+                "gmm_sampling_ready": True,
+                "issued_suggestions": completed_evaluations,
+            },
+        )
+
+    monkeypatch.setattr(
+        hpo_adapter_module,
+        "require_empirical_gmm_exploitation",
+        fail_gate,
+    )
+
+    row = _run_hpo_one(problem, HolaHpoAdapter("gmm"), budget=5, run_id=0)
+
+    assert row["status"] == "error"
+    assert row["n_validation_evaluations"] == 5
+    assert row["n_heldout_evaluations"] == 0
+    assert "EmpiricalExploitationError" in row["error"]
+    assert "gmm_origin_suggestions" in row["error"]
+    assert evaluator.events == ["validation"] * 5
 
 
 def test_runner_calls_heldout_once_only_after_exact_validation_budget() -> None:

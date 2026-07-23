@@ -23,6 +23,8 @@ from benchmarks.adapters.base import (
     MultiObjectiveResult,
     SingleObjectiveResult,
     assert_exact_evaluations,
+    empirical_exploitation_gate_configuration,
+    require_empirical_gmm_exploitation,
 )
 from benchmarks.problems.registry import (
     GroupedTlpProblem,
@@ -41,13 +43,18 @@ class HolaSingleObjectiveAdapter:
         self.name = f"HOLA ({label})"
 
     def configuration(self, budget: int) -> dict[str, object]:
-        return {
+        configuration: dict[str, object] = {
             "adapter": type(self).__name__,
             "strategy": self.strategy,
             "max_trials": budget,
             "n_workers": 1,
             "objective": "raw minimization",
         }
+        if self.strategy == "gmm":
+            configuration["empirical_exploitation_gate"] = (
+                empirical_exploitation_gate_configuration()
+            )
+        return configuration
 
     def optimize(
         self,
@@ -77,6 +84,8 @@ class HolaSingleObjectiveAdapter:
         trials = study.trials()
         n_evaluations = len(trials)
         assert_exact_evaluations(n_evaluations, budget, self.name)
+        if self.strategy == "gmm":
+            require_empirical_gmm_exploitation(study, n_evaluations)
         for trial in trials:
             score = trial.score_vector.get("value", float("inf"))
             if math.isfinite(score):
@@ -109,13 +118,18 @@ class HolaMultiObjectiveAdapter:
         self.name = f"HOLA MO ({label})"
 
     def configuration(self, budget: int) -> dict[str, object]:
-        return {
+        configuration: dict[str, object] = {
             "adapter": type(self).__name__,
             "strategy": self.strategy,
             "max_trials": budget,
             "n_workers": 1,
             "objectives": "unrestricted raw minimization, one group per field",
         }
+        if self.strategy == "gmm":
+            configuration["empirical_exploitation_gate"] = (
+                empirical_exploitation_gate_configuration()
+            )
+        return configuration
 
     @staticmethod
     def _build_objectives(problem: MultiObjectiveProblem) -> list[Minimize | Maximize]:
@@ -158,6 +172,8 @@ class HolaMultiObjectiveAdapter:
         all_trials = study.trials(sorted_by="index", include_infeasible=True)
         n_evaluations = len(all_trials)
         assert_exact_evaluations(n_evaluations, budget, self.name)
+        if self.strategy == "gmm":
+            require_empirical_gmm_exploitation(study, n_evaluations)
         if all_trials:
             raw_objectives = np.array(
                 [[t.metrics[name] for name in problem.objective_names] for t in all_trials]
@@ -192,7 +208,7 @@ class HolaGroupedTlpAdapter:
         self.name = f"HOLA grouped TLP ({label})"
 
     def configuration(self, budget: int) -> dict[str, object]:
-        return {
+        configuration: dict[str, object] = {
             "adapter": type(self).__name__,
             "strategy": self.strategy,
             "problem": self.grouped_problem.name,
@@ -211,6 +227,11 @@ class HolaGroupedTlpAdapter:
                 for objective in self.grouped_problem.objectives
             ],
         }
+        if self.strategy == "gmm":
+            configuration["empirical_exploitation_gate"] = (
+                empirical_exploitation_gate_configuration()
+            )
+        return configuration
 
     @staticmethod
     def _build_objectives(problem: GroupedTlpProblem) -> list[Minimize | Maximize]:
@@ -259,6 +280,8 @@ class HolaGroupedTlpAdapter:
         trials = study.trials(sorted_by="index", include_infeasible=True)
         n_evaluations = len(trials)
         assert_exact_evaluations(n_evaluations, budget, self.name)
+        if self.strategy == "gmm":
+            require_empirical_gmm_exploitation(study, n_evaluations)
         if not trials:
             return MultiObjectiveResult(
                 pareto_front=np.empty((0, grouped.n_groups)),
