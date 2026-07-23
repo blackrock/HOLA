@@ -500,8 +500,8 @@ enum DynStrategyInner {
 /// model once its first empirical fit is available; the model is periodically
 /// refit to elite trials.
 ///
-/// The default exploration budget doubles the raw formula from the paper
-/// before rounding down to a power of two:
+/// The calibrated default applies its factor of two before rounding down to a
+/// power of two:
 /// `2 * min(floor(S / 5), 50 + 2n)`, where `S` is the intended number of
 /// simulations and `n` is the dimensionality.
 #[derive(Debug)]
@@ -526,10 +526,9 @@ pub struct AutoStrategy {
 }
 
 impl AutoStrategy {
-    /// Compute the default exploration budget by doubling the paper's raw
-    /// formula before rounding down to the nearest power of two. Applying the
-    /// multiplier before rounding preserves the balanced space-filling
-    /// properties of the Sobol sequence.
+    /// Compute the calibrated default exploration budget. Applying the factor
+    /// of two before rounding preserves the balanced space-filling properties
+    /// of the Sobol sequence.
     ///
     /// `total_budget` is `S`, the intended total number of simulations.
     /// `dim` is `n`, the dimensionality of the search space.
