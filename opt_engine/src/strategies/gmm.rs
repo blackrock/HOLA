@@ -1315,7 +1315,7 @@ struct SerializedGmmStrategy {
     #[serde(default)]
     refit_epoch: Option<u64>,
     params: GmmParams,
-    #[serde(default)]
+    #[serde(default = "legacy_gmm_refit_config")]
     refit_config: GmmRefitConfig,
 }
 
@@ -1656,6 +1656,20 @@ where
 
 use crate::traits::RefittableStrategy;
 
+/// Default upper bound on the number of components fitted by a new GMM strategy.
+pub const DEFAULT_GMM_COMPONENTS: usize = 1;
+
+/// Preserve refit behavior for strategy states written before this field was
+/// serialized.  This must remain independent of the default for new strategies.
+fn legacy_gmm_refit_config() -> GmmRefitConfig {
+    GmmRefitConfig {
+        n_components: 3,
+        max_iters: 100,
+        tolerance: 1e-6,
+        regularization: 1e-4,
+    }
+}
+
 /// Configuration for GMM refitting.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(try_from = "GmmRefitConfigSerde", into = "GmmRefitConfigSerde")]
@@ -1764,7 +1778,7 @@ impl GmmRefitConfig {
 impl Default for GmmRefitConfig {
     fn default() -> Self {
         Self {
-            n_components: 3,
+            n_components: DEFAULT_GMM_COMPONENTS,
             max_iters: 100,
             tolerance: 1e-6,
             regularization: 1e-4,
@@ -2651,11 +2665,30 @@ mod tests {
 
     #[test]
     fn test_gmm_refit_config_defaults() {
+        assert_eq!(DEFAULT_GMM_COMPONENTS, 1);
         let config = GmmRefitConfig::default();
-        assert_eq!(config.n_components(), 3);
+        assert_eq!(config.n_components(), DEFAULT_GMM_COMPONENTS);
         assert_eq!(config.max_iters(), 100);
         assert!((config.tolerance() - 1e-6).abs() < 1e-12);
         assert!((config.regularization() - 1e-4).abs() < 1e-12);
+
+        let strategy =
+            GmmStrategy::<UnitSquare>::new(42, GmmParams::uniform_prior(2, 0.25).unwrap());
+        assert_eq!(
+            strategy.get_refit_config().n_components(),
+            DEFAULT_GMM_COMPONENTS
+        );
+    }
+
+    #[test]
+    fn test_legacy_checkpoint_without_refit_config_uses_historical_default() {
+        let strategy =
+            GmmStrategy::<UnitSquare>::new(42, GmmParams::uniform_prior(2, 0.25).unwrap());
+        let mut legacy = serde_json::to_value(strategy).unwrap();
+        legacy.as_object_mut().unwrap().remove("refit_config");
+
+        let restored: GmmStrategy<UnitSquare> = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.get_refit_config().n_components(), 3);
     }
 
     #[test]

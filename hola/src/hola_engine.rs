@@ -29,7 +29,9 @@ use opt_engine::persistence::{
 };
 use opt_engine::scales::{LinearScale, Log10Scale, LogScale, Scale};
 use opt_engine::spaces::{CategoricalSpace, ContinuousSpace, DiscreteSpace};
-use opt_engine::strategies::{GmmRefitConfig, GmmStrategy, RandomStrategy, SobolStrategy};
+use opt_engine::strategies::{
+    DEFAULT_GMM_COMPONENTS, GmmRefitConfig, GmmStrategy, RandomStrategy, SobolStrategy,
+};
 use opt_engine::traits::{RefitConfig, SampleSpace, StandardizedSpace, Strategy};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -76,7 +78,7 @@ pub const DEFAULT_ELITE_FRACTION: f64 = 0.125;
 /// Zero disables periodic exploration once an empirical GMM is available.
 pub const DEFAULT_ONGOING_EXPLORATION_PERIOD: usize = 0;
 /// Default upper bound on fitted GMM components.
-pub const DEFAULT_MAX_COMPONENTS: usize = 1;
+pub const DEFAULT_MAX_COMPONENTS: usize = DEFAULT_GMM_COMPONENTS;
 /// Default lower bound on the elite workset passed to a GMM refit.
 pub const DEFAULT_MIN_ELITE_SAMPLES: usize = 5;
 /// Defaults used only to migrate checkpoints written before these controls
