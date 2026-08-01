@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.1
+
 - Fresh GMM studies now use the held-out-calibrated defaults: twice the raw
   warm-up rule before power-of-two rounding, a 12.5% elite fraction, no ongoing
   post-warm-up Sobol' cadence, one mixture component, and a five-sample elite

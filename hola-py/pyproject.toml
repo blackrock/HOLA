@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "hola-opt"
-version = "1.0.1-rc8"
+version = "1.0.1"
 description = "Lightweight asynchronous hyperparameter optimization backed by Rust"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,7 +13,7 @@ license-files = ["LICENSE-APACHE"]
 authors = [{ name = "BlackRock, Inc." }]
 keywords = ["optimization", "hyperparameter-optimization", "machine-learning"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
     "Operating System :: OS Independent",
     "Programming Language :: Rust",
