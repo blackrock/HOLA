@@ -1364,12 +1364,16 @@ impl StudyConfig {
             if checkpoint_embedded_strategy_was_absent_or_null(checkpoint_document)
                 && checkpoint_format_version(checkpoint_document) == Some(1)
                 && matches!(strategy.strategy_type.as_str(), "gmm" | "auto")
-                && let Some(pair) = serialized_auto_seed_pair(checkpoint_document)?
-                && let Some(seed) = strategy.seed
-                && pair.current_config_seed() != Some(seed)
-                && pair.matches_legacy_explicit_seed(seed)
             {
-                strategy.seed = None;
+                if let Some(pair) = serialized_auto_seed_pair(checkpoint_document)? {
+                    if let Some(seed) = strategy.seed {
+                        if pair.current_config_seed() != Some(seed)
+                            && pair.matches_legacy_explicit_seed(seed)
+                        {
+                            strategy.seed = None;
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -1685,22 +1689,22 @@ fn validate_configured_checkpoint_request(
     }
     require_explicit_match!(exploration_budget);
     require_explicit_match!(ongoing_exploration_period);
-    if let Some(requested_seed) = requested_strategy.seed
-        && saved_strategy.seed != Some(requested_seed)
-    {
-        // A migrated Auto pair that cannot be reconstructed under today's
-        // folded-seed rule is deliberately represented as `seed: null`. An
-        // explicitly configured resume can still prove it is the original
-        // historical seed by matching both serialized sampler seeds exactly.
-        let matches_serialized_pair = saved_strategy.seed.is_none()
-            && serialized_auto_seeds.is_some_and(|pair| {
-                pair.current_config_seed() == Some(requested_seed)
-                    || pair.matches_legacy_explicit_seed(requested_seed)
-            });
-        let matches_legacy_sobol = legacy_truncated_sobol_seed
-            .is_some_and(|sobol_seed| sobol_seed == requested_seed as u32);
-        if !matches_serialized_pair && !matches_legacy_sobol {
-            return Err("checkpoint seed does not match the caller config".to_string());
+    if let Some(requested_seed) = requested_strategy.seed {
+        if saved_strategy.seed != Some(requested_seed) {
+            // A migrated Auto pair that cannot be reconstructed under today's
+            // folded-seed rule is deliberately represented as `seed: null`. An
+            // explicitly configured resume can still prove it is the original
+            // historical seed by matching both serialized sampler seeds exactly.
+            let matches_serialized_pair = saved_strategy.seed.is_none()
+                && serialized_auto_seeds.is_some_and(|pair| {
+                    pair.current_config_seed() == Some(requested_seed)
+                        || pair.matches_legacy_explicit_seed(requested_seed)
+                });
+            let matches_legacy_sobol = legacy_truncated_sobol_seed
+                .is_some_and(|sobol_seed| sobol_seed == requested_seed as u32);
+            if !matches_serialized_pair && !matches_legacy_sobol {
+                return Err("checkpoint seed does not match the caller config".to_string());
+            }
         }
     }
     require_explicit_match!(elite_fraction);
@@ -4756,14 +4760,15 @@ impl HolaEngine {
                         "legacy Auto checkpoint requires a configured strategy",
                     )
                 })?;
-                if let Some(requested_seed) = strategy.seed
-                    && pair.current_config_seed() != Some(requested_seed)
-                    && !pair.matches_legacy_explicit_seed(requested_seed)
-                {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "checkpoint seed does not match the caller config",
-                    ));
+                if let Some(requested_seed) = strategy.seed {
+                    if pair.current_config_seed() != Some(requested_seed)
+                        && !pair.matches_legacy_explicit_seed(requested_seed)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "checkpoint seed does not match the caller config",
+                        ));
+                    }
                 }
                 strategy.seed = pair.current_config_seed();
             } else if let Some(sobol_seed) = serialized_sobol_seed(&raw)
@@ -4775,13 +4780,13 @@ impl HolaEngine {
                         "legacy Sobol checkpoint requires a configured strategy",
                     )
                 })?;
-                if let Some(requested_seed) = strategy.seed
-                    && sobol_seed != requested_seed as u32
-                {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "checkpoint seed does not match the caller config",
-                    ));
+                if let Some(requested_seed) = strategy.seed {
+                    if sobol_seed != requested_seed as u32 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "checkpoint seed does not match the caller config",
+                        ));
+                    }
                 }
                 // The serialized `u32` is a truthful current public seed. The
                 // original high bits cannot be recovered, so do not re-export
