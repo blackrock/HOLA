@@ -26,6 +26,8 @@
   seeds, immutable provenance manifests, failure-visible reporting, fixed
   metric scales, and strict result-coverage validation. The suite also adds
   analytic grouped-TLP and sealed-test mixed-space HPO capability studies.
+- Updated the documentation dependency lockfile to resolve CVE-2026-61632 in
+  `pymdown-extensions`.
 
 ## 1.0.1-rc8
 
