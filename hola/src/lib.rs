@@ -32,5 +32,5 @@ pub mod server;
 pub use hola_engine::{
     AutoStrategy, CompletedTrial, DEFAULT_MAX_REFIT_CANDIDATES, DEFAULT_MAX_REFIT_SAMPLES,
     DynSpace, DynTrial, HolaEngine, ObjectiveConfig, ParamConfig, ParamInfo, StrategyConfig,
-    StudyConfig,
+    StrategyDiagnostics, StudyConfig,
 };

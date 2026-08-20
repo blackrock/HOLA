@@ -211,6 +211,54 @@ def test_study_strategy_gmm():
     assert study.trial_count() == 1
 
 
+def test_strategy_diagnostics_python_exposure():
+    from hola_opt import Gmm, Minimize, Real, Space, Study
+
+    study = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("loss")],
+        strategy=Gmm(
+            exploration_budget=1,
+            refit_interval=1,
+            ongoing_exploration_period=0,
+            min_elite_samples=1,
+        ),
+    )
+    assert study.strategy_diagnostics() == {
+        "gmm_fit_epoch": 0,
+        "gmm_origin_suggestions": 0,
+        "gmm_sampling_ready": False,
+        "issued_suggestions": 0,
+    }
+
+    warmup = study.ask()
+    assert study.strategy_diagnostics()["gmm_origin_suggestions"] == 0
+    study.tell(warmup.trial_id, {"loss": 0.5})
+    fitted = study.strategy_diagnostics()
+    assert fitted["gmm_fit_epoch"] == 1
+    assert fitted["gmm_sampling_ready"] is True
+
+    study.ask()
+    assert study.strategy_diagnostics() == {
+        "gmm_fit_epoch": 1,
+        "gmm_origin_suggestions": 1,
+        "gmm_sampling_ready": True,
+        "issued_suggestions": 2,
+    }
+
+    random_study = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("loss")],
+        strategy="random",
+    )
+    assert random_study.strategy_diagnostics() == {
+        "gmm_fit_epoch": None,
+        "gmm_origin_suggestions": None,
+        "gmm_sampling_ready": None,
+        "issued_suggestions": 0,
+    }
+
+
 def test_gmm_refit_limit_configuration_and_validation():
     from hola_opt import ConfigurationError, Gmm, Minimize, Real, Space, Study
 
@@ -281,9 +329,14 @@ def test_gmm_calibration_controls_configuration_and_validation(tmp_path):
     default_path = tmp_path / "resolved-defaults.json"
     default_study.save(str(default_path))
     resolved_defaults = json.loads(default_path.read_text())["config"]["strategy"]
-    assert resolved_defaults["ongoing_exploration_period"] == 5
-    assert resolved_defaults["max_components"] == 3
-    assert resolved_defaults["min_elite_samples"] == 1
+    assert resolved_defaults["refit_interval"] == 20
+    assert resolved_defaults["exploration_budget"] == 64
+    assert resolved_defaults["elite_fraction"] == 0.125
+    assert resolved_defaults["ongoing_exploration_period"] == 0
+    assert resolved_defaults["max_components"] == 1
+    assert resolved_defaults["min_elite_samples"] == 5
+    assert resolved_defaults["max_refit_samples"] == 4096
+    assert resolved_defaults["max_refit_candidates"] == 16_384
 
     with pytest.raises(ConfigurationError, match=r"0 \(disabled\) or at least 2"):
         Gmm(ongoing_exploration_period=1)
@@ -293,6 +346,8 @@ def test_gmm_calibration_controls_configuration_and_validation(tmp_path):
         Gmm(min_elite_samples=0)
     with pytest.raises(ConfigurationError, match="must not exceed max_refit_samples"):
         Gmm(min_elite_samples=5, max_refit_samples=4)
+    with pytest.raises(ConfigurationError, match="must not exceed max_refit_samples"):
+        Gmm(max_refit_samples=4)
 
 
 # ==========================================================================
@@ -451,6 +506,57 @@ def test_study_save_load_resume_uses_fresh_trial_id(tmp_path):
     assert completed.trial_id == 2
     assert completed.params == trial.params
     assert [trial.trial_id for trial in restored.trials()] == [0, 1, 2]
+
+
+def test_study_load_migrates_missing_gmm_fields_to_legacy_defaults(tmp_path):
+    from hola_opt import Gmm, Minimize, Real, Space, Study
+
+    source = Study(
+        space=Space(x=Real(0.0, 1.0)),
+        objectives=[Minimize("loss")],
+        strategy=Gmm(
+            exploration_budget=32,
+            elite_fraction=0.25,
+            ongoing_exploration_period=5,
+            max_components=3,
+            min_elite_samples=1,
+            max_refit_samples=4,
+        ),
+        seed=7,
+    )
+    first = source.ask()
+    source.tell(first.trial_id, {"loss": first.params["x"]})
+    path = tmp_path / "legacy-gmm-defaults.json"
+    source.save(str(path))
+
+    legacy = json.loads(path.read_text())
+    saved_strategy = legacy["config"]["strategy"]
+    for field in (
+        "exploration_budget",
+        "elite_fraction",
+        "ongoing_exploration_period",
+        "max_components",
+        "min_elite_samples",
+    ):
+        saved_strategy.pop(field)
+    legacy["checkpoint"]["strategy_state"]["inner"].pop("ongoing_exploration_period")
+    path.write_text(json.dumps(legacy))
+
+    restored = Study.load(str(path))
+    source_next = source.ask()
+    restored_next = restored.ask()
+    assert restored_next.trial_id == source_next.trial_id
+    assert restored_next.params == source_next.params
+
+    migrated_path = tmp_path / "migrated-gmm-defaults.json"
+    restored.save(str(migrated_path))
+    migrated = json.loads(migrated_path.read_text())["config"]["strategy"]
+    assert migrated["exploration_budget"] == 32
+    assert migrated["elite_fraction"] == 0.25
+    assert migrated["ongoing_exploration_period"] == 5
+    assert migrated["max_components"] == 3
+    assert migrated["min_elite_samples"] == 1
+    assert migrated["max_refit_samples"] == 4
 
 
 @pytest.mark.skipif(os.name == "nt", reason="named-pipe checkpoint test requires POSIX")

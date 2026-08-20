@@ -19,6 +19,7 @@ from concurrent.futures import FIRST_COMPLETED, Executor, Future, ProcessPoolExe
 from typing import Any, TypeAlias
 
 from benchmarks.adapters.base import (
+    EmpiricalExploitationError,
     EvaluationCountError,
     MultiObjectiveOptimizer,
     SingleObjectiveOptimizer,
@@ -145,7 +146,7 @@ def _run_single_one(
     except Exception as error:
         row["error"] = _format_error(error)
         row["wall_time_seconds"] = time.perf_counter() - started
-        if isinstance(error, EvaluationCountError):
+        if isinstance(error, (EvaluationCountError, EmpiricalExploitationError)):
             row["n_evaluations"] = error.actual
         return row
 
@@ -339,7 +340,7 @@ def _run_multi_one(
         row["error"] = _format_error(error)
         if row["wall_time_seconds"] is None:
             row["wall_time_seconds"] = time.perf_counter() - started
-        if isinstance(error, EvaluationCountError):
+        if isinstance(error, (EvaluationCountError, EmpiricalExploitationError)):
             row["n_evaluations"] = error.actual
         return row
 
