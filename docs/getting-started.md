@@ -71,7 +71,7 @@ import math
 def forrester(params):
     x = params["x"]
     term = 6 * x - 2
-    value = term ** 2 * math.sin(term / 2)
+    value = term ** 2 * math.sin(2 * term)
     return {"value": value}
 
 # Run 50 trials

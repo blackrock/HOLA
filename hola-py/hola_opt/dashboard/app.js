@@ -19,6 +19,7 @@ const S = {
     lastEventId: null,        // SSE replay cursor for reconnects
     connectionGeneration: 0, // invalidates superseded connect/resync/load work
     resyncGeneration: null,  // generation currently fetching a full resync
+    resyncPromise: null,
     resyncRetryTimer: null,
     renderScheduled: false,
 
@@ -48,6 +49,9 @@ const S = {
     sortAsc: true,
     lastTrialTime: null,
     previewActive: false,    // true when client-side rescalarization is active
+    previewOriginalScores: null,
+    objectiveRequestGeneration: 0,
+    rankingPartial: false,
 };
 
 // ============================================================================
@@ -180,6 +184,10 @@ async function connectToServer() {
         setParamNames(S.space.map(p => p.name));
         S.objectives = Array.isArray(objData.objectives) ? objData.objectives : [];
         S.serverObjectives = JSON.parse(JSON.stringify(S.objectives));
+        S.previewActive = false;
+        S.previewOriginalScores = null;
+        S.objectiveRequestGeneration++;
+        document.getElementById('preview-badge').style.display = 'none';
         replaceTrials(trials);
         S.lastEventId = eventCursor;
 
@@ -329,13 +337,29 @@ function handleStreamEvent(
     void handleEngineEvent(event, generation, serverUrl);
 }
 
-async function resyncLiveState(
+function resyncLiveState(
     generation = S.connectionGeneration,
     serverUrl = S.serverUrl,
+    objectiveRequestGeneration = null,
 ) {
-    if (!isCurrentLiveConnection(generation, serverUrl)) return;
-    if (S.resyncGeneration === generation) return;
+    if (!isCurrentLiveConnection(generation, serverUrl)) return Promise.resolve();
+    if (S.resyncGeneration === generation) {
+        const pending = S.resyncPromise;
+        if (objectiveRequestGeneration == null) return pending;
+        // A later reset/apply waits for the current snapshot before taking its
+        // own. Superseded controls cannot invalidate its replacement snapshot.
+        return pending.then(() => {
+            if (objectiveRequestGeneration === S.objectiveRequestGeneration) {
+                return resyncLiveState(generation, serverUrl, objectiveRequestGeneration);
+            }
+        });
+    }
     S.resyncGeneration = generation;
+    S.resyncPromise = performLiveResync(generation, serverUrl, objectiveRequestGeneration);
+    return S.resyncPromise;
+}
+
+async function performLiveResync(generation, serverUrl, objectiveRequestGeneration) {
     clearResyncRetry();
     // Freeze event application while taking the replacement snapshot. The
     // cursor captured first is replayed after the snapshot is committed, so an
@@ -366,6 +390,8 @@ async function resyncLiveState(
         // Ignore a late response after any newer connection or checkpoint
         // load, even when it targets the same URL.
         if (!isCurrentLiveConnection(generation, serverUrl)) return;
+        if (objectiveRequestGeneration != null
+            && objectiveRequestGeneration !== S.objectiveRequestGeneration) return;
         S.space = Array.isArray(spaceData.params) ? spaceData.params : [];
         setParamNames(S.space.map(p => p.name));
         S.objectives = Array.isArray(objectivesData.objectives)
@@ -373,6 +399,10 @@ async function resyncLiveState(
         S.serverObjectives = JSON.parse(JSON.stringify(S.objectives));
         replaceTrials(trials);
         S.lastEventId = eventCursor;
+        S.previewActive = false;
+        S.previewOriginalScores = null;
+        S.objectiveRequestGeneration++;
+        document.getElementById('preview-badge').style.display = 'none';
         renderAll();
         resynced = true;
     } catch {
@@ -380,9 +410,15 @@ async function resyncLiveState(
     } finally {
         // A stale request must not clear the in-progress marker for a newer
         // generation's resync.
-        if (S.resyncGeneration === generation) S.resyncGeneration = null;
+        if (S.resyncGeneration === generation) {
+            S.resyncGeneration = null;
+            S.resyncPromise = null;
+        }
         if (isCurrentLiveConnection(generation, serverUrl)) {
-            if (resynced) startStream(generation, serverUrl);
+            if (resynced || (objectiveRequestGeneration != null
+                && objectiveRequestGeneration !== S.objectiveRequestGeneration)) {
+                startStream(generation, serverUrl);
+            }
             else scheduleResyncRetry(generation, serverUrl);
         }
     }
@@ -400,8 +436,31 @@ async function handleEngineEvent(
         const trial = event.trial || await fetchCompletedTrial(event.trial_id, serverUrl);
         if (!isCurrentLiveConnection(generation, serverUrl)) return;
         if (!trial) return;
-        if (S.previewActive) rescoreTrialForPreview(trial);
+        if (S.previewActive) {
+            if (S.previewOriginalScores && !S.previewOriginalScores.has(trial.trial_id)) {
+                S.previewOriginalScores.set(trial.trial_id, {
+                    score_vector: { ...trial.score_vector },
+                    rank: trial.rank,
+                    pareto_front: trial.pareto_front,
+                    ranking_status: trial.ranking_status,
+                });
+            }
+            rescoreTrialForPreview(trial);
+            delete trial.rank;
+            delete trial.pareto_front;
+            delete trial.ranking_status;
+        }
         upsertTrial(trial);
+        if (S.previewActive && !S.rankingPartial) {
+            // Server ranks refer to the unedited objectives. Rebuild this
+            // preview's population rather than accepting stale receipt ranks.
+            for (const current of S.trials) {
+                delete current.rank;
+                delete current.pareto_front;
+            }
+            computeRanksIfMissing(S.trials);
+            replaceTrials(S.trials);
+        }
         S.lastTrialTime = Date.now();
         scheduleRenderAll();
     }
@@ -576,6 +635,36 @@ function chooseFirstParetoTrial() {
 
 function updateMultiObjectiveFrontForAppend(trial) {
     const demoted = [];
+    if (S.rankingPartial) {
+        trial.rank = null;
+        trial.pareto_front = null;
+        trial.ranking_status = 'partial';
+        if (!isTrialFeasible(trial)) return demoted;
+        const best = S.bestIdx < 0 ? null : S.trials[S.bestIdx];
+        const cols = Object.keys(trial.score_vector).sort();
+        let comparison = 0;
+        if (best && cols.length === Object.keys(best.score_vector).length) {
+            for (const col of cols) {
+                if (!(col in best.score_vector)) { comparison = 1; break; }
+                if (trial.score_vector[col] < best.score_vector[col]) { comparison = -1; break; }
+                if (trial.score_vector[col] > best.score_vector[col]) { comparison = 1; break; }
+            }
+        }
+        // Only the lexicographic minimum is certified in a partial snapshot.
+        // Comparing against that point cannot establish every other membership.
+        if (!best || comparison < 0) {
+            if (best) {
+                best.pareto_front = null;
+                best.rank = null;
+                demoted.push(best);
+            }
+            S.paretoFrontIds.clear();
+            trial.pareto_front = 0;
+            S.paretoFrontIds.add(trial.trial_id);
+            chooseFirstParetoTrial();
+        }
+        return demoted;
+    }
     if (!isTrialFeasible(trial)) {
         S.paretoFrontIds.delete(trial.trial_id);
         markTrialOffFront(trial);
@@ -617,6 +706,7 @@ function replaceTrials(trials) {
     S.metricExtents = new Map();
     S.paramExtents = new Map();
     S.scoreGroupCount = 0;
+    S.rankingPartial = S.trials.some(trial => trial.ranking_status === 'partial');
     for (let i = 0; i < S.trials.length; i++) {
         const trial = S.trials[i];
         S.trialIndex.set(trial.trial_id, i);
@@ -656,6 +746,7 @@ function upsertTrial(trial) {
         // Changed replacements are uncommon and may alter any cached field.
         // The ID lookup is O(1); rebuilding keeps replacements fully correct.
         S.trials[existing] = trial;
+        if (S.rankingPartial) computeRanksIfMissing(S.trials);
         replaceTrials(S.trials);
         return false;
     }
@@ -802,6 +893,8 @@ function applyCheckpointData(data) {
     S.objectives = snapshot.objectives;
     S.serverObjectives = JSON.parse(JSON.stringify(S.objectives));
     S.previewActive = false;
+    S.previewOriginalScores = null;
+    S.objectiveRequestGeneration++;
     const badge = document.getElementById('preview-badge');
     if (badge) badge.style.display = 'none';
     replaceTrials(snapshot.trials);
@@ -937,10 +1030,9 @@ function exactFrontRanksBounded(entries, cols) {
 
 // For large 3+-group imports, exact non-dominated sorting is quadratic. Keep a
 // safe under-approximation instead: the lexicographic minimum is guaranteed to
-// be truly non-dominated, while every unverified point is conservatively placed
-// behind front zero.
+// be truly non-dominated, while every unverified membership remains unknown.
 function conservativeManyObjectiveFrontRanks(entries, cols) {
-    const fronts = new Array(entries.length).fill(1);
+    const fronts = new Array(entries.length).fill(null);
     if (entries.length === 0) return fronts;
     let best = 0;
     for (let i = 1; i < entries.length; i++) {
@@ -997,6 +1089,7 @@ function computeRanksIfMissing(trials) {
                 return av - bv || a.i - b.i;
             });
         order.forEach((entry, rank) => {
+            delete entry.t.ranking_status;
             if (!hasRank(entry.t)) entry.t.rank = rank;
             if (!hasParetoFront(entry.t)) entry.t.pareto_front = entry.t.rank;
         });
@@ -1004,11 +1097,11 @@ function computeRanksIfMissing(trials) {
     }
 
     // Multi-group case: exact O(n log n) two-objective ranks, exact bounded
-    // sorting for small higher-dimensional imports, and a conservative front
+    // sorting for small higher-dimensional imports, and a certified subset
     // for large 3+-group imports. A trial is eligible only when every group has
     // a finite numeric score; malformed/infeasible observations never reach
     // front zero.
-    const cols = [...groupNames];
+    const cols = [...groupNames].sort();
     const hasFiniteVector = t => cols.every(g => Number.isFinite(scoreVal(t, g)));
     const feasible = [];
     const infeasible = [];
@@ -1020,12 +1113,33 @@ function computeRanksIfMissing(trials) {
 
     const EXACT_MANY_OBJECTIVE_LIMIT = 2048;
     let fronts;
+    const partial = cols.length > 2 && feasible.length > EXACT_MANY_OBJECTIVE_LIMIT
+        && feasible.some(entry => !hasRank(entry.trial) || !hasParetoFront(entry.trial));
     if (cols.length === 2) {
         fronts = twoObjectiveFrontRanks(feasible, cols);
     } else if (feasible.length <= EXACT_MANY_OBJECTIVE_LIMIT) {
         fronts = exactFrontRanksBounded(feasible, cols);
-    } else {
+    } else if (partial) {
         fronts = conservativeManyObjectiveFrontRanks(feasible, cols);
+    } else {
+        // Fully ranked server snapshots need no client-side reconstruction.
+        fronts = feasible.map(entry => entry.trial.pareto_front);
+    }
+    if (partial) {
+        // A mixed or previously exported snapshot may carry ranks computed
+        // against a different population. Certify only the minimum of this
+        // complete population; all other memberships remain unknown.
+        feasible.forEach((entry, position) => {
+            entry.trial.rank = null;
+            entry.trial.pareto_front = fronts[position];
+            entry.trial.ranking_status = 'partial';
+        });
+        for (const trial of infeasible) {
+            trial.rank = null;
+            trial.pareto_front = null;
+            trial.ranking_status = 'partial';
+        }
+        return;
     }
     const order = feasible
         .map((entry, position) => ({ entry, position, front: fronts[position] }))
@@ -1034,6 +1148,7 @@ function computeRanksIfMissing(trials) {
     let worstFeasibleFront = 0;
     order.forEach((ranked, rank) => {
         const trial = ranked.entry.trial;
+        delete trial.ranking_status;
         if (!hasRank(trial)) trial.rank = rank;
         if (!hasParetoFront(trial)) trial.pareto_front = ranked.front;
         worstFeasibleRank = Math.max(worstFeasibleRank, trial.rank);
@@ -1045,6 +1160,7 @@ function computeRanksIfMissing(trials) {
     const infeasibleRank = Math.max(1, worstFeasibleRank + 1);
     const infeasibleFront = Math.max(1, worstFeasibleFront + 1);
     for (const t of infeasible) {
+        delete t.ranking_status;
         if (!Number.isFinite(t.rank) || t.rank < infeasibleRank) t.rank = infeasibleRank;
         if (!Number.isFinite(t.pareto_front) || t.pareto_front < infeasibleFront) {
             t.pareto_front = infeasibleFront;
@@ -1165,6 +1281,13 @@ function updateStats() {
         document.getElementById('stat-last-time').textContent = ago < 60 ? `${ago}s ago` : `${Math.round(ago / 60)}m ago`;
     }
     document.getElementById('table-count').textContent = `${S.trials.length} trials`;
+    const rankingNote = document.getElementById('ranking-note');
+    if (rankingNote) {
+        rankingNote.hidden = !S.rankingPartial;
+        rankingNote.textContent = S.rankingPartial
+            ? 'Partial frontier: highlighted points are verified; other memberships and ranks are unknown.'
+            : '';
+    }
 }
 
 // Scalar best follows the oriented server score so a later rank-0 completion
@@ -1177,19 +1300,6 @@ function findBest() {
 // ============================================================================
 // Convergence Chart (dependency-free canvas)
 // ============================================================================
-// Re-render charts on window resize
-let _resizeTimer;
-window.addEventListener('resize', () => {
-    clearTimeout(_resizeTimer);
-    _resizeTimer = setTimeout(() => {
-        if (S.trials.length > 0) {
-            renderConvergence();
-            renderPareto();
-            renderParallel();
-        }
-    }, 150);
-});
-
 function renderConvergence() {
     const container = document.getElementById('convergence-chart');
     const canvas = document.getElementById('convergence-canvas');
@@ -1214,7 +1324,8 @@ function renderConvergence() {
     // committed, so a repaint never rebuilds convergence from full history.
     const ys = S.convergenceScores;
     const runBest = S.convergenceBest;
-    const bestLabel = single ? 'Best' : 'Pareto front size';
+    const bestLabel = single ? 'Best' : S.rankingPartial
+        ? 'Verified frontier size (partial)' : 'Pareto front size';
     if (!Number.isFinite(S.convergenceMin) || !Number.isFinite(S.convergenceMax)) return;
     let yMin = S.convergenceMin, yMax = S.convergenceMax;
     const useLog = yMin > 0 && yMax / yMin > 1000;
@@ -1560,7 +1671,9 @@ function attachParetoTooltip() {
             yLine.textContent = `${nearest.yField}: ${fmtCell(nearest.yVal)}`;
 
             const status = document.createElement('span');
-            status.textContent = nearest.onFront ? 'Pareto front' : 'Dominated';
+            status.textContent = !isTrialFeasible(nearest.trial) ? 'Infeasible'
+                : nearest.onFront ? 'Pareto front'
+                : nearest.trial.pareto_front == null ? 'Front membership unknown' : 'Dominated';
             status.style.color = nearest.onFront ? 'var(--accent-bright)' : 'var(--text-2)';
 
             tooltip.append(title, xLine, yLine, status);
@@ -2095,18 +2208,69 @@ function makeObjectiveLabel(text) {
 
 // Client-side TLP rescalarization for preview mode.
 async function resetObjectives() {
+    const generation = S.connectionGeneration;
+    const serverUrl = S.serverUrl;
+    const requestGeneration = ++S.objectiveRequestGeneration;
+    let trials = S.trials;
+    if (S.mode === 'live') {
+        await resyncLiveState(generation, serverUrl, requestGeneration);
+        return;
+    } else if (S.previewOriginalScores) {
+        for (const trial of trials) {
+            const original = S.previewOriginalScores.get(trial.trial_id);
+            if (!original) continue;
+            trial.score_vector = { ...original.score_vector };
+            trial.rank = original.rank;
+            trial.pareto_front = original.pareto_front;
+            if (original.ranking_status) trial.ranking_status = original.ranking_status;
+            else delete trial.ranking_status;
+        }
+    }
     S.objectives = JSON.parse(JSON.stringify(S.serverObjectives));
     S.previewActive = false;
+    S.previewOriginalScores = null;
     document.getElementById('preview-badge').style.display = 'none';
-    if (S.mode === 'live') {
-        // Re-fetch trials with the server's actual scores
-        const resp = await apiFetch(`${S.serverUrl}/api/trials?sorted_by=index&include_infeasible=true`);
-        replaceTrials(await resp.json());
-    }
+    replaceTrials(trials);
     renderAll();
 }
 
+function objectiveValidationError() {
+    if (S.objectives.length === 0) return 'At least one objective is required.';
+    const fields = new Set();
+    for (const obj of S.objectives) {
+        const type = obj.obj_type || obj.type || 'minimize';
+        if (typeof obj.field !== 'string' || !obj.field.trim() || fields.has(obj.field)) {
+            return 'Objective fields must be nonempty and unique.';
+        }
+        fields.add(obj.field);
+        if (type !== 'minimize' && type !== 'maximize') return 'Unknown objective type.';
+        const priority = obj.priority ?? 1;
+        if (!Number.isFinite(priority) || priority < 0) return 'Priorities must be finite and non-negative.';
+        const hasTarget = obj.target != null, hasLimit = obj.limit != null;
+        if (hasTarget !== hasLimit) return 'Set both target and limit, or leave both empty.';
+        if (hasTarget && (!Number.isFinite(obj.target) || !Number.isFinite(obj.limit))) {
+            return 'Target and limit must be finite.';
+        }
+        if (hasTarget && (type === 'minimize' ? obj.target >= obj.limit : obj.target <= obj.limit)) {
+            return type === 'minimize' ? 'A minimize target must be below its limit.'
+                : 'A maximize target must be above its limit.';
+        }
+    }
+    return null;
+}
+
 function previewObjectives() {
+    const error = objectiveValidationError();
+    if (error) { alert(error); return; }
+    S.objectiveRequestGeneration++;
+    if (!S.previewActive) {
+        S.previewOriginalScores = new Map(S.trials.map(trial => [trial.trial_id, {
+            score_vector: { ...trial.score_vector },
+            rank: trial.rank,
+            pareto_front: trial.pareto_front,
+            ranking_status: trial.ranking_status,
+        }]));
+    }
     S.previewActive = true;
     document.getElementById('preview-badge').style.display = '';
     for (const trial of S.trials) {
@@ -2117,6 +2281,7 @@ function previewObjectives() {
         delete trial.pareto_front;
     }
     computeRanksIfMissing(S.trials);
+    S.rankingPartial = S.trials.some(trial => trial.ranking_status === 'partial');
     S.scoreGroupCount = 0;
     for (const trial of S.trials) {
         S.scoreGroupCount = Math.max(S.scoreGroupCount, scoreGroupWidth(trial));
@@ -2129,57 +2294,72 @@ function previewObjectives() {
 
 function rescoreTrialForPreview(trial) {
     const m = trial.metrics;
-    if (!m || typeof m !== 'object') return;
-    const groups = {};
-    let feasible = true;
+    const groups = Object.create(null);
     for (const obj of S.objectives) {
         // Normalize the engine's string sentinels to match getMetric so a
-        // persisted 'inf'/'-inf' metric is treated as +/-Infinity (and thus
-        // infeasible) rather than as a non-numeric value.
-        let raw = m[obj.field];
+        // persisted IEEE-754 metrics participate in the same scoring math.
+        let raw = m?.[obj.field];
         if (raw === 'inf') raw = Infinity;
         else if (raw === '-inf') raw = -Infinity;
-        if (raw == null || !isFinite(raw)) { feasible = false; continue; }
+        else if (raw === 'nan') raw = NaN;
         const isMin = (obj.obj_type || obj.type || 'minimize') === 'minimize';
         let score;
-        if (obj.target != null && obj.limit != null) {
-            const t = obj.target, l = obj.limit;
-            const val = isMin ? raw : -raw;
-            const tAdj = isMin ? t : -t;
-            const lAdj = isMin ? l : -l;
-            if (val <= tAdj) score = 0;
-            else if (val >= lAdj) { score = Infinity; feasible = false; }
-            else score = obj.priority * (val - tAdj) / (lAdj - tAdj);
+        if (typeof raw !== 'number') {
+            score = Infinity;
+        } else if (obj.target != null && obj.limit != null) {
+            score = previewTlpScore(raw, obj.target, obj.limit);
         } else {
-            score = (isMin ? 1 : -1) * obj.priority * raw;
+            score = (isMin ? 1 : -1) * raw;
         }
-        const g = obj.group || obj.field;
-        groups[g] = (groups[g] || 0) + score;
+        // Constraint violations remain infinite even at priority zero.
+        if (Number.isFinite(score)) score *= obj.priority ?? 1;
+        const g = obj.group ?? obj.field;
+        groups[g] = (groups[g] ?? 0) + score;
     }
-    trial.score_vector = feasible ? groups : Object.fromEntries(
-        Object.keys(groups).map(k => [k, null])
-    );
+    trial.score_vector = groups;
+}
+
+function previewTlpScore(value, target, limit) {
+    if (target < limit) {
+        if (value <= target) return 0;
+        if (value > limit) return Infinity;
+    } else if (target > limit) {
+        if (value >= target) return 0;
+        if (value < limit) return Infinity;
+    } else {
+        return value >= target ? 0 : Infinity;
+    }
+    const span = limit - target;
+    return Number.isFinite(span) ? (value - target) / span
+        : (value * 0.5 - target * 0.5) / (limit * 0.5 - target * 0.5);
 }
 
 async function applyObjectives() {
     if (S.mode !== 'live') return;
+    const error = objectiveValidationError();
+    if (error) { alert(error); return; }
     if (!confirm('This will update the server objectives and rescalarize all trials. The server will use these objectives for future sampling. Continue?')) return;
+    const generation = S.connectionGeneration;
+    const serverUrl = S.serverUrl;
+    const objectives = JSON.parse(JSON.stringify(S.objectives));
+    const requestGeneration = ++S.objectiveRequestGeneration;
     try {
-        const resp = await apiFetch(`${S.serverUrl}/api/objectives`, {
+        const resp = await apiFetch(`${serverUrl}/api/objectives`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ objectives: S.objectives }),
+            body: JSON.stringify({ objectives }),
         });
+        if (!isCurrentLiveConnection(generation, serverUrl)
+            || requestGeneration !== S.objectiveRequestGeneration) return;
         if (!resp.ok) throw new Error('Failed');
-        S.previewActive = false;
-        document.getElementById('preview-badge').style.display = 'none';
-        S.serverObjectives = JSON.parse(JSON.stringify(S.objectives));
-        // Re-fetch trials with server-side rescalarization
-        const trialsResp = await apiFetch(`${S.serverUrl}/api/trials?sorted_by=index&include_infeasible=true`);
-        replaceTrials(await trialsResp.json());
-        renderAll();
+        // Fetch the full authoritative snapshot, including any concurrent
+        // objective update, and replay events racing its watermark.
+        await resyncLiveState(generation, serverUrl, requestGeneration);
     } catch (e) {
-        alert('Failed to update objectives: ' + e.message);
+        if (isCurrentLiveConnection(generation, serverUrl)
+            && requestGeneration === S.objectiveRequestGeneration) {
+            alert('Failed to update objectives: ' + e.message);
+        }
     }
 }
 

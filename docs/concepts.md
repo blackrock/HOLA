@@ -115,8 +115,8 @@ The lifecycle follows three phases.
 1. **Warmup.** The first trials build up the leaderboard. HOLA continues
    Sobol' sampling until the first empirical fit is installed.
 2. **Refit.** Every `refit_interval` trials (default 20), we refit
-   the GMM to the top 25% of trials, subject to the configured minimum
-   feasible elite workset. If the first scheduled fit lacks that workset,
+   the GMM to the top 25% of eligible retained candidates, subject to the
+   configured minimum feasible elite workset. If the first scheduled fit lacks that workset,
    each subsequent completion retries until the first empirical model is
    installed; later refits return to the configured cadence.
 3. **Exploit.** New samples are drawn from the updated GMM,
@@ -145,12 +145,16 @@ Two implementation limits keep refitting bounded on unusually long studies.
 At most `max_refit_samples` elite points enter one fit (default 4096), and at
 most `max_refit_candidates` retained trials are ranked to choose them (default
 16384). Histories within the candidate limit are ranked globally. Longer
-histories use deterministic chronological strata spanning the full retained
-history, rather than a newest-only window. These are implementation safeguards;
-they do not change the abstract definition of the elite set. Scalar selection
+histories use deterministic chronological strata spanning the full eligible
+retained history, rather than a newest-only window. The elite fraction applies
+to that sampled candidate population, with `min_elite_samples` as a floor and
+`max_refit_samples` as a ceiling. Lifetime completions still determine refit
+cadence; evicted trials cannot inflate the elite count. Scalar selection
 is linear in the candidate count. General multi-group non-dominated sorting is
-quadratic in the worst case, so long-running studies with many groups may use a
-smaller `max_refit_candidates` value.
+quadratic in time in the worst case, while its auxiliary memory is linear in
+the candidate count and objective-group count. Long-running studies with many
+groups may use a smaller `max_refit_candidates` value and a
+`max_leaderboard_size` cap for retained history.
 
 This strategy works well for larger budgets (50+ trials) where you
 want to transition from exploration to exploitation. The more

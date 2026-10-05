@@ -115,23 +115,42 @@ def free_port():
 
 @pytest.fixture(scope="session")
 def cli_binary():
-    """Build the CLI binary once per session and return its path."""
-    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    result = subprocess.run(
-        ["cargo", "build", "-p", "hola-cli"],
-        cwd=project_root,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    if result.returncode != 0:
-        pytest.skip(f"Failed to build hola-cli: {result.stderr}")
+    """Use an explicit packaged CLI, or build the checkout's locked CLI once.
 
-    binary_name = "hola.exe" if os.name == "nt" else "hola"
-    binary = os.path.join(project_root, "target", "debug", binary_name)
-    if not os.path.exists(binary):
-        pytest.skip(f"CLI binary not found at {binary}")
-    return binary
+    Integration coverage is required: a missing executable or failed build is
+    a test failure. Relocated wheel tests must set ``HOLA_CLI_BINARY`` because
+    their fixture is no longer beneath the source workspace.
+    """
+    supplied = os.environ.get("HOLA_CLI_BINARY")
+    if supplied:
+        binary = Path(supplied).expanduser().resolve()
+    else:
+        project_root = Path(__file__).resolve().parents[2]
+        if not (project_root / "Cargo.toml").is_file():
+            pytest.fail("Relocated server tests require HOLA_CLI_BINARY")
+        try:
+            result = subprocess.run(
+                ["cargo", "build", "--locked", "-p", "hola-cli"],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            pytest.fail(f"Failed to build required hola-cli: {error}")
+        if result.returncode != 0:
+            pytest.fail(f"Failed to build required hola-cli: {result.stderr}")
+        target_dir = Path(os.environ.get("CARGO_TARGET_DIR", "target")).expanduser()
+        if not target_dir.is_absolute():
+            target_dir = project_root / target_dir
+        binary_name = "hola.exe" if os.name == "nt" else "hola"
+        binary = target_dir / "debug" / binary_name
+
+    if not binary.is_file():
+        pytest.fail(f"Required CLI binary not found at {binary}")
+    if os.name != "nt" and not os.access(binary, os.X_OK):
+        pytest.fail(f"Required CLI binary is not executable: {binary}")
+    return str(binary)
 
 
 # ==========================================================================
@@ -289,6 +308,7 @@ def running_server(cli_binary, free_port, tmp_path, request):
 
     if proc is None:
         pytest.fail(f"Server failed to start within timeout. stderr: {last_stderr}")
+    assert proc is not None
 
     yield url
 
