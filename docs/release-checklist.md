@@ -1,5 +1,10 @@
 # Release Verification Checklist
 
+Code fixes and prerelease version updates may merge before the paper is ready.
+The first official release requires the paper to be ready and Dylan's approval.
+A `workflow_dispatch` release verification run builds and tests artifacts without
+creating a release or publishing the package index.
+
 Run this checklist on the exact release commit after the CI and Security Audit
 workflow runs for that commit are green. Record both run URLs and SHAs together
 with the commit, date, operator, browser/OS versions, and measured timings in
@@ -13,6 +18,9 @@ the release notes. A failed item blocks the release; it is not a waiver.
   than an editable source build.
 - Confirm release-wheel smoke tests passed on Linux x86-64/aarch64, macOS
   x86-64/aarch64, and Windows x86-64.
+- Confirm the wheel's real-server tests used the matching packaged CLI and
+  ran without missing-binary skips. `HOLA_CLI_BINARY` selects that artifact;
+  these tests must not rebuild a checkout CLI or silently skip a failed build.
 - Download every CLI archive and run `hola --help` on each native platform.
 - Confirm Cargo, pip, and npm audits report no unexpired vulnerability.
 

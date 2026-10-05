@@ -40,6 +40,7 @@ EXPECTED_STUDY_METHODS = [
     "save",
     "run",
     "serve",
+    "stop",
     "connect",
     "load",
 ]

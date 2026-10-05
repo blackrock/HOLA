@@ -23,7 +23,7 @@ To build from source instead, see the
 ## Quick Start
 
 This example minimizes the one-dimensional Forrester function, a
-standard benchmark with a known minimum of approximately -6.03 near
+standard benchmark with a known minimum of approximately -6.02074 near
 *x* = 0.757.
 
 ```python
@@ -40,7 +40,7 @@ study = Study(
 def forrester(params):
     x = params["x"]
     term = 6 * x - 2
-    return {"value": term ** 2 * math.sin(term / 2)}
+    return {"value": term ** 2 * math.sin(2 * term)}
 
 study.run(forrester, n_trials=50)
 

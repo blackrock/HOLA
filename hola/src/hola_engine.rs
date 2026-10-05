@@ -22,7 +22,7 @@
 //! directly when you have concrete Rust types and want full compile-time
 //! verification.
 
-use opt_engine::leaderboard::{Leaderboard, Trial, is_feasible_multi};
+use opt_engine::leaderboard::{Leaderboard, Trial, is_feasible_multi, non_dominated_front_indices};
 use opt_engine::persistence::{
     AutoCheckpointConfig, Checkpoint, LeaderboardCheckpoint, ObservationKind, atomic_write_json,
     check_format_version_bytes, read_checkpoint_capped,
@@ -35,10 +35,10 @@ use opt_engine::strategies::{
 use opt_engine::traits::{RefitConfig, SampleSpace, StandardizedSpace, Strategy};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 
 /// Maximum space dimensionality the Sobol backend supports. It ships 256
 /// dimensions of direction numbers and panics in release beyond that, so
@@ -2050,6 +2050,27 @@ enum DynLeaderboard {
 }
 
 impl DynLeaderboard {
+    /// Cadence uses lifetime completions, but selection pressure applies to
+    /// the feasible population that the current bounded ranking pass sees.
+    fn refit_selection_count(
+        &self,
+        config: &RefitConfig,
+        min_samples: usize,
+        max_samples: usize,
+        max_candidates: usize,
+    ) -> usize {
+        let feasible = match self {
+            Self::Scalar(lb) => lb.feasible_count(),
+            Self::Vector(lb) => lb.feasible_count(),
+        }
+        .min(max_candidates);
+        config
+            .selection_count(feasible)
+            .max(min_samples)
+            .min(feasible)
+            .min(max_samples)
+    }
+
     fn for_objectives(objectives: &[ObjectiveConfig]) -> Self {
         if count_priority_groups(objectives) > 1 {
             DynLeaderboard::Vector(Leaderboard::new())
@@ -2401,10 +2422,9 @@ impl DynLeaderboard {
     /// vector ranking without borrowing the leaderboard.
     ///
     /// The scalar path computes its O(n) `rank_of` directly and returns a fully
-    /// populated `CompletedTrial`. The vector path fills `pareto_front` via the
-    /// front-peeling `pareto_rank_of` (no trial clones) and returns a cheap
+    /// populated `CompletedTrial`. The vector path returns a cheap
     /// `(trial_id, observation)` snapshot of the participating trials plus the
-    /// target id. The caller finalizes the response before exposing the
+    /// target id. The caller finishes its rank/front on a blocking worker before exposing the
     /// idempotency receipt, without cloning every candidate or raw-metrics DTO.
     #[allow(clippy::type_complexity)]
     fn completed_for_tell(
@@ -2616,28 +2636,6 @@ fn build_completed_vector(
     }
 }
 
-/// Whether observation `a` dominates `b` (no worse in any group, strictly
-/// better in at least one), assuming minimization. Mirrors the leaderboard's
-/// own domination relation so the off-lock rank below matches NSGA-II exactly.
-fn observation_dominates(a: &BTreeMap<String, f64>, b: &BTreeMap<String, f64>) -> bool {
-    let mut dominated_some = false;
-    for (key, &va) in a {
-        let vb = b.get(key).copied().unwrap_or(f64::INFINITY);
-        if va > vb {
-            return false;
-        }
-        if va < vb {
-            dominated_some = true;
-        }
-    }
-    for key in b.keys() {
-        if !a.contains_key(key) {
-            return false;
-        }
-    }
-    dominated_some
-}
-
 /// Compute every front rank in O(N log N) when a snapshot has exactly two
 /// consistent, finite objectives. A Fenwick tree stores the best chain depth
 /// among compressed y coordinates while points are swept by x. Exact duplicate
@@ -2713,76 +2711,59 @@ fn two_objective_front_ranks(participants: &[(u64, BTreeMap<String, f64>)]) -> O
     Some(fronts)
 }
 
-/// Compute every trial's 0-indexed Pareto front from a cheap observation
-/// snapshot, preserving iteration order within each front.
-fn vector_front_ranks(participants: &[(u64, BTreeMap<String, f64>)]) -> Vec<usize> {
-    if let Some(fronts) = two_objective_front_ranks(participants) {
+/// Compute fronts from an observation snapshot in the canonical leaderboard
+/// order, including its general pairwise discovery order.
+fn vector_front_indices(participants: &[(u64, BTreeMap<String, f64>)]) -> Vec<Vec<usize>> {
+    if let Some(ranks) = two_objective_front_ranks(participants) {
+        let mut fronts = vec![Vec::new(); ranks.iter().copied().max().map_or(0, |rank| rank + 1)];
+        for (index, rank) in ranks.into_iter().enumerate() {
+            fronts[rank].push(index);
+        }
         return fronts;
     }
-
-    let n = participants.len();
-    let mut domination_count = vec![0usize; n];
-    let mut dominated_by: Vec<Vec<usize>> = vec![Vec::new(); n];
-
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if observation_dominates(&participants[i].1, &participants[j].1) {
-                dominated_by[i].push(j);
-                domination_count[j] += 1;
-            } else if observation_dominates(&participants[j].1, &participants[i].1) {
-                dominated_by[j].push(i);
-                domination_count[i] += 1;
-            }
-        }
-    }
-
-    let mut current: Vec<usize> = (0..n).filter(|&i| domination_count[i] == 0).collect();
-    let mut fronts = vec![0usize; n];
-    let mut front = 0usize;
-    while !current.is_empty() {
-        for &index in &current {
-            fronts[index] = front;
-        }
-        let mut next = Vec::new();
-        for &i in &current {
-            for &j in &dominated_by[i] {
-                domination_count[j] -= 1;
-                if domination_count[j] == 0 {
-                    next.push(j);
-                }
-            }
-        }
-        current = next;
-        front += 1;
-    }
-    fronts
+    let observations: Vec<_> = participants
+        .iter()
+        .map(|(_, observation)| observation)
+        .collect();
+    non_dominated_front_indices(&observations)
 }
 
-/// Compute a single trial's 0-indexed NSGA-II global rank and front from a cheap
-/// snapshot.
+fn vector_front_ranks(participants: &[(u64, BTreeMap<String, f64>)]) -> Vec<usize> {
+    let mut ranks = vec![0; participants.len()];
+    for (rank, front) in vector_front_indices(participants).into_iter().enumerate() {
+        for index in front {
+            ranks[index] = rank;
+        }
+    }
+    ranks
+}
+
+/// Compute a single trial's 0-indexed NSGA-II rank in the same front and
+/// crowding order used by the full leaderboard view.
 fn vector_rank(
     participants: &[(u64, BTreeMap<String, f64>)],
     target: u64,
 ) -> Option<(usize, usize)> {
     let target_index = participants.iter().position(|(id, _)| *id == target)?;
-    let fronts = vector_front_ranks(participants);
-    let target_front = fronts[target_index];
-    let rank_base = fronts.iter().filter(|&&front| front < target_front).count();
-    let front_trials: Vec<Trial<u64, BTreeMap<String, f64>>> = participants
+    let fronts = vector_front_indices(participants);
+    let target_front = fronts
         .iter()
-        .enumerate()
-        .filter(|(index, _)| fronts[*index] == target_front)
-        .map(|(index, (trial_id, observation))| Trial {
-            candidate: *trial_id,
-            observation: observation.clone(),
-            raw_metrics: None,
-            trial_id: *trial_id,
-            timestamp: index as u64,
+        .position(|front| front.contains(&target_index))?;
+    let rank_base: usize = fronts[..target_front].iter().map(Vec::len).sum();
+    let front_trials: Vec<Trial<u64, BTreeMap<String, f64>>> = fronts[target_front]
+        .iter()
+        .map(|&index| {
+            let (trial_id, observation) = &participants[index];
+            Trial {
+                candidate: *trial_id,
+                observation: observation.clone(),
+                raw_metrics: None,
+                trial_id: *trial_id,
+                timestamp: index as u64,
+            }
         })
         .collect();
     let mut crowded = Leaderboard::<u64, BTreeMap<String, f64>>::crowding_distance(&front_trials);
-    // Stable sorting preserves snapshot order for equal crowding distances,
-    // matching Leaderboard::select_nsga2's canonical full-front ordering.
     crowded.sort_by(|left, right| right.1.total_cmp(&left.1));
     let position = crowded
         .iter()
@@ -2999,6 +2980,14 @@ pub struct HolaEngine {
     /// Serializes refits so a stale off-lock fit cannot overwrite a newer model.
     /// Cheap to clone (Arc); shared across engine clones like `state`.
     refit_lock: Arc<Mutex<()>>,
+    /// Bound prospective ranking work to one tell per engine. This gate is
+    /// held outside the state lock, so asks and lease operations remain usable.
+    tell_ranking_lock: Arc<Mutex<()>>,
+    /// A cancelled caller cannot release the heavy worker's slot until the
+    /// blocking calculation itself finishes.
+    ranking_workers: Arc<Semaphore>,
+    /// Invalidates prospective ranks after a leaderboard/objective replacement.
+    ranking_revision: Arc<AtomicU64>,
     refit_config: Option<RefitConfig>,
     /// Implementation bound for samples passed to one GMM fit.
     max_refit_samples: usize,
@@ -3049,6 +3038,9 @@ struct HolaEngineState {
     cancelled: HashSet<u64>,
     ask_idempotency: BTreeMap<String, DynTrial>,
     lease_deadlines: BTreeMap<u64, u64>,
+    /// Live prospective tells were accepted before their lease expired. Weak
+    /// tokens release this reservation immediately when their future is dropped.
+    pending_tell_claims: BTreeMap<u64, Weak<()>>,
     /// Keyed by trial id for bounded logarithmic retry lookup.
     completion_receipts: BTreeMap<u64, CompletionReceipt>,
     /// Trial ids in commit order, used to prune the oldest receipt in O(1).
@@ -3130,6 +3122,7 @@ impl HolaEngineState {
         self.cancelled.clear();
         self.ask_idempotency.clear();
         self.lease_deadlines.clear();
+        self.pending_tell_claims.clear();
         self.completion_receipts.clear();
         self.completion_receipt_order.clear();
         self.deferred_completion_receipts = 0;
@@ -3402,18 +3395,11 @@ impl HolaEngineState {
     /// Materialize every private batch receipt against one canonical ranking
     /// snapshot. Deferred receipts are guaranteed to remain in the leaderboard:
     /// the batch commit path stops deferring before a bounded push can evict.
-    fn finalize_deferred_completion_receipts(&mut self) -> Result<(), String> {
-        if self.deferred_completion_receipts == 0 {
-            return Ok(());
-        }
-
-        let view_count = self.leaderboard.completed_count();
-        let current: BTreeMap<u64, CompletedTrial> = self
-            .leaderboard
-            .completed_trials("rank", true, &self.objectives)
-            .into_iter()
-            .map(|trial| (trial.trial_id, trial))
-            .collect();
+    fn finalize_deferred_completion_receipts(
+        &mut self,
+        current: BTreeMap<u64, CompletedTrial>,
+        view_count: usize,
+    ) -> Result<(), String> {
         let expected = self.deferred_completion_receipts;
         if let Some(trial_id) = self
             .completion_receipts
@@ -3483,10 +3469,15 @@ impl HolaEngineState {
     }
 
     fn expire_leases(&mut self, now: u64) -> usize {
+        self.pending_tell_claims
+            .retain(|_, claim| claim.strong_count() > 0);
         let expired: Vec<u64> = self
             .lease_deadlines
             .iter()
-            .filter_map(|(&trial_id, &deadline)| (deadline <= now).then_some(trial_id))
+            .filter_map(|(&trial_id, &deadline)| {
+                (deadline <= now && !self.pending_tell_claims.contains_key(&trial_id))
+                    .then_some(trial_id)
+            })
             .collect();
         for trial_id in &expired {
             self.lease_deadlines.remove(trial_id);
@@ -3727,11 +3718,15 @@ impl HolaEngine {
                 cancelled: HashSet::new(),
                 ask_idempotency: BTreeMap::new(),
                 lease_deadlines: BTreeMap::new(),
+                pending_tell_claims: BTreeMap::new(),
                 completion_receipts: BTreeMap::new(),
                 completion_receipt_order: VecDeque::new(),
                 deferred_completion_receipts: 0,
             })),
             refit_lock: Arc::new(Mutex::new(())),
+            tell_ranking_lock: Arc::new(Mutex::new(())),
+            ranking_workers: Arc::new(Semaphore::new(1)),
+            ranking_revision: Arc::new(AtomicU64::new(0)),
             refit_config,
             max_refit_samples,
             max_refit_candidates,
@@ -3952,10 +3947,43 @@ impl HolaEngine {
     /// ranking snapshot. This is a no-op when no batch completion is pending.
     #[doc(hidden)]
     pub async fn finalize_deferred_rankings(&self) -> Result<(), String> {
-        self.state
-            .write()
+        let _ranking_guard = self.tell_ranking_lock.lock().await;
+        self.finalize_deferred_rankings_under_gate().await
+    }
+
+    async fn finalize_deferred_rankings_under_gate(&self) -> Result<(), String> {
+        loop {
+            let state = self.state.read().await;
+            if state.deferred_completion_receipts == 0 {
+                return Ok(());
+            }
+            let revision = self.ranking_revision.load(Ordering::Relaxed);
+            let leaderboard = state.leaderboard.clone();
+            let objectives = state.objectives.clone();
+            let view_count = state.leaderboard.completed_count();
+            drop(state);
+            let permit = self
+                .ranking_workers
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|error| format!("ranking worker unavailable: {error}"))?;
+            let current = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                leaderboard
+                    .completed_trials("rank", true, &objectives)
+                    .into_iter()
+                    .map(|trial| (trial.trial_id, trial))
+                    .collect()
+            })
             .await
-            .finalize_deferred_completion_receipts()
+            .map_err(|error| format!("deferred ranking task failed: {error}"))?;
+            let mut state = self.state.write().await;
+            if self.ranking_revision.load(Ordering::Relaxed) != revision {
+                continue;
+            }
+            return state.finalize_deferred_completion_receipts(current, view_count);
+        }
     }
 
     async fn tell_with_outcome_mode<F>(
@@ -3968,73 +3996,137 @@ impl HolaEngine {
     where
         F: FnOnce(&CompletedTrial, usize),
     {
-        let mut state = self.state.write().await;
-        state.expire_leases(unix_time_millis());
-
-        if state.cancelled.contains(&trial_id) {
-            return Err(format!("Trial {trial_id} has been cancelled"));
-        }
-
-        if let Some(receipt) = state.completion_receipt(trial_id) {
-            if receipt.completed.metrics != raw_metrics {
-                return Err(format!(
-                    "Trial {trial_id} has already been completed with different metrics"
-                ));
-            }
-            if !defer_ranking && receipt.ranking_deferred {
-                state.finalize_deferred_completion_receipts()?;
-            }
-            let receipt = state
-                .completion_receipt(trial_id)
-                .expect("finalizing receipts must preserve the requested receipt");
-            return Ok(TellOutcome {
-                completed: receipt.completed.clone(),
-                trial_count: receipt.committed_count,
-                newly_committed: false,
-                post_commit_warnings: receipt.post_commit_warnings.clone(),
-            });
-        }
-
-        if state.leaderboard.contains_trial_id(trial_id) {
-            if state.leaderboard.raw_metrics(trial_id) != Some(&raw_metrics) {
-                return Err(format!(
-                    "Trial {trial_id} has already been completed with different metrics"
-                ));
-            }
-            let objectives = state.objectives.clone();
-            let committed_count = state.leaderboard.completed_count();
-            let (mut completed, vector_rank_inputs) = state
+        // Serialize completion preparation outside the engine state lock. A
+        // caller cancelled before the ranked receipt commits leaves its pending
+        // trial untouched, and no second tell can enqueue another ranking job.
+        let ranking_guard = self.tell_ranking_lock.lock().await;
+        let mut tell_claim = None;
+        let (mut state, prepared_rank, would_evict) = loop {
+            let mut state = self.state.write().await;
+            state.expire_leases(unix_time_millis());
+            let would_evict = state
                 .leaderboard
-                .completed_for_tell(trial_id, true, &objectives)
-                .ok_or_else(|| format!("Failed to rebuild CompletedTrial for {trial_id}"))?;
-            drop(state);
-            if let Some((participants, target)) = vector_rank_inputs {
-                let (rank, front) = vector_dashboard_rank(&participants, target)
-                    .ok_or_else(|| format!("Failed to rank CompletedTrial for {trial_id}"))?;
-                completed.rank = rank;
-                completed.pareto_front = front;
+                .max_size()
+                .is_some_and(|cap| state.leaderboard.len() >= cap);
+            if state.cancelled.contains(&trial_id) {
+                return Err(format!("Trial {trial_id} has been cancelled"));
             }
-            return Ok(TellOutcome {
-                completed,
-                trial_count: committed_count,
-                newly_committed: false,
-                post_commit_warnings: Vec::new(),
-            });
-        }
 
-        // A bounded board must never evict the backing trial for a deferred
-        // receipt. Stop deferring at the capacity boundary and materialize the
-        // prior batch before the push can evict its oldest member.
-        if !state.pending.contains_key(&trial_id) {
-            return Err(format!("Unknown trial_id: {trial_id}"));
-        }
-        let would_evict = state
-            .leaderboard
-            .max_size()
-            .is_some_and(|cap| state.leaderboard.len() >= cap);
-        if !defer_ranking || would_evict {
-            state.finalize_deferred_completion_receipts()?;
-        }
+            if let Some(receipt) = state.completion_receipt(trial_id) {
+                if receipt.completed.metrics != raw_metrics {
+                    return Err(format!(
+                        "Trial {trial_id} has already been completed with different metrics"
+                    ));
+                }
+                if !defer_ranking && receipt.ranking_deferred {
+                    drop(state);
+                    self.finalize_deferred_rankings_under_gate().await?;
+                    continue;
+                }
+                let receipt = state
+                    .completion_receipt(trial_id)
+                    .expect("finalizing receipts must preserve the requested receipt");
+                return Ok(TellOutcome {
+                    completed: receipt.completed.clone(),
+                    trial_count: receipt.committed_count,
+                    newly_committed: false,
+                    post_commit_warnings: receipt.post_commit_warnings.clone(),
+                });
+            }
+
+            if state.leaderboard.contains_trial_id(trial_id) {
+                if state.leaderboard.raw_metrics(trial_id) != Some(&raw_metrics) {
+                    return Err(format!(
+                        "Trial {trial_id} has already been completed with different metrics"
+                    ));
+                }
+                let objectives = state.objectives.clone();
+                let committed_count = state.leaderboard.completed_count();
+                let (mut completed, vector_rank_inputs) = state
+                    .leaderboard
+                    .completed_for_tell(trial_id, true, &objectives)
+                    .ok_or_else(|| format!("Failed to rebuild CompletedTrial for {trial_id}"))?;
+                drop(state);
+                if let Some((participants, target)) = vector_rank_inputs {
+                    let permit = self
+                        .ranking_workers
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|error| format!("ranking worker unavailable: {error}"))?;
+                    let (rank, front) = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        vector_dashboard_rank(&participants, target)
+                    })
+                    .await
+                    .map_err(|error| format!("ranking task failed: {error}"))?
+                    .ok_or_else(|| format!("Failed to rank CompletedTrial for {trial_id}"))?;
+                    completed.rank = rank;
+                    completed.pareto_front = front;
+                }
+                return Ok(TellOutcome {
+                    completed,
+                    trial_count: committed_count,
+                    newly_committed: false,
+                    post_commit_warnings: Vec::new(),
+                });
+            }
+
+            let candidate = state
+                .pending
+                .get(&trial_id)
+                .ok_or_else(|| format!("Unknown trial_id: {trial_id}"))?
+                .clone();
+            if state.deferred_completion_receipts > 0 && (!defer_ranking || would_evict) {
+                drop(state);
+                self.finalize_deferred_rankings_under_gate().await?;
+                continue;
+            }
+            let participants = match &state.leaderboard {
+                DynLeaderboard::Vector(lb) if !defer_ranking || would_evict => {
+                    let mut participants: Vec<_> = lb
+                        .iter()
+                        .skip(usize::from(would_evict))
+                        .map(|trial| (trial.trial_id, trial.observation.clone()))
+                        .collect();
+                    participants.push((trial_id, vectorize_raw(&raw_metrics, &state.objectives)));
+                    Some(participants)
+                }
+                _ => None,
+            };
+            let Some(participants) = participants else {
+                break (state, None, would_evict);
+            };
+            let claim = tell_claim.get_or_insert_with(|| Arc::new(()));
+            state
+                .pending_tell_claims
+                .insert(trial_id, Arc::downgrade(claim));
+            let revision = self.ranking_revision.load(Ordering::Relaxed);
+            drop(state);
+            let permit = self
+                .ranking_workers
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|error| format!("ranking worker unavailable: {error}"))?;
+            let rank = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                vector_dashboard_rank(&participants, trial_id)
+            })
+            .await
+            .map_err(|error| format!("ranking task failed: {error}"))?
+            .ok_or_else(|| format!("Failed to rank CompletedTrial for {trial_id}"))?;
+            let mut state = self.state.write().await;
+            state.expire_leases(unix_time_millis());
+            // Objectives, retention, and loads can change while ranking runs.
+            // Retrying observes cancellation/replay before another preparation.
+            if self.ranking_revision.load(Ordering::Relaxed) != revision
+                || state.pending.get(&trial_id) != Some(&candidate)
+            {
+                continue;
+            }
+            break (state, Some(rank), would_evict);
+        };
         if would_evict {
             defer_ranking = false;
         }
@@ -4045,6 +4137,7 @@ impl HolaEngine {
             .expect("pending membership was checked above");
         state.remove_ask_idempotency_for_trial(trial_id);
         state.lease_deadlines.remove(&trial_id);
+        state.pending_tell_claims.remove(&trial_id);
 
         // Read objectives, scalarize, and push under the single state lock so a
         // concurrent update_objectives cannot scalarize this trial against a
@@ -4060,6 +4153,7 @@ impl HolaEngine {
             ));
         }
         state.strategy.update(&candidate, score);
+        self.ranking_revision.fetch_add(1, Ordering::Relaxed);
 
         let completed_trials = state.leaderboard.completed_count();
         let commit_sequence = state.leaderboard.total_completed();
@@ -4068,25 +4162,24 @@ impl HolaEngine {
         // lock. The local batch path stores only the completion payload; its
         // private placeholder rank/front is materialized before any public
         // replay and once at normal batch exit.
-        let completed = if defer_ranking {
+        let completed = if let Some((rank, front)) = prepared_rank {
+            let mut completed = state
+                .leaderboard
+                .completed_without_ranking(stored_trial_id, &objectives)
+                .ok_or_else(|| format!("Failed to build CompletedTrial for {stored_trial_id}"))?;
+            completed.rank = rank;
+            completed.pareto_front = front;
+            completed
+        } else if defer_ranking {
             state
                 .leaderboard
                 .completed_without_ranking(stored_trial_id, &objectives)
                 .ok_or_else(|| format!("Failed to build CompletedTrial for {stored_trial_id}"))?
         } else {
-            let (mut completed, vector_rank_inputs) = state
+            state
                 .leaderboard
-                .completed_for_tell(stored_trial_id, true, &objectives)
-                .ok_or_else(|| format!("Failed to build CompletedTrial for {stored_trial_id}"))?;
-            if let Some((participants, target)) = vector_rank_inputs {
-                let (rank, front) =
-                    vector_dashboard_rank(&participants, target).ok_or_else(|| {
-                        format!("Failed to rank CompletedTrial for {stored_trial_id}")
-                    })?;
-                completed.rank = rank;
-                completed.pareto_front = front;
-            }
-            completed
+                .get_completed(stored_trial_id, true, &objectives)
+                .ok_or_else(|| format!("Failed to build CompletedTrial for {stored_trial_id}"))?
         };
         state.record_completion_receipt(
             commit_sequence,
@@ -4098,10 +4191,13 @@ impl HolaEngine {
 
         // There is deliberately no `.await` between recording the receipt and
         // this hook. Cancellation therefore observes either neither operation
-        // or both the commit and its externally visible event.
+        // or both the commit and its externally visible event. Keep the tell
+        // gate until publication so another runtime thread cannot publish a
+        // later completion first.
         if !defer_ranking {
             on_commit(&completed, completed_trials);
         }
+        drop(ranking_guard);
 
         // Own post-commit maintenance in a spawned task. Awaiting it preserves
         // the synchronous API's warnings on the normal path, while dropping or
@@ -4197,12 +4293,12 @@ impl HolaEngine {
                     }
                     #[cfg(test)]
                     self.refit_attempts.fetch_add(1, Ordering::Relaxed);
-                    let k = config
-                        .selection_count(refit_completed)
-                        .max(self.min_elite_samples)
-                        .min(refit_completed)
-                        .min(self.max_refit_samples)
-                        .min(self.max_refit_candidates);
+                    let k = state_guard.leaderboard.refit_selection_count(
+                        config,
+                        self.min_elite_samples,
+                        self.max_refit_samples,
+                        self.max_refit_candidates,
+                    );
                     let refit_objectives = state_guard.objectives.clone();
                     let mut trials = state_guard.leaderboard.top_k_for_refit(
                         k,
@@ -4330,6 +4426,7 @@ impl HolaEngine {
         if state.pending.remove(&trial_id).is_some() {
             state.remove_ask_idempotency_for_trial(trial_id);
             state.lease_deadlines.remove(&trial_id);
+            state.pending_tell_claims.remove(&trial_id);
             state.record_cancelled(trial_id);
             Ok(())
         } else {
@@ -4498,6 +4595,7 @@ impl HolaEngine {
         let objectives = state.objectives.clone();
         state.leaderboard.rescalarize(&objectives);
         state.rescore_completion_receipts(&objectives);
+        self.ranking_revision.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Update objectives and re-scalarize (for mid-run dashboard adjustments).
@@ -4540,6 +4638,7 @@ impl HolaEngine {
             state.objectives = objectives.clone();
             state.leaderboard.migrate_for_objectives(&objectives);
             state.rescore_completion_receipts(&objectives);
+            self.ranking_revision.fetch_add(1, Ordering::Relaxed);
             (state.leaderboard.completed_count(), state.leaderboard.len())
         };
 
@@ -4572,12 +4671,12 @@ impl HolaEngine {
         if current_completed < config.min_trials() || current_completed < self.min_elite_samples {
             return;
         }
-        let k = config
-            .selection_count(current_completed)
-            .max(self.min_elite_samples)
-            .min(current_completed)
-            .min(self.max_refit_samples)
-            .min(self.max_refit_candidates);
+        let k = state_guard.leaderboard.refit_selection_count(
+            config,
+            self.min_elite_samples,
+            self.max_refit_samples,
+            self.max_refit_candidates,
+        );
         let objectives = state_guard.objectives.clone();
         let mut trials =
             state_guard
@@ -4893,6 +4992,7 @@ impl HolaEngine {
         let max_refit_samples = self.max_refit_samples;
         let max_refit_candidates = self.max_refit_candidates;
         let min_elite_samples = self.min_elite_samples;
+        let refit_config = self.refit_config.clone();
         let (leaderboard, strategy, n) = tokio::task::spawn_blocking(move || {
             let mut leaderboard = parse_leaderboard_checkpoint(raw, current_is_vector)?;
             leaderboard
@@ -4902,11 +5002,19 @@ impl HolaEngine {
             let n = leaderboard.len();
             leaderboard.set_max_size(max_leaderboard_size);
             let completed_count = leaderboard.completed_count();
-            let mut trials = leaderboard.top_k_for_refit(
-                completed_count.min(max_refit_samples),
-                max_refit_candidates,
-                &objectives,
-            );
+            let selection_count =
+                refit_config
+                    .as_ref()
+                    .map_or(completed_count.min(max_refit_samples), |config| {
+                        leaderboard.refit_selection_count(
+                            config,
+                            min_elite_samples,
+                            max_refit_samples,
+                            max_refit_candidates,
+                        )
+                    });
+            let mut trials =
+                leaderboard.top_k_for_refit(selection_count, max_refit_candidates, &objectives);
             if trials.len() < min_elite_samples {
                 trials.clear();
             }
@@ -4935,6 +5043,7 @@ impl HolaEngine {
         state.strategy = strategy;
         state.leaderboard = leaderboard;
         state.reset_transient_trial_state_after_load();
+        self.ranking_revision.fetch_add(1, Ordering::Relaxed);
         self.initial_fit_attempted_completed
             .store(state.leaderboard.completed_count(), Ordering::Relaxed);
         state.next_pending_id = state.next_pending_id.max(fresh_legacy_trial_id_floor());
@@ -5165,6 +5274,7 @@ impl HolaEngine {
                 cancelled: HashSet::new(),
                 ask_idempotency: BTreeMap::new(),
                 lease_deadlines: BTreeMap::new(),
+                pending_tell_claims: BTreeMap::new(),
                 completion_receipts: BTreeMap::new(),
                 completion_receipt_order: VecDeque::new(),
                 deferred_completion_receipts: 0,
@@ -5209,6 +5319,7 @@ impl HolaEngine {
             ));
         }
         *state = replacement;
+        self.ranking_revision.fetch_add(1, Ordering::Relaxed);
         self.initial_fit_attempted_completed
             .store(state.leaderboard.completed_count(), Ordering::Relaxed);
         eprintln!("[hola] Loaded full checkpoint with {n_loaded} trials");
@@ -6601,7 +6712,8 @@ mod tests {
 
         // The omitted and explicit calibrated forms must remain behaviorally
         // identical, including the first refit and periodic exploration.
-        for _ in 0..40 {
+        let simulations = AutoStrategy::default_exploration_budget(200, 1) + 40;
+        for _ in 0..simulations {
             let implicit_trial = implicit.ask().await.unwrap();
             let explicit_trial = explicit.ask().await.unwrap();
             assert_eq!(implicit_trial.params, explicit_trial.params);
@@ -6615,6 +6727,12 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let diagnostics = implicit.strategy_diagnostics().await;
+        assert_eq!(diagnostics, explicit.strategy_diagnostics().await);
+        assert!(diagnostics.gmm_fit_epoch.unwrap() > 0);
+        assert_eq!(diagnostics.gmm_sampling_ready, Some(true));
+        assert_eq!(diagnostics.gmm_origin_suggestions, Some(40));
+        assert_eq!(diagnostics.issued_suggestions, simulations as u64);
     }
 
     #[tokio::test]
@@ -8669,6 +8787,85 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completion_publications_follow_commit_order_across_runtime_threads() {
+        let engine = HolaEngine::from_config(single_objective_config("random")).unwrap();
+        let first = engine.ask().await.unwrap();
+        let second = engine.ask().await.unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_engine = engine.clone();
+        let first_events = events.clone();
+        let first_tell = tokio::spawn(async move {
+            first_engine
+                .tell_with_outcome_on_commit(
+                    first.trial_id,
+                    serde_json::json!({"loss": 1.0}),
+                    move |completed, _| {
+                        let _ = entered_tx.send(());
+                        // Bound the blocking hook so even a failed test cannot
+                        // leave a runtime worker waiting indefinitely.
+                        let released = release_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+                        first_events.lock().unwrap().push(completed.trial_id);
+                        let _ = finished_tx.send(released);
+                    },
+                )
+                .await
+        });
+        entered_rx.await.unwrap();
+
+        let second_engine = engine.clone();
+        let second_events = events.clone();
+        let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+        let second_tell = tokio::spawn(async move {
+            let mut tell = Box::pin(second_engine.tell_with_outcome_on_commit(
+                second.trial_id,
+                serde_json::json!({"loss": 2.0}),
+                move |completed, _| second_events.lock().unwrap().push(completed.trial_id),
+            ));
+            let mut polled_tx = Some(polled_tx);
+            std::future::poll_fn(|cx| {
+                let result = std::future::Future::poll(tell.as_mut(), cx);
+                if let Some(tx) = polled_tx.take() {
+                    // Signal after polling the tell itself, proving that the
+                    // second call reached its gate rather than merely starting.
+                    let _ = tx.send(());
+                }
+                result
+            })
+            .await
+        });
+        polled_rx.await.unwrap();
+        let count_before_release = engine.trial_count().await;
+        let events_before_release = events.lock().unwrap().clone();
+
+        // Release the hook before any assertions, including assertions that
+        // intentionally fail if publication serialization regresses.
+        let _ = release_tx.send(());
+        let first_result = first_tell.await;
+        let second_result = second_tell.await;
+        first_result.unwrap().unwrap();
+        second_result.unwrap().unwrap();
+        assert!(
+            finished_rx.await.unwrap(),
+            "first publication should be explicitly released"
+        );
+        assert_eq!(
+            count_before_release, 1,
+            "second tell must not commit ahead of the first publication"
+        );
+        assert!(
+            events_before_release.is_empty(),
+            "second tell must not publish ahead of the first"
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![first.trial_id, second.trial_id]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn commit_hook_is_exactly_once_when_post_commit_work_is_cancelled() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = single_objective_config("random");
@@ -8871,6 +9068,430 @@ mod tests {
         assert_eq!(refit_at, vec![2, 4, 6]);
         assert_eq!(leaderboard.len(), 3);
         assert_eq!(leaderboard.completed_count(), 6);
+    }
+
+    #[test]
+    fn elite_fraction_uses_the_feasible_bounded_candidate_population() {
+        let policy = RefitConfig::with_quantile(4, 4, 0.25);
+        let mut board = DynLeaderboard::Scalar(Leaderboard::new());
+        board.set_max_size(Some(4));
+        for i in 0..16 {
+            let DynLeaderboard::Scalar(lb) = &mut board else {
+                unreachable!()
+            };
+            lb.push(serde_json::json!({"x": i}), i as f64);
+        }
+        assert_eq!(board.completed_count(), 16);
+        assert_eq!(board.refit_selection_count(&policy, 1, 4, 4), 1);
+        let DynLeaderboard::Scalar(lb) = &mut board else {
+            unreachable!()
+        };
+        lb.push(serde_json::json!({"x": 16}), f64::INFINITY);
+        assert_eq!(board.refit_selection_count(&policy, 1, 4, 4), 1);
+
+        let mut large = DynLeaderboard::Scalar(Leaderboard::new());
+        for i in 0..100 {
+            let DynLeaderboard::Scalar(lb) = &mut large else {
+                unreachable!()
+            };
+            lb.push(serde_json::json!({"x": i}), i as f64);
+        }
+        let policy = RefitConfig::with_quantile(4, 4, 0.1);
+        assert_eq!(large.refit_selection_count(&policy, 1, 20, 20), 2);
+        assert_eq!(large.refit_selection_count(&policy, 5, 20, 20), 5);
+    }
+
+    #[tokio::test]
+    async fn bounded_refit_objective_update_and_import_fit_the_best_retained_fraction() {
+        let mut config = single_objective_config("gmm");
+        config.max_leaderboard_size = Some(4);
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(4);
+        strategy.refit_interval = 4;
+        strategy.elite_fraction = Some(0.25);
+        strategy.max_components = Some(1);
+        // This regression isolates a one-sample elite policy; the calibrated
+        // five-sample default is exercised separately below.
+        strategy.min_elite_samples = Some(1);
+        strategy.max_refit_samples = 4;
+        strategy.max_refit_candidates = 4;
+        let engine = HolaEngine::from_config(config.clone()).unwrap();
+        for loss in 0..16 {
+            let trial = engine.ask().await.unwrap();
+            engine
+                .tell(trial.trial_id, serde_json::json!({"loss": loss}))
+                .await
+                .unwrap();
+        }
+        let best = engine.top_k(1, false).await.remove(0);
+        let expected = engine.space.to_unit_cube(&best.params);
+        {
+            let state = engine.state.read().await;
+            let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+                unreachable!()
+            };
+            assert_eq!(
+                auto.gmm.params().unwrap().components()[0].mean().as_slice(),
+                expected
+            );
+        }
+        let objectives = engine.objectives().await;
+        engine.update_objectives(objectives).await.unwrap();
+        let state = engine.state.read().await;
+        let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+            unreachable!()
+        };
+        assert_eq!(
+            auto.gmm.params().unwrap().components()[0].mean().as_slice(),
+            expected
+        );
+        drop(state);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bounded-leaderboard.json");
+        engine
+            .save_leaderboard_checkpoint_to(&path, None)
+            .await
+            .unwrap();
+        let imported = HolaEngine::from_config(config).unwrap();
+        imported.load_leaderboard_checkpoint(&path).await.unwrap();
+        let state = imported.state.read().await;
+        let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+            unreachable!()
+        };
+        assert_eq!(
+            auto.gmm.params().unwrap().components()[0].mean().as_slice(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn calibrated_bounded_elites_and_diagnostics_survive_checkpoint_routes() {
+        let mut config = single_objective_config("gmm");
+        config.max_leaderboard_size = Some(8);
+        let strategy = config.strategy.as_mut().unwrap();
+        strategy.exploration_budget = Some(8);
+        strategy.max_refit_samples = 8;
+        strategy.max_refit_candidates = 8;
+        // Leave fraction, component cap, floor, cadence, and continuing
+        // exploration omitted so their calibrated defaults govern this test.
+        let engine = HolaEngine::from_config(config.clone()).unwrap();
+        for loss in 0..68 {
+            let trial = engine.ask().await.unwrap();
+            engine
+                .tell(trial.trial_id, serde_json::json!({"loss": loss}))
+                .await
+                .unwrap();
+        }
+        let selected = engine.top_k(DEFAULT_MIN_ELITE_SAMPLES, false).await;
+        let expected_mean = selected
+            .iter()
+            .map(|trial| engine.space.to_unit_cube(&trial.params)[0])
+            .sum::<f64>()
+            / DEFAULT_MIN_ELITE_SAMPLES as f64;
+        let retained_mean = engine
+            .trials("rank", false)
+            .await
+            .iter()
+            .map(|trial| engine.space.to_unit_cube(&trial.params)[0])
+            .sum::<f64>()
+            / 8.0;
+        {
+            let state = engine.state.read().await;
+            let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+                unreachable!()
+            };
+            let params = auto.gmm.params().unwrap();
+            assert_eq!(params.n_components(), 1);
+            assert!((params.components()[0].mean()[0] - expected_mean).abs() < 1e-12);
+        }
+        assert!(
+            (expected_mean - retained_mean).abs() > 1e-8,
+            "fixture must distinguish selected elites from the whole retained population"
+        );
+        let diagnostics = engine.strategy_diagnostics().await;
+        assert_eq!(diagnostics.gmm_fit_epoch, Some(4));
+        assert_eq!(diagnostics.gmm_origin_suggestions, Some(60));
+        assert_eq!(diagnostics.gmm_sampling_ready, Some(true));
+        assert_eq!(diagnostics.issued_suggestions, 68);
+
+        let dir = tempfile::tempdir().unwrap();
+        let full_path = dir.path().join("bounded-full.json");
+        engine.save(&full_path).await.unwrap();
+        let resumed = HolaEngine::load_from_checkpoint(&full_path).await.unwrap();
+        assert_eq!(resumed.strategy_diagnostics().await, diagnostics);
+        assert_eq!(engine.ask().await.unwrap(), resumed.ask().await.unwrap());
+        assert_eq!(
+            resumed.strategy_diagnostics().await.gmm_origin_suggestions,
+            Some(61)
+        );
+
+        let history_path = dir.path().join("bounded-history.json");
+        engine
+            .save_leaderboard_checkpoint_to(&history_path, None)
+            .await
+            .unwrap();
+        let imported = HolaEngine::from_config(config).unwrap();
+        imported
+            .load_leaderboard_checkpoint(&history_path)
+            .await
+            .unwrap();
+        let imported_diagnostics = imported.strategy_diagnostics().await;
+        assert_eq!(imported_diagnostics.gmm_origin_suggestions, None);
+        assert_eq!(imported_diagnostics.gmm_sampling_ready, Some(true));
+        let state = imported.state.read().await;
+        let DynStrategyInner::Auto(auto) = &state.strategy.inner else {
+            unreachable!()
+        };
+        assert!(
+            (auto.gmm.params().unwrap().components()[0].mean()[0] - expected_mean).abs() < 1e-12
+        );
+        drop(state);
+        imported.ask().await.unwrap();
+        assert_eq!(
+            imported.strategy_diagnostics().await.gmm_origin_suggestions,
+            None
+        );
+    }
+
+    fn three_group_random_config() -> StudyConfig {
+        let mut config = single_objective_config("random");
+        config.objectives = ["a", "b", "c"]
+            .into_iter()
+            .map(|field| ObjectiveConfig {
+                field: field.to_string(),
+                obj_type: "minimize".into(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            })
+            .collect();
+        config
+    }
+
+    #[tokio::test]
+    async fn three_group_tell_rank_matches_immediate_read_and_receipt() {
+        let engine = HolaEngine::from_config(three_group_random_config()).unwrap();
+        for (a, b, c) in [(2, 0, 0), (4, 0, 4), (1, 0, 4), (4, 4, 3)] {
+            let trial = engine.ask().await.unwrap();
+            let metrics = serde_json::json!({"a": a, "b": b, "c": c});
+            let outcome = engine
+                .tell_with_outcome(trial.trial_id, metrics.clone())
+                .await
+                .unwrap();
+            let read = engine.completed_trial(trial.trial_id, true).await.unwrap();
+            assert_eq!(
+                (outcome.completed.rank, outcome.completed.pareto_front),
+                (read.rank, read.pareto_front)
+            );
+            let replay = engine
+                .tell_with_outcome(trial.trial_id, metrics)
+                .await
+                .unwrap();
+            assert!(!replay.newly_committed);
+            assert_eq!(replay.completed.rank, read.rank);
+        }
+        assert_eq!(
+            engine
+                .trials("rank", true)
+                .await
+                .into_iter()
+                .map(|trial| trial.trial_id)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3, 1]
+        );
+    }
+
+    async fn wait_until_tell_preparation_started(engine: &HolaEngine) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if engine.tell_ranking_lock.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tell must begin preparation");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prospective_rank_leaves_state_available_and_retries_objective_changes() {
+        let engine = HolaEngine::from_config(three_group_random_config()).unwrap();
+        let trial = engine.ask().await.unwrap();
+        let held_worker = engine
+            .ranking_workers
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let telling_engine = engine.clone();
+        let tell = tokio::spawn(async move {
+            telling_engine
+                .tell(
+                    trial.trial_id,
+                    serde_json::json!({"a": 1, "b": 2, "c": 3, "loss": 4}),
+                )
+                .await
+        });
+        wait_until_tell_has_reserved_its_lease(&engine, trial.trial_id).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            assert_eq!(engine.trial_count().await, 0);
+            engine
+                .heartbeat(trial.trial_id, Duration::from_secs(10))
+                .await
+                .unwrap();
+            let other = engine.ask().await.unwrap();
+            engine.cancel(other.trial_id).await.unwrap();
+            let scalar_objectives = single_objective_config("random").objectives;
+            engine.update_objectives(scalar_objectives).await.unwrap();
+        })
+        .await
+        .expect("state operations must not wait for ranking");
+        drop(held_worker);
+        let told = tell.await.unwrap().unwrap();
+        assert_eq!(told.score_vector, serde_json::json!({"loss": 4.0}));
+        assert_eq!(engine.trial_count().await, 1);
+        assert_eq!(
+            engine
+                .completed_trial(trial.trial_id, true)
+                .await
+                .unwrap()
+                .score_vector,
+            told.score_vector
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_prospective_rank_commit_preserves_pending_trial() {
+        let engine = HolaEngine::from_config(three_group_random_config()).unwrap();
+        let trial = engine.ask().await.unwrap();
+        let held_worker = engine
+            .ranking_workers
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let telling_engine = engine.clone();
+        let tell = tokio::spawn(async move {
+            telling_engine
+                .tell(trial.trial_id, serde_json::json!({"a": 1, "b": 2, "c": 3}))
+                .await
+        });
+        wait_until_tell_preparation_started(&engine).await;
+        tell.abort();
+        assert!(tell.await.unwrap_err().is_cancelled());
+        assert_eq!(engine.trial_count().await, 0);
+        assert_eq!(engine.pending_count().await, 1);
+        drop(held_worker);
+        let outcome = engine
+            .tell_with_outcome(trial.trial_id, serde_json::json!({"a": 1, "b": 2, "c": 3}))
+            .await
+            .unwrap();
+        assert!(outcome.newly_committed);
+        assert_eq!(engine.trial_count().await, 1);
+    }
+
+    async fn wait_until_tell_has_reserved_its_lease(engine: &HolaEngine, trial_id: u64) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if engine
+                    .state
+                    .read()
+                    .await
+                    .pending_tell_claims
+                    .get(&trial_id)
+                    .is_some_and(|claim| claim.strong_count() > 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tell must reserve its accepted lease");
+    }
+
+    #[tokio::test]
+    async fn accepted_tell_keeps_its_lease_during_ranking_but_explicit_cancel_wins() {
+        for cancel in [false, true] {
+            let engine = HolaEngine::from_config(three_group_random_config()).unwrap();
+            let trial = engine
+                .ask_with_lease(Duration::from_secs(60))
+                .await
+                .unwrap();
+            let held_worker = engine
+                .ranking_workers
+                .clone()
+                .acquire_owned()
+                .await
+                .unwrap();
+            let telling_engine = engine.clone();
+            let tell = tokio::spawn(async move {
+                telling_engine
+                    .tell(trial.trial_id, serde_json::json!({"a": 1, "b": 2, "c": 3}))
+                    .await
+            });
+            wait_until_tell_has_reserved_its_lease(&engine, trial.trial_id).await;
+            engine
+                .state
+                .write()
+                .await
+                .lease_deadlines
+                .insert(trial.trial_id, 0);
+            assert_eq!(engine.expire_pending_leases().await, 0);
+            assert_eq!(engine.pending_count().await, 1);
+            let another = engine.ask().await.unwrap();
+            engine.cancel(another.trial_id).await.unwrap();
+            if cancel {
+                engine.cancel(trial.trial_id).await.unwrap();
+            }
+            drop(held_worker);
+            let result = tell.await.unwrap();
+            if cancel {
+                assert!(result.unwrap_err().contains("cancelled"));
+                assert_eq!(engine.trial_count().await, 0);
+            } else {
+                result.unwrap();
+                assert_eq!(engine.trial_count().await, 1);
+            }
+            assert!(engine.state.read().await.pending_tell_claims.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_tell_releases_lease_reservation_immediately() {
+        let engine = HolaEngine::from_config(three_group_random_config()).unwrap();
+        let trial = engine
+            .ask_with_lease(Duration::from_secs(60))
+            .await
+            .unwrap();
+        let held_worker = engine
+            .ranking_workers
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let telling_engine = engine.clone();
+        let tell = tokio::spawn(async move {
+            telling_engine
+                .tell(trial.trial_id, serde_json::json!({"a": 1, "b": 2, "c": 3}))
+                .await
+        });
+        wait_until_tell_has_reserved_its_lease(&engine, trial.trial_id).await;
+        engine
+            .state
+            .write()
+            .await
+            .lease_deadlines
+            .insert(trial.trial_id, 0);
+        tell.abort();
+        assert!(tell.await.unwrap_err().is_cancelled());
+        assert_eq!(engine.expire_pending_leases().await, 1);
+        assert_eq!(engine.pending_count().await, 0);
+        assert_eq!(engine.trial_count().await, 0);
+        assert!(engine.state.read().await.pending_tell_claims.is_empty());
+        drop(held_worker);
     }
 
     #[test]
