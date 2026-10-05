@@ -35,7 +35,7 @@ limitations under the License.
         <span id="mode-label">Disconnected</span>
       </div>
       <div class="status-item">
-        <span class="label">Trials</span>
+        <span class="label">Displayed trials</span>
         <span id="stat-trials">0</span>
       </div>
       <div class="status-item">
@@ -90,6 +90,7 @@ limitations under the License.
             <label>X <select id="pareto-x"></select></label>
             <label>Y <select id="pareto-y"></select></label>
           </div>
+          <p id="ranking-note" role="status" hidden style="font-size:0.78rem;color:var(--text-2)"></p>
           <div style="position:relative">
             <canvas id="pareto-canvas" width="600" height="280" role="img"
                     aria-label="Pareto front scatter chart; full trial data is available in the trials table below."></canvas>

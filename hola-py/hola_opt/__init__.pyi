@@ -227,14 +227,13 @@ class Trial:
 class CompletedTrial:
     """A completed trial with scoring, ranking, and Pareto front information.
 
-    ``params``, ``metrics``, and ``scores`` are normally ``dict`` objects. On the
-    remote (``Study.connect``) path any of them may be ``None`` if the server
-    response omits the corresponding field.
+    ``params``, ``metrics``, ``scores``, and ``score_vector`` are dictionaries
+    in canonical local and server responses. Missing required remote fields
+    raise ``RemoteError``.
 
-    ``score_vector`` maps each priority group to its aggregated cost. A value is
-    ``None`` when the underlying cost is NaN (the engine serializes NaN as JSON
-    ``null``, which surfaces here as ``None``); infinities surface as
-    ``float('inf')``.
+    ``score_vector`` maps each priority group to its aggregated cost. Numeric
+    NaN and infinity sentinels are decoded to ``float('nan')``, ``float('inf')``,
+    or ``float('-inf')``. Raw metrics preserve literal JSON strings.
     """
 
     @property
@@ -324,8 +323,12 @@ class Study:
         """Report the result of a trial.
 
         Raises:
-            ObjectiveError: If local metrics violate the objective contract.
+            ObjectiveError: If metrics contain unsupported values, non-string
+                keys, a circular reference, or nesting deeper than 64 levels.
             RemoteError: If a remote request or response fails.
+
+        Missing or non-numeric objective fields produce infeasible scores.
+        Exact duplicate metrics replay the completion without committing twice.
         """
         ...
     def cancel(self, trial_id: int) -> None:
@@ -377,6 +380,8 @@ class Study:
 
         A Python exception raised by ``func`` is propagated unchanged. An
         invalid return value raises ``ObjectiveError``.
+        Remote trial leases are renewed automatically during evaluation when
+        the server supports heartbeats. Renewal tasks stop on every exit path.
         """
         ...
     def serve(
@@ -384,15 +389,32 @@ class Study:
         port: int = 8000,
         background: bool = False,
         dashboard_path: str | None = None,
+        *,
+        host: str = "127.0.0.1",
+        auth_token: str | None = None,
+        lease_seconds: float = 7200.0,
     ) -> None:
-        """Start a REST server for this study."""
+        """Start a REST server for this local study.
+
+        Background startup waits until binding succeeds. One background server
+        may run per study; call ``stop()`` before restarting it. Binding to a
+        non-loopback host requires ``auth_token``. Dropping the study requests
+        graceful shutdown of its background server.
+        """
+        ...
+    def stop(self) -> None:
+        """Stop this local study's background server and wait for shutdown.
+
+        A no-op if no background server is running. Remote studies reject this
+        operation with ``ConfigurationError``.
+        """
         ...
 
 def dashboard_dir() -> Path:
     """Return the path to the bundled dashboard static files.
 
     Useful for passing to ``Study.serve(dashboard_path=str(dashboard_dir()))``.
-    Returns a ``pathlib.Path`` even if the directory does not exist (the dashboard
-    is only bundled in release wheels, not editable installs from source).
+    The versioned assets are bundled in source/editable trees, wheels, and
+    source distributions.
     """
     ...

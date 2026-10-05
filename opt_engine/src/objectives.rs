@@ -46,7 +46,7 @@ pub fn tlp_score(value: f64, target: f64, limit: f64) -> f64 {
         } else if value > limit {
             f64::INFINITY
         } else {
-            (value - target) / (limit - target)
+            normalized_distance(value, target, limit)
         }
     } else if target > limit {
         // Maximize: higher is better
@@ -55,11 +55,22 @@ pub fn tlp_score(value: f64, target: f64, limit: f64) -> f64 {
         } else if value < limit {
             f64::INFINITY
         } else {
-            (target - value) / (target - limit)
+            normalized_distance(value, target, limit)
         }
     } else {
         // Degenerate: target == limit
         if value >= target { 0.0 } else { f64::INFINITY }
+    }
+}
+
+/// Preserve ordinary interpolation arithmetic, scaling only the differences
+/// whose finite endpoints would otherwise produce an infinite span.
+fn normalized_distance(value: f64, target: f64, limit: f64) -> f64 {
+    let span = limit - target;
+    if span.is_finite() {
+        (value - target) / span
+    } else {
+        (value * 0.5 - target * 0.5) / (limit * 0.5 - target * 0.5)
     }
 }
 
@@ -136,5 +147,16 @@ mod tests {
         assert_eq!(tlp_score(1.0, 1.0, 1.0), 0.0);
         assert_eq!(tlp_score(2.0, 1.0, 1.0), 0.0);
         assert!(tlp_score(0.5, 1.0, 1.0).is_infinite());
+    }
+
+    #[test]
+    fn test_tlp_extreme_finite_bounds_do_not_overflow() {
+        for (target, limit) in [(-1e308, 1e308), (1e308, -1e308)] {
+            assert_eq!(tlp_score(target, target, limit), 0.0);
+            assert_eq!(tlp_score(0.0, target, limit), 0.5);
+            assert_eq!(tlp_score(limit, target, limit), 1.0);
+            assert_eq!(tlp_score(target * 0.5, target, limit), 0.25);
+            assert_eq!(tlp_score(limit * 0.5, target, limit), 0.75);
+        }
     }
 }

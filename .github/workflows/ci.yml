@@ -178,16 +178,24 @@ jobs:
       # Use .venv/bin/python after wheel installation to avoid uv re-sync
       # replacing the exact artifact under test with an editable source build.
 
+      - name: Build CLI for wheel/server integration tests
+        run: cargo build --locked -p hola-cli
+
       - name: Run unit tests
         shell: bash
+        env:
+          HOLA_CLI_BINARY: ${{ github.workspace }}/target/debug/hola
         run: |
           wheel_tests="$RUNNER_TEMP/hola-wheel-tests"
           mkdir -p "$wheel_tests"
           cp tests/conftest.py \
+             tests/test_binding_lifecycle.py \
+             tests/test_cli_fixture.py \
              tests/test_exceptions.py \
              tests/test_ffi_roundtrip.py \
              tests/test_hola.py \
              tests/test_remote_client_hardening.py \
+             tests/test_server.py \
              tests/test_stubs.py \
              tests/test_study_advanced.py \
              "$wheel_tests/"
@@ -233,9 +241,18 @@ jobs:
             "$GITHUB_WORKSPACE/hola-py/tests/test_doc_examples.py" -v --timeout=30
         working-directory: hola-py
 
+      - name: Check documented benchmark objectives
+        if: matrix.python-version == '3.12'
+        run: .venv/bin/python -m pytest tests/test_doc_objectives.py -v
+        working-directory: hola-py
+
       - name: Test package-index generator
         if: matrix.python-version == '3.12'
         run: python3 .github/scripts/test_build_simple_index.py
+
+      - name: Test native CLI artifact staging
+        if: matrix.python-version == '3.12'
+        run: python3 .github/scripts/test_stage_cli_for_tests.py
 
   # ── CLI: real server/worker subprocess flow on every native OS ──
   cli-integration:

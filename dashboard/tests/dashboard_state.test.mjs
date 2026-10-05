@@ -38,6 +38,9 @@ function buildHtml() {
             'isCheckpointFileSizeAllowed',
             'loadCheckpointFile',
             'previewObjectives',
+            'rescoreTrialForPreview',
+            'resetObjectives',
+            'applyObjectives',
             'renderConvergence',
             'renderParallel',
             'renderPareto',
@@ -766,10 +769,302 @@ test('large unranked vector checkpoints use exact 2-D and bounded many-objective
         const frontZero = trials.filter(trial => trial.pareto_front === 0);
         assert.deepEqual(frontZero.map(trial => trial.trial_id), [0]);
         assert.ok(frontZero.every(window.isTrialFeasible));
-        assert.ok(trials.at(-1).pareto_front > 0);
-        assert.ok(trials.at(-1).rank > 0);
+        assert.equal(trials[1].pareto_front, null);
+        assert.equal(trials[1].rank, null);
+        assert.equal(trials.at(-1).pareto_front, null);
+        assert.equal(trials.at(-1).rank, null);
+        window.replaceTrials(trials);
+        assert.equal(window.S.rankingPartial, true);
     } finally {
         dom.window.close();
+    }
+});
+
+test('preview honors inclusive limits, priorities and wide finite TLP spans', () => {
+    const { dom, window } = createDom();
+    try {
+        for (const [type, target, limit] of [['minimize', 0, 1], ['maximize', 1, 0]]) {
+            window.S.objectives = [{ field: 'loss', type, target, limit, priority: 2 }];
+            for (const [value, expected] of [[target, 0], [limit, 2], [0.5, 1]]) {
+                const trial = { metrics: { loss: value } };
+                window.rescoreTrialForPreview(trial);
+                assert.equal(trial.score_vector.loss, expected);
+                assert.equal(window.isTrialFeasible(trial), true);
+            }
+        }
+        window.S.objectives = [{ field: 'loss', type: 'minimize', target: -1e308, limit: 1e308 }];
+        const wide = { metrics: { loss: 0 } };
+        window.rescoreTrialForPreview(wide);
+        assert.equal(wide.score_vector.loss, 0.5);
+        window.S.objectives[0].priority = 0;
+        window.S.objectives[0].limit = 1;
+        const invalid = { metrics: { loss: 2 } };
+        window.rescoreTrialForPreview(invalid);
+        assert.equal(invalid.score_vector.loss, Infinity);
+        assert.equal(window.isTrialFeasible(invalid), false);
+        window.S.objectives = [{ field: 'loss', type: 'minimize', group: '__proto__' }];
+        window.rescoreTrialForPreview(wide);
+        assert.equal(wide.score_vector.__proto__, 0);
+    } finally { dom.window.close(); }
+});
+
+test('preview preserves the engine scoring of IEEE-754 metric sentinels', () => {
+    const { dom, window } = createDom();
+    try {
+        for (const [type, target, limit, good, bad] of [
+            ['minimize', 0, 1, '-inf', 'inf'],
+            ['maximize', 1, 0, 'inf', '-inf'],
+        ]) {
+            window.S.objectives = [{ field: 'loss', type, target, limit, priority: 0 }];
+            const trial = { metrics: { loss: good } };
+            window.rescoreTrialForPreview(trial);
+            assert.equal(trial.score_vector.loss, 0);
+            trial.metrics.loss = bad;
+            window.rescoreTrialForPreview(trial);
+            assert.equal(trial.score_vector.loss, Infinity);
+            trial.metrics.loss = 'nan';
+            window.rescoreTrialForPreview(trial);
+            assert.equal(Number.isNaN(trial.score_vector.loss), true);
+        }
+        window.S.objectives = [{ field: 'loss', type: 'maximize' }];
+        const trial = { metrics: { loss: 'inf' } };
+        window.rescoreTrialForPreview(trial);
+        assert.equal(trial.score_vector.loss, -Infinity);
+        assert.equal(window.isTrialFeasible(trial), false);
+    } finally {
+        dom.window.close();
+    }
+});
+
+test('invalid partial TLP configuration leaves preview state unchanged', () => {
+    const { dom, window, alerts } = createDom();
+    try {
+        window.applyCheckpointData({
+            format: 'hola-dashboard-export',
+            objectives: [{ field: 'loss', type: 'minimize', priority: 1 }],
+            trials: [{ trial_id: 0, metrics: { loss: 3 }, score_vector: { loss: 3 }, rank: 0, pareto_front: 0 }],
+        });
+        window.S.objectives[0].target = 0;
+        window.previewObjectives();
+        assert.equal(alerts.length, 1);
+        assert.equal(window.S.previewActive, false);
+        assert.equal(window.S.trials[0].score_vector.loss, 3);
+        assert.equal(window.document.getElementById('preview-badge').style.display, 'none');
+    } finally { dom.window.close(); }
+});
+
+test('offline reset restores authoritative scores and ranks across repeated previews', async () => {
+    const { dom, window } = createDom();
+    try {
+        window.applyCheckpointData({
+            format: 'hola-dashboard-export',
+            objectives: [{ field: 'loss', type: 'minimize', priority: 1 }],
+            trials: [{ trial_id: 0, metrics: { loss: 3 }, score_vector: { loss: 3 }, rank: 0, pareto_front: 0 }],
+        });
+        window.S.objectives[0].priority = 2;
+        window.previewObjectives();
+        assert.equal(window.S.trials[0].score_vector.loss, 6);
+        window.S.objectives[0].priority = 3;
+        window.previewObjectives();
+        assert.equal(window.S.trials[0].score_vector.loss, 9);
+        await window.resetObjectives();
+        assert.equal(window.S.objectives[0].priority, 1);
+        assert.equal(window.S.trials[0].score_vector.loss, 3);
+        assert.equal(window.S.trials[0].rank, 0);
+        assert.equal(window.S.previewActive, false);
+        assert.equal(window.S.previewOriginalScores, null);
+    } finally { dom.window.close(); }
+});
+
+test('live preview replay cannot restore ranks from the server objectives', async () => {
+    const { dom, window } = createDom();
+    const original = [
+        { trial_id: 0, metrics: { a: 0, b: 10, c: 0 }, score_vector: { a: 0, b: 10, c: 0 }, rank: 0, pareto_front: 0 },
+        { trial_id: 1, metrics: { a: 5, b: 0, c: 0 }, score_vector: { a: 5, b: 0, c: 0 }, rank: 1, pareto_front: 0 },
+    ];
+    try {
+        window.applyCheckpointData({
+            format: 'hola-dashboard-export',
+            objectives: ['a', 'b', 'c'].map(field => ({ field, type: 'minimize' })),
+            trials: structuredClone(original),
+        });
+        window.S.mode = 'live';
+        window.S.serverUrl = 'http://preview-replay.test';
+        window.S.objectives[0].group = 'quality';
+        window.S.objectives[1].group = 'quality';
+        window.previewObjectives();
+        assert.equal(window.S.trials[0].score_vector.quality, 10);
+        assert.equal(window.S.trials[0].pareto_front, 1);
+        assert.deepEqual(Array.from(window.S.paretoFrontIds), [1]);
+
+        await window.handleEngineEvent({
+            type: 'TrialCompleted', trial_id: 0, trial: structuredClone(original[0]),
+        });
+        assert.equal(window.S.previewActive, true);
+        assert.equal(window.S.trials[0].score_vector.quality, 10);
+        assert.equal(window.S.trials[0].pareto_front, 1);
+        assert.equal(window.S.trials[0].rank, 1);
+        assert.equal(window.S.trials[1].pareto_front, 0);
+        assert.deepEqual(Array.from(window.S.paretoFrontIds), [1]);
+    } finally { dom.window.close(); }
+});
+
+test('partial preview keeps existing replay memberships unknown', async () => {
+    const { dom, window } = createDom();
+    try {
+        window.applyCheckpointData({
+            format: 'hola-dashboard-export',
+            objectives: ['a', 'b', 'c'].map(field => ({ field, type: 'minimize' })),
+            trials: Array.from({ length: 2049 }, (_, i) => ({
+                trial_id: i, metrics: { a: i, b: 2048-i, c: 0 },
+                score_vector: { a: i, b: 2048-i, c: 0 },
+            })),
+        });
+        window.S.mode = 'live';
+        window.S.serverUrl = 'http://partial-preview.test';
+        window.previewObjectives();
+        assert.equal(window.S.rankingPartial, true);
+        assert.equal(window.S.trials[17].pareto_front, null);
+        await window.handleEngineEvent({
+            type: 'TrialCompleted', trial_id: 17,
+            trial: {
+                trial_id: 17, metrics: { a: 17, b: 2031, c: 0 },
+                score_vector: { a: 17, b: 2031, c: 0 },
+                rank: 0, pareto_front: 0,
+            },
+        });
+        assert.equal(window.S.rankingPartial, true);
+        assert.equal(window.S.trials[17].pareto_front, null);
+        assert.equal(window.S.trials[17].rank, null);
+        assert.equal(window.S.trials[17].ranking_status, 'partial');
+        assert.deepEqual(Array.from(window.S.paretoFrontIds), [0]);
+    } finally { dom.window.close(); }
+});
+
+test('partial frontier membership stays unknown on import, export replay and live append', () => {
+    const { dom, window } = createDom();
+    try {
+        const trials = Array.from({length: 2049}, (_, i) => ({
+            trial_id: i,
+            metrics: {a: i, b: 2048-i, c: 0},
+            score_vector: {a: i, b: 2048-i, c: 0},
+        }));
+        window.applyCheckpointData({format: 'hola-dashboard-export', trials});
+        const note = window.document.getElementById('ranking-note');
+        assert.equal(note.hidden, false);
+        assert.match(note.textContent, /memberships and ranks are unknown/);
+        assert.equal(window.S.trials.filter(t => t.pareto_front === 0).length, 1);
+        assert.equal(window.S.trials.filter(t => t.pareto_front === null).length, 2048);
+        const replay = JSON.parse(JSON.stringify(window.S.trials));
+        window.applyCheckpointData({format: 'hola-dashboard-export', trials: replay});
+        assert.equal(window.S.rankingPartial, true);
+        window.upsertTrial({trial_id: 3000, score_vector: {a: 2, b: 2047, c: 0}, rank: 0, pareto_front: 0});
+        assert.equal(window.S.trials.at(-1).pareto_front, null);
+        window.upsertTrial({trial_id: 3001, score_vector: {a: -1, b: 3000, c: 0}, rank: 0, pareto_front: 0});
+        assert.equal(window.S.trials.at(-1).pareto_front, 0);
+        assert.equal(window.S.trials.at(-1).rank, null);
+        assert.equal(window.S.trials[0].pareto_front, null);
+    } finally { dom.window.close(); }
+});
+
+test('live reset replays completions racing its authoritative snapshot', async () => {
+    const router = requestRouter();
+    const { dom, window } = createDom(router.fetch);
+    const server = 'http://reset-race.test';
+    const trialsUrl = `${server}/api/trials?sorted_by=index&include_infeasible=true`;
+    const original = {
+        trial_id: 0, metrics: { loss: 10 }, score_vector: { loss: 10 },
+        rank: 0, pareto_front: 0,
+    };
+    const completion = {
+        type: 'TrialCompleted', trial_id: 1,
+        trial: {
+            trial_id: 1, metrics: { loss: 1 }, score_vector: { loss: 1 },
+            rank: 0, pareto_front: 0,
+        },
+    };
+    try {
+        window.S.mode = 'live';
+        window.S.serverUrl = server;
+        window.S.objectives = [{ field: 'loss', type: 'minimize', priority: 1 }];
+        window.S.serverObjectives = JSON.parse(JSON.stringify(window.S.objectives));
+        window.replaceTrials([structuredClone(original)]);
+        window.S.objectives[0].priority = 2;
+        window.previewObjectives();
+        const resetting = window.resetObjectives();
+        (await router.waitFor(`${server}/api/event_cursor`))
+            .resolve(jsonResponse({ last_event_id: '5' }));
+        (await router.waitFor(`${server}/api/space`))
+            .resolve(jsonResponse({ params: [] }));
+        (await router.waitFor(`${server}/api/objectives`))
+            .resolve(jsonResponse({ objectives: [{ field: 'loss', type: 'minimize', priority: 1 }] }));
+        const snapshot = await router.waitFor(trialsUrl);
+
+        // A previously dispatched completion can finish during the GET. A
+        // snapshot captured before it must restart replay from the watermark,
+        // rather than permanently erase that completion after its cursor moves.
+        await window.handleEngineEvent(structuredClone(completion));
+        window.S.lastEventId = '6';
+        assert.deepEqual(Array.from(window.S.trials, trial => trial.trial_id), [0, 1]);
+        snapshot.resolve(jsonResponse([structuredClone(original)]));
+        await resetting;
+        const stream = await router.waitFor(`${server}/api/events`);
+        assert.equal(stream.options.headers.get('Last-Event-ID'), '5');
+        const encoded = new TextEncoder().encode(
+            `id: 6\ndata: ${JSON.stringify(completion)}\n\n`,
+        );
+        let delivered = false;
+        stream.resolve({
+            ok: true, status: 200,
+            body: {
+                getReader() {
+                    return {
+                        read() {
+                            if (delivered) return new Promise(() => {});
+                            delivered = true;
+                            return Promise.resolve({ value: encoded, done: false });
+                        },
+                    };
+                },
+            },
+        });
+        for (let i = 0; i < 20 && window.S.trials.length < 2; i++) {
+            await new Promise(resolvePromise => setImmediate(resolvePromise));
+        }
+        assert.deepEqual(Array.from(window.S.trials, trial => trial.trial_id), [0, 1]);
+        assert.equal(window.S.trials[1].score_vector.loss, 1);
+        assert.equal(window.S.previewActive, false);
+        assert.equal(window.S.objectives[0].priority, 1);
+        assert.equal(window.S.lastEventId, '6');
+    } finally {
+        window.stopStream();
+        dom.window.close();
+    }
+});
+
+test('pending reset and apply cannot overwrite a newly loaded checkpoint', async () => {
+    for (const action of ['resetObjectives', 'applyObjectives']) {
+        const pending = deferred();
+        const { dom, window } = createDom(() => pending.promise);
+        try {
+            window.S.mode = 'live';
+            window.S.serverUrl = 'http://old-server.test';
+            window.S.objectives = [{ field: 'loss', type: 'minimize', priority: 1 }];
+            const running = window[action]();
+            window.S.connectionGeneration++;
+            window.applyCheckpointData({
+                format: 'hola-dashboard-export',
+                objectives: [{ field: 'offline', type: 'minimize', priority: 1 }],
+                trials: [{ trial_id: 99, metrics: { offline: 7 }, score_vector: { offline: 7 }, rank: 0, pareto_front: 0 }],
+            });
+            pending.resolve(jsonResponse(action === 'resetObjectives'
+                ? [{trial_id: 0, score_vector: {loss: -1}, rank: 0, pareto_front: 0}]
+                : {status: 'ok'}));
+            await running;
+            assert.equal(window.S.mode, 'offline');
+            assert.equal(window.S.trials[0].trial_id, 99);
+            assert.equal(window.S.objectives[0].field, 'offline');
+        } finally { dom.window.close(); }
     }
 });
 
