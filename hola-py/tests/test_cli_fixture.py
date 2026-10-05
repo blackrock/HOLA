@@ -11,12 +11,21 @@
 
 """Required server coverage must use the intended CLI and fail closed."""
 
+import importlib.util
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
-import conftest
 import pytest
+
+# Load the sibling fixture explicitly so relocated wheel tests and type checking
+# cannot resolve a different test suite's module named "conftest".
+_fixture_spec = importlib.util.spec_from_file_location(
+    "hola_cli_fixture_under_test", Path(__file__).with_name("conftest.py")
+)
+assert _fixture_spec is not None and _fixture_spec.loader is not None
+conftest = importlib.util.module_from_spec(_fixture_spec)
+_fixture_spec.loader.exec_module(conftest)
 
 
 def _executable(path: Path) -> Path:
