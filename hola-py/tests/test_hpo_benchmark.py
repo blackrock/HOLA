@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import pickle
 import sys
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
@@ -34,8 +33,9 @@ from benchmarks.problems.hpo import (
 )
 from benchmarks.runner import run_hpo as hpo_runner
 from benchmarks.runner.config import RunConfig
+from benchmarks.runner.executor import _process_pool
 from benchmarks.runner.run_hpo import _run_hpo_one
-from hola_opt import Categorical, Integer, Real
+from hola_opt import Categorical, Integer, Minimize, Real, Space, Study
 
 pytestmark = pytest.mark.benchmarks
 
@@ -340,8 +340,13 @@ def test_diabetes_split_is_deterministic_and_heldout_is_sealed() -> None:
 
 
 def test_hpo_work_item_is_pickleable_and_runs_in_real_process_pool() -> None:
+    parent_study = Study(
+        space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")], strategy="random"
+    )
+    parent_study.run(lambda params: {"loss": params["x"]}, 1)
+
     pickle.dumps((DIABETES_GBR_HPO, HolaHpoAdapter("random"), 1, 0))
-    with ProcessPoolExecutor(max_workers=1) as executor:
+    with _process_pool(max_workers=1) as executor:
         row = executor.submit(
             _run_hpo_one,
             DIABETES_GBR_HPO,

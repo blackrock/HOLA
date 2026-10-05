@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import pickle
-from concurrent.futures import Executor, Future, ProcessPoolExecutor
+from concurrent.futures import Executor, Future
 from typing import Any, cast
 
 import numpy as np
@@ -53,6 +53,7 @@ from benchmarks.problems.single_objective import SINGLE_OBJECTIVE_PROBLEMS  # no
 from benchmarks.runner.config import RunConfig  # noqa: E402
 from benchmarks.runner.executor import (  # noqa: E402
     _bounded_futures,
+    _process_pool,
     _run_multi_one,
     _run_single_one,
     run_single_objective,
@@ -349,16 +350,24 @@ def test_single_objective_adapters_use_exact_budget(
 @pytest.mark.benchmarks
 def test_primary_pymoo_single_adapters_run_through_a_real_process_pool() -> None:
     """Campaign workers must be able to pickle every primary adapter and work item."""
+    from hola_opt import Minimize, Real, Space, Study
+
+    parent_study = Study(
+        space=Space(x=Real(0.0, 1.0)), objectives=[Minimize("loss")], strategy="random"
+    )
+    parent_study.run(lambda params: {"loss": params["x"]}, 1)
+
     problem = SINGLE_OBJECTIVE_PROBLEMS["forrester_1d"]
     adapters = [
         ga_adapter(),
         pso_adapter(),
         hooke_jeeves_adapter(),
+        HolaSingleObjectiveAdapter("random"),
     ]
     for adapter in adapters:
         pickle.loads(pickle.dumps(adapter))
 
-    with ProcessPoolExecutor(max_workers=2) as executor:
+    with _process_pool(max_workers=2) as executor:
         futures = [
             executor.submit(_run_single_one, problem, adapter, 25, index)
             for index, adapter in enumerate(adapters)
