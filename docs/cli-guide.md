@@ -69,6 +69,8 @@ objectives:
     priority: 0.5
     group: cost
 
+max_trials: 200  # trial cap and S for the automatic GMM warm-up
+
 strategy:
   type: gmm
   refit_interval: 20
@@ -185,10 +187,10 @@ strategy:
   refit_interval: 20       # how often GMM refits (used by "gmm")
   seed: 42                 # optional seed for reproducible runs
   exploration_budget: 50   # number of Sobol asks before switching to GMM
-  elite_fraction: 0.25     # fraction of top trials used for GMM fitting (default: 0.25)
-  ongoing_exploration_period: 5  # every Nth post-warmup ask is Sobol (0 disables)
-  max_components: 3        # maximum fitted GMM components
-  min_elite_samples: 1     # minimum feasible elite workset before fitting
+  elite_fraction: 0.125    # fraction of top trials used for GMM fitting
+  ongoing_exploration_period: 0  # every Nth post-warmup ask is Sobol (0 disables)
+  max_components: 1        # maximum fitted GMM components
+  min_elite_samples: 5     # minimum feasible elite workset before fitting
   max_refit_samples: 4096  # maximum elite samples passed to one GMM fit
   max_refit_candidates: 16384  # maximum trials ranked to choose elites
 ```
@@ -199,11 +201,11 @@ strategy:
 | `refit_interval` | `20` | How often the GMM refits (only used by `"gmm"`) |
 | `seed` | none | Seed for reproducible runs. When omitted, HOLA draws one seed once and records it in full checkpoints. |
 | `total_budget` | none | Alternative total trial cap and source for the warm-up budget when top-level `max_trials` is omitted |
-| `exploration_budget` | none | Number of issued Sobol exploration suggestions before switching to GMM exploitation. Pending asks count against this budget. The default is `min(floor(S/5), 50 + 2n)`, rounded down to a power of two, for total budget `S` and dimension `n`. |
-| `elite_fraction` | `0.25` | Fraction of top trials used for GMM refitting. Must be in (0.0, 1.0]. |
-| `ongoing_exploration_period` | `5` | Continue global Sobol' exploration every Nth post-warmup suggestion. Use `0` to disable; explicit periods must be at least 2. |
-| `max_components` | `3` | Maximum fitted GMM components. The effective count can be lower for small elite sets. |
-| `min_elite_samples` | `1` | Minimum feasible elite workset required before fitting. Must not exceed `max_refit_samples`. |
+| `exploration_budget` | none | Number of issued Sobol exploration suggestions before switching to GMM exploitation. Pending asks count against this budget. When omitted, HOLA doubles `min(floor(S/5), 50 + 2n)` and then rounds down to a power of two, for total budget `S` and dimension `n`; `S=200` when neither budget field is set. |
+| `elite_fraction` | `0.125` | Fraction of top trials used for GMM refitting. Must be in (0.0, 1.0]. |
+| `ongoing_exploration_period` | `0` | Continue global Sobol' exploration every Nth post-warmup suggestion. The default `0` disables it; explicit periods must be at least 2. |
+| `max_components` | `1` | Maximum fitted GMM components. The effective count can be lower for small elite sets. |
+| `min_elite_samples` | `5` | Minimum feasible elite workset required before fitting. Must not exceed `max_refit_samples`. |
 | `max_refit_samples` | `4096` | Maximum elite samples passed to one GMM fit. Must be at least 1. |
 | `max_refit_candidates` | `16384` | Maximum retained trials ranked to choose elites. Must be at least `max_refit_samples`; longer histories use deterministic stratified coverage of the full retained history. |
 

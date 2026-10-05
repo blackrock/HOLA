@@ -1985,7 +1985,7 @@ async fn test_dyn_engine_full_checkpoint_resume_preserves_vector_trial_ids() {
 }
 
 #[tokio::test]
-async fn test_dyn_engine_checkpoint_load_with_fallback_supports_full_and_leaderboard() {
+async fn test_configured_checkpoint_load_supports_full_and_leaderboard() {
     let config = scalar_checkpoint_config(None);
     let engine = HolaEngine::from_config(config.clone()).unwrap();
     let trial = engine.ask().await.unwrap();
@@ -2001,14 +2001,20 @@ async fn test_dyn_engine_checkpoint_load_with_fallback_supports_full_and_leaderb
         .await
         .unwrap();
 
-    let restored_full = HolaEngine::from_config(config.clone()).unwrap();
-    let kind = restored_full
-        .load_checkpoint_with_fallback(&full_path)
+    let (restored_full, kind) = HolaEngine::load_configured_checkpoint(config.clone(), &full_path)
         .await
         .unwrap();
     assert_eq!(kind, CheckpointLoadKind::Full);
     assert_eq!(restored_full.trial_count().await, 1);
     assert_eq!(restored_full.ask().await.unwrap().trial_id, 1);
+
+    let strict_full = HolaEngine::from_config(config.clone()).unwrap();
+    let strict_kind = strict_full
+        .load_checkpoint_with_fallback(&full_path)
+        .await
+        .unwrap();
+    assert_eq!(strict_kind, CheckpointLoadKind::Full);
+    assert_eq!(strict_full.trial_count().await, 1);
 
     let leaderboard_path = dir.path().join("leaderboard.json");
     engine
@@ -2016,14 +2022,21 @@ async fn test_dyn_engine_checkpoint_load_with_fallback_supports_full_and_leaderb
         .await
         .unwrap();
 
-    let restored_leaderboard = HolaEngine::from_config(config).unwrap();
-    let kind = restored_leaderboard
-        .load_checkpoint_with_fallback(&leaderboard_path)
-        .await
-        .unwrap();
+    let (restored_leaderboard, kind) =
+        HolaEngine::load_configured_checkpoint(config, &leaderboard_path)
+            .await
+            .unwrap();
     assert_eq!(kind, CheckpointLoadKind::Leaderboard);
     assert_eq!(restored_leaderboard.trial_count().await, 1);
     assert!(restored_leaderboard.ask().await.unwrap().trial_id >= (1_u64 << 62));
+
+    let strict_leaderboard = HolaEngine::from_config(scalar_checkpoint_config(None)).unwrap();
+    let strict_kind = strict_leaderboard
+        .load_checkpoint_with_fallback(&leaderboard_path)
+        .await
+        .unwrap();
+    assert_eq!(strict_kind, CheckpointLoadKind::Leaderboard);
+    assert_eq!(strict_leaderboard.trial_count().await, 1);
 }
 
 #[tokio::test]
@@ -2265,21 +2278,21 @@ async fn test_auto_strategy_with_explicit_exploration_budget() {
 fn test_auto_strategy_default_exploration_budget() {
     use hola::hola_engine::AutoStrategy;
 
-    // min(40, 56) = 40 -> round down to 32
-    assert_eq!(AutoStrategy::default_exploration_budget(200, 3), 32);
+    // 2 * min(40, 56) = 80 -> round down to 64
+    assert_eq!(AutoStrategy::default_exploration_budget(200, 3), 64);
 
-    // min(20, 52) = 20 -> round down to 16
-    assert_eq!(AutoStrategy::default_exploration_budget(100, 1), 16);
+    // 2 * min(20, 52) = 40 -> round down to 32
+    assert_eq!(AutoStrategy::default_exploration_budget(100, 1), 32);
 
-    // min(200, 60) = 60 -> round down to 32
-    assert_eq!(AutoStrategy::default_exploration_budget(1000, 5), 32);
+    // 2 * min(200, 60) = 120 -> round down to 64
+    assert_eq!(AutoStrategy::default_exploration_budget(1000, 5), 64);
 
-    // min(10, 70) = 10 -> round down to 8
-    assert_eq!(AutoStrategy::default_exploration_budget(50, 10), 8);
+    // 2 * min(10, 70) = 20 -> round down to 16
+    assert_eq!(AutoStrategy::default_exploration_budget(50, 10), 16);
 
     // Edge cases
-    assert_eq!(AutoStrategy::default_exploration_budget(10, 1), 2); // min(2, 52) = 2
-    assert_eq!(AutoStrategy::default_exploration_budget(5, 1), 1); // min(1, 52) = 1
+    assert_eq!(AutoStrategy::default_exploration_budget(10, 1), 4);
+    assert_eq!(AutoStrategy::default_exploration_budget(5, 1), 2);
 }
 
 #[tokio::test]

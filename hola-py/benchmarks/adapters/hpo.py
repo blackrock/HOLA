@@ -19,7 +19,12 @@ from typing import Any
 
 import optuna
 
-from benchmarks.adapters.base import HpoOptimizationResult, assert_exact_evaluations
+from benchmarks.adapters.base import (
+    HpoOptimizationResult,
+    assert_exact_evaluations,
+    empirical_exploitation_gate_configuration,
+    require_empirical_gmm_exploitation,
+)
 from benchmarks.problems.hpo import (
     CategoricalParameter,
     HpoProblem,
@@ -83,13 +88,18 @@ class HolaHpoAdapter:
         self.name = f"HOLA HPO ({label})"
 
     def configuration(self, budget: int) -> dict[str, object]:
-        return {
+        configuration: dict[str, object] = {
             "adapter": type(self).__name__,
             "strategy": self.strategy,
             "max_trials": budget,
             "n_workers": 1,
             "objective": "maximize fixed-split validation R2",
         }
+        if self.strategy == "gmm":
+            configuration["empirical_exploitation_gate"] = (
+                empirical_exploitation_gate_configuration()
+            )
+        return configuration
 
     def optimize(
         self,
@@ -115,6 +125,8 @@ class HolaHpoAdapter:
         trials = study.trials(sorted_by="index", include_infeasible=True)
         n_evaluations = len(trials)
         assert_exact_evaluations(n_evaluations, budget, self.name)
+        if self.strategy == "gmm":
+            require_empirical_gmm_exploitation(study, n_evaluations)
         validation_trace = [float(trial.metrics[problem.objective_name]) for trial in trials]
         best = max(trials, key=lambda trial: float(trial.metrics[problem.objective_name]))
         return HpoOptimizationResult(

@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+## 1.0.1-rc9
+
+Development source version. The first official release remains pending the
+paper and Dylan's approval.
+
+- Corrected bounded-history elite selection, shared Pareto/crowding ordering,
+  and multi-objective ranking memory use. Ranking runs outside the async
+  runtime and read lock, with serialized completion and publication order.
+- Python servers confirm startup and support explicit shutdown. Remote
+  workers renew leases while objectives run and reconcile failed cleanup.
+  Recursive or excessively nested objective values fail without losing work.
+- The dashboard preserves offline previews across resets, resynchronizes live
+  configuration changes, and reports incomplete large multi-group rankings
+  explicitly. Preview constraints and extreme objective bounds match the engine.
+- Benchmark campaigns use spawned worker processes so an initialized native
+  runtime in the parent cannot strand worker execution after a fork.
+- Required packaged CLI/server tests now fail when their binary is missing,
+  and CI covers fixture relocation and documented objective formulas.
+- Corrected the documented Forrester objective, lifetime/retained-history
+  semantics, refit bounds, and server lifecycle examples.
+- Updated Rust TLS and Python documentation/HTTP dependencies to resolve the
+  audited vulnerabilities. Refreshed Clap, Hyper, UUID, and pinned CI/release
+  actions after compatibility review.
+- Fresh GMM studies now use the held-out-calibrated defaults: twice the raw
+  warm-up rule before power-of-two rounding, a 12.5% elite fraction, no ongoing
+  post-warm-up Sobol' cadence, one mixture component, and a five-sample elite
+  floor. Direct low-level GMM constructors and refit configuration use the same
+  component cap. Checkpoints that predate these explicit fields continue to
+  resolve to the historical defaults when loaded.
 - Multi-group GMM refits now select elites by Pareto rank and crowding
   distance, and grouped objectives apply priority weights only within their
   explicit group.
@@ -18,6 +47,8 @@
   seeds, immutable provenance manifests, failure-visible reporting, fixed
   metric scales, and strict result-coverage validation. The suite also adds
   analytic grouped-TLP and sealed-test mixed-space HPO capability studies.
+- Updated the documentation dependency lockfile to resolve CVE-2026-61632 in
+  `pymdown-extensions`.
 
 ## 1.0.1-rc8
 

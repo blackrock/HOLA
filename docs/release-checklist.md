@@ -1,5 +1,10 @@
 # Release Verification Checklist
 
+Code fixes and prerelease version updates may merge before the paper is ready.
+The first official release requires the paper to be ready and Dylan's approval.
+A `workflow_dispatch` release verification run builds and tests artifacts without
+creating a release or publishing the package index.
+
 Run this checklist on the exact release commit after the CI and Security Audit
 workflow runs for that commit are green. Record both run URLs and SHAs together
 with the commit, date, operator, browser/OS versions, and measured timings in

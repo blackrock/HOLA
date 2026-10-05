@@ -13,9 +13,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 import numpy as np
 
@@ -68,6 +69,92 @@ class EvaluationCountError(RuntimeError):
         super().__init__(
             f"{optimizer} used {actual} objective evaluations; expected exactly {expected}"
         )
+
+
+class EmpiricalExploitationError(RuntimeError):
+    """A GMM benchmark run did not produce authenticated empirical exploitation."""
+
+    def __init__(self, actual: int, observed_diagnostics: Mapping[str, object]) -> None:
+        self.actual = actual
+        self.observed_diagnostics = dict(observed_diagnostics)
+        observed = json.dumps(
+            self.observed_diagnostics,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        super().__init__(
+            "GMM empirical-exploitation gate failed "
+            "(requires gmm_fit_epoch>=1, gmm_sampling_ready=true, "
+            "gmm_origin_suggestions>=5, and "
+            "issued_suggestions==completed_evaluations); "
+            f"observed_diagnostics={observed}"
+        )
+
+
+def empirical_exploitation_gate_configuration() -> dict[str, object]:
+    """Return the manifest-bound practical-benchmark GMM gate."""
+
+    return {
+        "minimum_gmm_fit_epoch": 1,
+        "minimum_gmm_origin_suggestions": 5,
+        "on_failure": "preserved_error_outcome",
+    }
+
+
+def _stable_observed_value(value: object) -> object:
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is float:
+        return value if np.isfinite(value) else f"<nonfinite {value!r}>"
+    return f"<malformed {type(value).__name__}>"
+
+
+def require_empirical_gmm_exploitation(study: object, completed_evaluations: int) -> None:
+    """Fail closed unless a completed GMM run demonstrably used its fitted sampler."""
+
+    if type(completed_evaluations) is not int or completed_evaluations < 0:
+        raise ValueError("completed_evaluations must be a non-negative integer")
+    required_fields = (
+        "gmm_fit_epoch",
+        "gmm_origin_suggestions",
+        "gmm_sampling_ready",
+        "issued_suggestions",
+    )
+    observed: dict[str, object] = {"completed_evaluations": completed_evaluations}
+    try:
+        diagnostics_method = cast(Any, study).strategy_diagnostics
+        diagnostics = diagnostics_method()
+    except Exception as error:
+        observed["diagnostics_error"] = f"{type(error).__name__}: {error}"
+        raise EmpiricalExploitationError(completed_evaluations, observed) from error
+    if type(diagnostics) is not dict:
+        observed["diagnostics"] = f"<malformed {type(diagnostics).__name__}>"
+        raise EmpiricalExploitationError(completed_evaluations, observed)
+    diagnostics = cast(dict[object, object], diagnostics)
+    for field_name in required_fields:
+        observed[field_name] = (
+            "<missing>"
+            if field_name not in diagnostics
+            else _stable_observed_value(diagnostics[field_name])
+        )
+
+    fit_epoch = diagnostics.get("gmm_fit_epoch")
+    origin_suggestions = diagnostics.get("gmm_origin_suggestions")
+    sampling_ready = diagnostics.get("gmm_sampling_ready")
+    issued_suggestions = diagnostics.get("issued_suggestions")
+    valid = (
+        type(fit_epoch) is int
+        and fit_epoch >= 1
+        and type(origin_suggestions) is int
+        and origin_suggestions >= 5
+        and sampling_ready is True
+        and type(issued_suggestions) is int
+        and issued_suggestions == completed_evaluations
+    )
+    if not valid:
+        raise EmpiricalExploitationError(completed_evaluations, observed)
 
 
 def assert_exact_evaluations(actual: int, expected: int, optimizer: str) -> None:

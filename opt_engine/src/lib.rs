@@ -48,7 +48,9 @@ pub mod prelude {
         BranchingSpace, CategoricalSpace, ContinuousSpace, DiscreteSpace, EitherDomain,
         ProductSpace,
     };
-    pub use crate::strategies::{GmmRefitConfig, GmmStrategy, RandomStrategy, SobolStrategy};
+    pub use crate::strategies::{
+        DEFAULT_GMM_COMPONENTS, GmmRefitConfig, GmmStrategy, RandomStrategy, SobolStrategy,
+    };
     pub use crate::traits::{
         RefitConfig, RefittableStrategy, SampleSpace, StandardizedSpace, Strategy,
     };
@@ -63,5 +65,7 @@ pub use scales::{LinearScale, Log10Scale, LogScale, Scale};
 pub use spaces::{
     BranchingSpace, CategoricalSpace, ContinuousSpace, DiscreteSpace, EitherDomain, ProductSpace,
 };
-pub use strategies::{GmmRefitConfig, GmmStrategy, RandomStrategy, SobolStrategy};
+pub use strategies::{
+    DEFAULT_GMM_COMPONENTS, GmmRefitConfig, GmmStrategy, RandomStrategy, SobolStrategy,
+};
 pub use traits::{RefitConfig, RefittableStrategy, SampleSpace, StandardizedSpace, Strategy};

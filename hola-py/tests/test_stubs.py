@@ -35,6 +35,7 @@ EXPECTED_STUDY_METHODS = [
     "pareto_front",
     "trials",
     "trial_count",
+    "strategy_diagnostics",
     "update_objectives",
     "save",
     "run",
