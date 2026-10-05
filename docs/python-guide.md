@@ -400,6 +400,14 @@ study.run(objective, n_trials=100, n_workers=4)
 study.run(objective, n_trials=100, n_workers=1)
 ```
 
+When using Python multiprocessing, select a `spawn` context and construct each
+`Study` inside its worker. Forking a process after HOLA has initialized its
+threaded native runtime can hang during `run()` or a later refit, even if simple
+`ask()` and `tell()` calls succeed. For example, pass
+`mp_context=multiprocessing.get_context("spawn")` to `ProcessPoolExecutor`,
+and create the pool under `if __name__ == "__main__":`. The benchmark runners
+already use spawned workers.
+
 ## Inspecting Results
 
 All index fields (`trial_id`, `rank`, `pareto_front`) are
