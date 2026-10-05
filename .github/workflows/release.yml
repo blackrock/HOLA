@@ -377,7 +377,7 @@ jobs:
   # ── Wheel smoke test ────────────────────────────────────
   test-wheels:
     name: Test wheel (${{ matrix.os }}, Python ${{ matrix.python-version }})
-    needs: [build-wheels]
+    needs: [build-wheels, build-cli]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -386,14 +386,29 @@ jobs:
         include:
           - os: ubuntu-latest
             python-version: "3.10"
+            cli-artifact: cli-hola-linux-x86_64
+            cli-archive: hola-linux-x86_64.tar.gz
+            cli-binary: hola-linux-x86_64
           - os: ubuntu-24.04-arm
             python-version: "3.11"
+            cli-artifact: cli-hola-linux-aarch64
+            cli-archive: hola-linux-aarch64.tar.gz
+            cli-binary: hola-linux-aarch64
           - os: macos-15-intel
             python-version: "3.12"
+            cli-artifact: cli-hola-macos-x86_64
+            cli-archive: hola-macos-x86_64.tar.gz
+            cli-binary: hola-macos-x86_64
           - os: macos-latest
             python-version: "3.13"
+            cli-artifact: cli-hola-macos-aarch64
+            cli-archive: hola-macos-aarch64.tar.gz
+            cli-binary: hola-macos-aarch64
           - os: windows-latest
             python-version: "3.14"
+            cli-artifact: cli-hola-windows-x86_64.exe
+            cli-archive: hola-windows-x86_64.exe.zip
+            cli-binary: hola-windows-x86_64.exe
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -408,6 +423,20 @@ jobs:
           merge-multiple: true
           path: dist
 
+      - name: Download native packaged CLI
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ matrix.cli-artifact }}
+          path: dist/cli
+
+      - name: Stage native CLI for server integration tests
+        shell: bash
+        run: |
+          python .github/scripts/stage_cli_for_tests.py \
+            "dist/cli/${{ matrix.cli-archive }}" \
+            "$RUNNER_TEMP/hola-wheel-cli/${{ matrix.cli-binary }}"
+          echo "HOLA_CLI_BINARY=$RUNNER_TEMP/hola-wheel-cli/${{ matrix.cli-binary }}" >> "$GITHUB_ENV"
+
       - name: Install and test
         shell: bash
         run: |
@@ -417,6 +446,8 @@ jobs:
           python -c "from hola_opt import dashboard_dir; assert dashboard_dir().exists(), 'Dashboard not bundled'"
           mkdir -p "$RUNNER_TEMP/hola-wheel-tests"
           cp hola-py/tests/conftest.py \
+             hola-py/tests/test_binding_lifecycle.py \
+             hola-py/tests/test_cli_fixture.py \
              hola-py/tests/test_exceptions.py \
              hola-py/tests/test_ffi_roundtrip.py \
              hola-py/tests/test_hola.py \

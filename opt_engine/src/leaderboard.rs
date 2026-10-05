@@ -267,9 +267,10 @@ impl<D, Obs> Leaderboard<D, Obs> {
     ///
     /// When a cap is set and a `push` would exceed it, the leaderboard evicts
     /// the single oldest trial (lowest index, i.e. earliest inserted). Oldest
-    /// eviction is chosen because it is O(1) amortized for the scalar and
-    /// vector cases alike and keeps `push` cheap; ranking helpers that the
-    /// optimizer relies on (`top_k`, `pareto_front`, `rank_of`) all recompute
+    /// eviction keeps a chronological window for scalar and vector cases.
+    /// With the current contiguous storage, eviction shifts the retained
+    /// records and rebuilds their ID index in O(capacity) time. Ranking helpers
+    /// (`top_k`, `pareto_front`, `rank_of`) all recompute
     /// from the retained set, so they stay correct over whatever window
     /// survives. Callers that need the global best preserved should leave the
     /// leaderboard unbounded.
@@ -374,7 +375,8 @@ impl<D, Obs> Leaderboard<D, Obs> {
 
     /// Append a new trial. Returns the assigned trial ID.
     ///
-    /// This is an O(1) operation - no sorting is performed.
+    /// No sorting is performed. Appending is O(1) amortized when unbounded;
+    /// a bounded board's eviction is O(capacity).
     pub fn push(&mut self, candidate: D, observation: Obs) -> u64 {
         let trial_id = self.next_id;
         self.next_id += 1;
@@ -443,19 +445,19 @@ impl<D, Obs> Leaderboard<D, Obs> {
 
     /// Return the next ID that can be assigned without reusing a stored trial ID.
     pub fn next_trial_id(&self) -> u64 {
+        self.next_id
+    }
+
+    /// Repair the internal next-ID counter after deserializing or manually
+    /// modifying a leaderboard.
+    pub fn normalize_next_trial_id(&mut self) -> u64 {
         let next_from_trials = self
             .trials
             .iter()
             .map(|trial| trial.trial_id.saturating_add(1))
             .max()
             .unwrap_or(0);
-        self.next_id.max(next_from_trials)
-    }
-
-    /// Repair the internal next-ID counter after deserializing or manually
-    /// modifying a leaderboard.
-    pub fn normalize_next_trial_id(&mut self) -> u64 {
-        let next_id = self.next_trial_id();
+        let next_id = self.next_id.max(next_from_trials);
         self.next_id = next_id;
         next_id
     }
@@ -834,6 +836,66 @@ impl<D: Clone> Leaderboard<D, f64> {
 // Multi-Objective Ranking (BTreeMap<String, f64> observations)
 // =============================================================================
 
+/// Exact non-dominated fronts with O(N) graph storage, plus an O(M * N)
+/// dense buffer when M consistent finite objectives can be flattened.
+///
+/// Initial dominance counts and the outgoing relations needed while peeling
+/// fronts are computed in separate passes, so the quadratic relation graph is
+/// never retained. Within-front ordering matches the ordinary pairwise peeling
+/// algorithm and is shared with callers that construct individual rank views.
+pub fn non_dominated_front_indices(observations: &[&BTreeMap<String, f64>]) -> Vec<Vec<usize>> {
+    let n = observations.len();
+    let dense = dense_objective_matrix(observations);
+    let relation = |i: usize, j: usize| {
+        if let Some((objectives, values)) = &dense {
+            dense_dominance_relation(
+                &values[i * objectives..(i + 1) * objectives],
+                &values[j * objectives..(j + 1) * objectives],
+            )
+        } else if Leaderboard::<(), BTreeMap<String, f64>>::dominates(
+            observations[i],
+            observations[j],
+        ) {
+            Ordering::Less
+        } else if Leaderboard::<(), BTreeMap<String, f64>>::dominates(
+            observations[j],
+            observations[i],
+        ) {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    };
+    let mut counts = vec![0usize; n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            match relation(i, j) {
+                Ordering::Less => counts[j] += 1,
+                Ordering::Greater => counts[i] += 1,
+                Ordering::Equal => {}
+            }
+        }
+    }
+    let mut current: Vec<usize> = (0..n).filter(|&i| counts[i] == 0).collect();
+    let mut fronts = Vec::new();
+    while !current.is_empty() {
+        let mut next = Vec::new();
+        for &i in &current {
+            for (j, count) in counts.iter_mut().enumerate() {
+                if *count > 0 && relation(i, j) == Ordering::Less {
+                    *count -= 1;
+                    if *count == 0 {
+                        next.push(j);
+                    }
+                }
+            }
+        }
+        fronts.push(current);
+        current = next;
+    }
+    fronts
+}
+
 type ScoredMultiTrial<'a, D> = (&'a Trial<D, BTreeMap<String, f64>>, f64);
 
 /// Select at most `maximum` indices with deterministic coverage of a complete
@@ -862,22 +924,20 @@ fn stratified_history_indices(length: usize, maximum: usize) -> Vec<usize> {
 /// Flatten a rectangular, finite objective table for allocation-free pairwise
 /// dominance checks. Malformed or heterogeneous maps fall back to the general
 /// map-merging comparison.
-fn dense_objective_matrix<D>(
-    trials: &[Trial<D, BTreeMap<String, f64>>],
-) -> Option<(usize, Vec<f64>)> {
-    let first = trials.first()?;
-    let keys: Vec<&str> = first.observation.keys().map(String::as_str).collect();
+fn dense_objective_matrix(observations: &[&BTreeMap<String, f64>]) -> Option<(usize, Vec<f64>)> {
+    let first = observations.first()?;
+    let keys: Vec<&str> = first.keys().map(String::as_str).collect();
     if keys.is_empty() {
         return None;
     }
 
-    let mut values = Vec::with_capacity(trials.len().checked_mul(keys.len())?);
-    for trial in trials {
-        if trial.observation.len() != keys.len() {
+    let mut values = Vec::with_capacity(observations.len().checked_mul(keys.len())?);
+    for observation in observations {
+        if observation.len() != keys.len() {
             return None;
         }
         for key in &keys {
-            let value = *trial.observation.get(*key)?;
+            let value = *observation.get(*key)?;
             if !value.is_finite() {
                 return None;
             }
@@ -1302,23 +1362,21 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
     }
 
     /// Compute the 0-indexed Pareto front membership of a single trial without
-    /// cloning trials or running a full non-dominated sort of every front.
+    /// cloning trials or constructing their crowding-ranked views.
     ///
     /// The result is the front index the trial belongs to under the same
     /// non-domination relation as [`non_dominated_sort`](Self::non_dominated_sort)
     /// (`0` = Pareto front, `1` = second front, etc.), which equals the
-    /// `rank - 1` that `ranked_trials` would assign. It is computed by peeling
-    /// fronts and stopping as soon as the target is placed, so it never has to
-    /// rank trials in later fronts and clones nothing (it works on observation
-    /// references and indices only).
+    /// `rank - 1` that `ranked_trials` would assign. Front membership uses
+    /// observation references and indices, without retaining the dominance
+    /// graph or cloning candidates and raw metrics.
     ///
     /// When `include_infeasible` is `false`, only feasible trials participate
     /// and the method returns `None` if the target is infeasible. When `true`,
     /// all trials participate (matching the `*_all` variants).
     ///
-    /// Complexity: O(M * N^2) worst case like the full sort, but typically far
-    /// less since front peeling halts once the target lands. Returns `None` if
-    /// no trial with `trial_id` exists.
+    /// Complexity: O(M * N^2) time and O(M * N) auxiliary storage. Returns
+    /// `None` if no trial with `trial_id` exists.
     pub fn pareto_rank_of(&self, trial_id: u64, include_infeasible: bool) -> Option<usize> {
         let target = self.get(trial_id)?;
         if !include_infeasible && !Self::trial_is_feasible(target) {
@@ -1333,39 +1391,17 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
             .map(|t| (t.trial_id, &t.observation))
             .collect();
 
-        let n = participants.len();
-        let mut domination_count: Vec<usize> = vec![0; n];
-        let mut dominated_by: Vec<Vec<usize>> = vec![Vec::new(); n];
-
-        for i in 0..n {
-            for j in (i + 1)..n {
-                if Self::dominates(participants[i].1, participants[j].1) {
-                    dominated_by[i].push(j);
-                    domination_count[j] += 1;
-                } else if Self::dominates(participants[j].1, participants[i].1) {
-                    dominated_by[j].push(i);
-                    domination_count[i] += 1;
-                }
-            }
-        }
-
-        let mut current: Vec<usize> = (0..n).filter(|&i| domination_count[i] == 0).collect();
-        let mut front = 0usize;
-        while !current.is_empty() {
-            if current.iter().any(|&i| participants[i].0 == trial_id) {
+        let observations: Vec<_> = participants
+            .iter()
+            .map(|(_, observation)| *observation)
+            .collect();
+        for (front, indices) in non_dominated_front_indices(&observations)
+            .into_iter()
+            .enumerate()
+        {
+            if indices.iter().any(|&i| participants[i].0 == trial_id) {
                 return Some(front);
             }
-            let mut next = Vec::new();
-            for &i in &current {
-                for &j in &dominated_by[i] {
-                    domination_count[j] -= 1;
-                    if domination_count[j] == 0 {
-                        next.push(j);
-                    }
-                }
-            }
-            current = next;
-            front += 1;
         }
         None
     }
@@ -1407,71 +1443,16 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
                 .collect();
         }
 
-        let n = feasible.len();
-        let dense = dense_objective_matrix(&feasible);
-
-        let mut domination_count: Vec<usize> = vec![0; n];
-        let mut dominated_by: Vec<Vec<usize>> = vec![Vec::new(); n];
-
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let relation = if let Some((objectives, values)) = &dense {
-                    let i_start = i * objectives;
-                    let j_start = j * objectives;
-                    dense_dominance_relation(
-                        &values[i_start..i_start + objectives],
-                        &values[j_start..j_start + objectives],
-                    )
-                } else {
-                    let obs_i = &feasible[i].observation;
-                    let obs_j = &feasible[j].observation;
-                    if Self::dominates(obs_i, obs_j) {
-                        Ordering::Less
-                    } else if Self::dominates(obs_j, obs_i) {
-                        Ordering::Greater
-                    } else {
-                        Ordering::Equal
-                    }
-                };
-
-                match relation {
-                    Ordering::Less => {
-                        dominated_by[i].push(j);
-                        domination_count[j] += 1;
-                    }
-                    Ordering::Greater => {
-                        dominated_by[j].push(i);
-                        domination_count[i] += 1;
-                    }
-                    Ordering::Equal => {}
-                }
-            }
-        }
-
-        let mut fronts: Vec<Vec<Trial<D, BTreeMap<String, f64>>>> = Vec::new();
-        let mut current_front_indices: Vec<usize> =
-            (0..n).filter(|&i| domination_count[i] == 0).collect();
-
-        while !current_front_indices.is_empty() {
-            let front: Vec<Trial<D, BTreeMap<String, f64>>> = current_front_indices
-                .iter()
-                .map(|&i| feasible[i].clone())
-                .collect();
-            fronts.push(front);
-
-            let mut next_front_indices = Vec::new();
-            for &i in &current_front_indices {
-                for &j in &dominated_by[i] {
-                    domination_count[j] -= 1;
-                    if domination_count[j] == 0 {
-                        next_front_indices.push(j);
-                    }
-                }
-            }
-            current_front_indices = next_front_indices;
-        }
-
-        fronts
+        let observations: Vec<_> = feasible.iter().map(|trial| &trial.observation).collect();
+        non_dominated_front_indices(&observations)
+            .into_iter()
+            .map(|front| {
+                front
+                    .into_iter()
+                    .map(|index| feasible[index].clone())
+                    .collect()
+            })
+            .collect()
     }
 
     /// Perform NSGA-II non-dominated sorting including infeasible trials.
@@ -1492,50 +1473,16 @@ impl<D: Clone> Leaderboard<D, BTreeMap<String, f64>> {
                 .collect();
         }
 
-        let n = self.trials.len();
-
-        let mut domination_count: Vec<usize> = vec![0; n];
-        let mut dominated_by: Vec<Vec<usize>> = vec![Vec::new(); n];
-
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let obs_i = &self.trials[i].observation;
-                let obs_j = &self.trials[j].observation;
-
-                if Self::dominates(obs_i, obs_j) {
-                    dominated_by[i].push(j);
-                    domination_count[j] += 1;
-                } else if Self::dominates(obs_j, obs_i) {
-                    dominated_by[j].push(i);
-                    domination_count[i] += 1;
-                }
-            }
-        }
-
-        let mut fronts: Vec<Vec<Trial<D, BTreeMap<String, f64>>>> = Vec::new();
-        let mut current_front_indices: Vec<usize> =
-            (0..n).filter(|&i| domination_count[i] == 0).collect();
-
-        while !current_front_indices.is_empty() {
-            let front: Vec<Trial<D, BTreeMap<String, f64>>> = current_front_indices
-                .iter()
-                .map(|&i| self.trials[i].clone())
-                .collect();
-            fronts.push(front);
-
-            let mut next_front_indices = Vec::new();
-            for &i in &current_front_indices {
-                for &j in &dominated_by[i] {
-                    domination_count[j] -= 1;
-                    if domination_count[j] == 0 {
-                        next_front_indices.push(j);
-                    }
-                }
-            }
-            current_front_indices = next_front_indices;
-        }
-
-        fronts
+        let observations: Vec<_> = self.trials.iter().map(|trial| &trial.observation).collect();
+        non_dominated_front_indices(&observations)
+            .into_iter()
+            .map(|front| {
+                front
+                    .into_iter()
+                    .map(|index| self.trials[index].clone())
+                    .collect()
+            })
+            .collect()
     }
 
     /// Calculate crowding distance for a set of trials.
@@ -1842,7 +1789,9 @@ mod tests {
         lb.push(0.2, 0.2);
         lb.next_id = 0;
 
-        assert_eq!(lb.next_trial_id(), 2);
+        // The ordinary accessor uses the maintained counter; an explicitly
+        // corrupted private field is repaired only by normalization.
+        assert_eq!(lb.next_trial_id(), 0);
         assert_eq!(lb.normalize_next_trial_id(), 2);
         assert_eq!(lb.push(0.3, 0.3), 2);
     }
@@ -2234,6 +2183,76 @@ mod tests {
         assert_eq!(fronts[1][0].candidate, "B");
         assert_eq!(fronts[2].len(), 1);
         assert_eq!(fronts[2][0].candidate, "C");
+    }
+
+    #[test]
+    fn general_fronts_preserve_pairwise_discovery_order_without_storing_edges() {
+        let observations: Vec<BTreeMap<String, f64>> = (0..128usize)
+            .map(|id| {
+                [
+                    ("a".to_string(), ((id * 37) % 13) as f64),
+                    ("b".to_string(), ((id * 61) % 17) as f64),
+                    ("c".to_string(), ((id * 11) % 7) as f64),
+                ]
+                .into()
+            })
+            .collect();
+        let references: Vec<_> = observations.iter().collect();
+        let n = observations.len();
+        let mut counts = vec![0; n];
+        let mut outgoing = vec![Vec::new(); n];
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if Leaderboard::<(), BTreeMap<String, f64>>::dominates(
+                    &observations[i],
+                    &observations[j],
+                ) {
+                    outgoing[i].push(j);
+                    counts[j] += 1;
+                } else if Leaderboard::<(), BTreeMap<String, f64>>::dominates(
+                    &observations[j],
+                    &observations[i],
+                ) {
+                    outgoing[j].push(i);
+                    counts[i] += 1;
+                }
+            }
+        }
+        let mut current: Vec<_> = (0..n).filter(|&i| counts[i] == 0).collect();
+        let mut expected = Vec::new();
+        while !current.is_empty() {
+            let mut next = Vec::new();
+            for &i in &current {
+                for &j in &outgoing[i] {
+                    counts[j] -= 1;
+                    if counts[j] == 0 {
+                        next.push(j);
+                    }
+                }
+            }
+            expected.push(current);
+            current = next;
+        }
+        assert_eq!(non_dominated_front_indices(&references), expected);
+    }
+
+    #[test]
+    fn general_fronts_rank_a_fully_ordered_population() {
+        let observations: Vec<BTreeMap<String, f64>> = (0..512)
+            .map(|i| {
+                [
+                    ("a".into(), i as f64),
+                    ("b".into(), i as f64),
+                    ("c".into(), i as f64),
+                ]
+                .into()
+            })
+            .collect();
+        let references: Vec<_> = observations.iter().collect();
+        assert_eq!(
+            non_dominated_front_indices(&references),
+            (0..512).map(|i| vec![i]).collect::<Vec<_>>()
+        );
     }
 
     #[test]

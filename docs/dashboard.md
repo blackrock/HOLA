@@ -20,8 +20,8 @@ directly in a modern browser.
 
 When running a study from Python with `study.serve()`, we can
 serve the dashboard automatically by passing the `dashboard_path`
-argument. In editable installs from source, point it at the
-repository's `dashboard/` directory.
+argument. Wheels and editable installs both include dashboard assets;
+use `dashboard_path=str(hola_opt.dashboard_dir())` to select them.
 
 ## Connecting to a live server
 
@@ -43,8 +43,10 @@ The status bar shows the following.
 **Connection status.**
 :   Green dot when connected.
 
-**Trials.**
-:   Total completed trials.
+**Displayed trials.**
+:   Completed trials retained in the loaded snapshot or received during this
+    connection. This is not the study's lifetime completion count when
+    leaderboard retention is bounded.
 
 **Best.**
 :   Current best score.
@@ -65,19 +67,32 @@ visualizations populate from the stored trials.
 
 ### Convergence plot
 
-We plot each trial's score and a running-best curve. The x-axis
-is the trial index; the y-axis is the scalarized score. When the
+For one objective group, we plot each trial's score and a running-best
+curve. The x-axis is the trial index; the y-axis is the scalarized score. When the
 data spans many orders of magnitude, the y-axis switches to a log
 scale automatically. Hover over the chart to inspect individual
-trials.
+trials. For multiple objective groups, the chart shows frontier size
+over completion order instead of a scalar running best.
 
 ### Pareto scatter
 
 We draw a scatter plot of two metrics fields, useful for inspecting
 trade-offs in multi-objective optimization. Use the **X** and **Y**
 dropdowns to select which metrics to plot. Trials on the first
-Pareto front are highlighted and connected with a dashed line.
-Hover over a point to see the trial ID and metric values.
+Pareto front are highlighted. A dashed connector is shown only for
+study with exactly two objective fields and those fields selected as
+the raw metric axes. Hover over a point
+to see the trial ID and metric values.
+
+Live snapshots retain the server's authoritative ranks. When browser
+ranking is needed, frontier membership is exact for one or two objective
+groups and for up to 2,048 feasible trials with more groups. Inferred
+browser ranks order each frontier by insertion order; server ranks use
+NSGA-II crowding distance. Larger unranked
+imports and previews use a partial frontier to keep the interface
+responsive: highlighted points are verified members; other memberships
+and ranks remain unknown. A status message and chart label identify
+this case. Exported trials preserve the partial ranking status.
 
 ### Parallel coordinates
 
@@ -89,9 +104,10 @@ best trial is highlighted in teal.
 
 ### Trial table
 
-We provide a sortable table of all completed trials showing trial
-ID, rank, parameter values, and metrics. Click any column header
-to sort.
+We provide a sortable table of completed trials showing trial
+ID, rank, parameter values, and metrics. The table shows up to 1,000
+rows from the current sort order; charts and exports use the full
+loaded population. Click any column header to sort.
 
 ## Editing objectives
 
@@ -113,7 +129,8 @@ We provide three actions.
 **Reset.**
 :   Restores the objectives to the server's current configuration,
     re-fetches trial scores from the server, and exits preview
-    mode.
+    mode. In offline mode, it restores the imported objectives,
+    scores, ranks, and frontier memberships saved before the preview.
 
 **Apply to server.**
 :   Sends the edited objectives to the server via

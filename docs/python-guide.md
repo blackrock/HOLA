@@ -13,8 +13,10 @@ in two modes:
 | **`Study(...)`** | **In your Python process** (Rust engine loaded inside the interpreter) | Notebooks, single-machine scripts, anything that should not depend on a server |
 | **`Study.connect(url)`** | **In a running HOLA server** (returns an HTTP client) | Workers on other machines, language-agnostic workers, sharing one study across many processes |
 
-Both modes expose the same methods (`ask`, `tell`, `top_k`, …).
-You pick one based on **process layout**, not on different math.
+Both modes expose the same optimization methods (`ask`, `tell`, `top_k`,
+`cancel`, and `run`). Local studies also provide checkpoint files and server
+hosting; remote studies provide lease renewal through `heartbeat`. Choose the
+mode based on where the engine should run.
 
 The Python API exposes these classes:
 
@@ -55,11 +57,17 @@ without parsing message text:
 | `ConfigurationError` | Invalid space, objective, strategy, study, URL, or timeout configuration |
 | `CheckpointError` | Checkpoint loading or saving failed |
 | `RemoteError` | Remote transport, HTTP status, response schema, or protocol failure |
-| `ObjectiveError` | Objective metrics have the wrong shape or violate the declared contract |
+| `ObjectiveError` | Metrics cannot be converted, or a local tell is rejected (for example, conflicting duplicate metrics) |
 
 All five classes subclass `ValueError`, so code written for earlier releases
 that catches `ValueError` remains compatible. Exceptions raised by the user's
 objective function itself are propagated unchanged, including their traceback.
+Missing or non-numeric objective fields are recorded as infeasible completed
+trials rather than raising `ObjectiveError`. IEEE-754 values follow the scoring
+rules: favorable infinity can meet a TLP target and score zero, while non-finite
+resulting scores make a trial infeasible. Cyclic metrics and
+metrics with nesting depth beyond 64 are rejected before completion;
+the allocation remains pending so you can retry or cancel it.
 
 ```python
 from hola_opt import ConfigurationError, RemoteError, Study
@@ -260,7 +268,14 @@ study = Study(
 | `objectives` | `list` | required | List of `Minimize` / `Maximize` objectives (at least one) |
 | `strategy` | `str` or strategy class | `"gmm"` | Search strategy. Pass a string (`"gmm"`, `"sobol"`, `"random"`) for defaults, or a configuration class (`Gmm(...)`, `Sobol()`, `Random()`) for fine-grained control. |
 | `seed` | `int` or `None` | `None` | Random seed for reproducibility. When set, the same seed produces the same candidate sequence. |
-| `max_trials` | `int` or `None` | `None` | Maximum number of trials. When set, `ask()` raises after this many trials have been dispatched. |
+| `max_trials` | `int` or `None` | `None` | Cap on completed plus currently pending trials. `ask()` raises when that total reaches the cap. Cancelling pending work frees a slot; it does not reuse its trial ID. |
+| `max_leaderboard_size` | `int` or `None` | `None` | Maximum completed trials retained for inspection, ranking, and fitting. Must be at least 1. Older entries are evicted; lifetime completion count and trial IDs keep increasing. |
+
+Use `max_leaderboard_size` to bound completed-history memory in a long-running
+study. `trial_count()` reports lifetime completions, while `trials()` and
+`top_k()` inspect retained history. Evicted observations no longer participate
+in rankings or GMM fitting. The GMM work limits below bound each refit, rather
+than the stored history itself.
 
 ## The Ask/Tell Loop
 
@@ -293,9 +308,11 @@ print(trial.params)    # {'x': 0.4321, 'layers': 5}
 
 ### `study.tell(trial_id, metrics) -> CompletedTrial`
 
-Reports the result of a trial. `metrics` must be a dict
-containing at least the fields specified in your objectives.
-Returns a `CompletedTrial`.
+Reports the result of a trial. `metrics` must be a dict; provide numeric
+values for the fields specified in your objectives to obtain feasible scores.
+Returns a `CompletedTrial`. Missing or non-numeric objective fields make the
+corresponding score infinite. IEEE-754 metrics follow the objective's scoring
+rules; check the resulting scores for finiteness when inspecting feasibility.
 
 ```python
 completed = study.tell(trial.trial_id, {"loss": 0.42, "accuracy": 0.91})
@@ -309,8 +326,25 @@ the trial as `metrics` and can be inspected later.
 !!! note
     For infeasible trials (where a metric exceeds its TLP limit), the corresponding entries in `.scores` and `.score_vector` are `float('inf')`. You can check for this with `math.isinf()`.
 
-!!! warning
-    Each trial ID can only be told once. Calling `tell` with the same ID twice raises a `ValueError`.
+An exact replay of an accepted `tell` succeeds without another completion.
+This permits retrying after an uncertain network response. Reporting different
+metrics for the same completed ID fails (`ObjectiveError` locally,
+`RemoteError` remotely). Completed history and the bounded receipt cache
+provide replay information; an old evicted trial can eventually leave both.
+
+### `study.cancel(trial_id) -> None`
+
+Cancel pending work in either mode when an evaluation is abandoned. Its ID
+remains consumed, and cancellation frees a pending slot under `max_trials`.
+Completed trials cannot be cancelled.
+
+### `remote.heartbeat(trial_id) -> int`
+
+Renew a remote trial's lease and return its deadline as Unix milliseconds.
+Use this for custom ask/tell workers with evaluations that might exceed the
+server's lease. Calling it on a local study raises `ConfigurationError`.
+The `run()` method manages renewal automatically on servers with heartbeat
+support.
 
 ## The `run()` Convenience Method
 
@@ -351,6 +385,12 @@ processes each result as soon as that evaluation finishes, and immediately
 replenishes the free slot. A slow early trial therefore does not hold up faster
 later results, and exceptions cancel any still-pending trials before the pool
 is shut down.
+Remote `run()` renews each evaluation's lease while the callback runs, including
+parallel evaluations, and stops renewal after completion or cancellation.
+Transient renewal failures are retried within the last confirmed lease. If
+the lease expires and the server rejects the result, `run()` raises
+`RemoteError`; it does not silently count that evaluation as completed.
+Older servers without a heartbeat endpoint retain their previous behavior.
 
 ```python
 # Use 4 parallel workers
@@ -359,6 +399,14 @@ study.run(objective, n_trials=100, n_workers=4)
 # Sequential (no thread pool overhead)
 study.run(objective, n_trials=100, n_workers=1)
 ```
+
+When using Python multiprocessing, select a `spawn` context and construct each
+`Study` inside its worker. Forking a process after HOLA has initialized its
+threaded native runtime can hang during `run()` or a later refit, even if simple
+`ask()` and `tell()` calls succeed. For example, pass
+`mp_context=multiprocessing.get_context("spawn")` to `ProcessPoolExecutor`,
+and create the pool under `if __name__ == "__main__":`. The benchmark runners
+already use spawned workers.
 
 ## Inspecting Results
 
@@ -394,7 +442,7 @@ print(f"Completed {study.trial_count()} trials")
 
 ### `study.trials(sorted_by="index", include_infeasible=True) -> list[CompletedTrial]`
 
-Returns all trials as `CompletedTrial` objects. Each has
+Returns retained completed trials as `CompletedTrial` objects. Each has
 `.trial_id`, `.params`, `.score_vector`, `.scores`, `.metrics`,
 `.rank`, `.pareto_front`, and `.completed_at`. Useful for
 plotting convergence traces or custom analysis.
@@ -441,6 +489,32 @@ for trial in study.pareto_front():
 
 Returns an empty list for single-group (scalar) studies.
 
+### `study.update_objectives(objectives) -> None`
+
+Replace the objective definitions in either mode. The engine recomputes scores
+and rankings for retained completed metrics and refits GMM selection as needed.
+The parameter space and historical metrics are preserved.
+
+## Saving and Resuming
+
+### `study.save(path) -> None`
+
+Save a local study's full checkpoint, including its configuration, strategy,
+retained completed history, pending allocations, and retry state. Missing parent
+directories are created. `save()` on a remote client raises `ConfigurationError`;
+use the server's [checkpoint endpoint](rest-api.md) for a server-side file.
+
+### `Study.load(path) -> Study`
+
+Restore a local study from a full checkpoint and resume its ask/tell sequence.
+Loading does not restart a previously hosted server. Failed saves or loads
+raise `CheckpointError`.
+
+```python
+study.save("study.json")
+restored = Study.load("study.json")
+```
+
 ## Choosing a Strategy
 
 Pass a string shortcut for defaults, or a strategy configuration
@@ -458,7 +532,7 @@ Study(strategy=Gmm(refit_interval=10, elite_fraction=0.1), ...)
 
 Gaussian Mixture Model strategy. Uses Sobol exploration followed
 by GMM exploitation. Refits a GMM to the top `elite_fraction`
-(default 25%) of trials every `refit_interval` (default 20)
+(default 25%) of eligible retained candidates every `refit_interval` (default 20)
 completed trials. With multiple objective groups, elites are ordered
 by non-domination rank and then descending crowding distance. The
 exploration budget counts issued `ask` suggestions, including pending
@@ -466,6 +540,11 @@ trials. If concurrent asks reach that boundary before any empirical fit is
 installed, HOLA continues the Sobol' sequence rather than sampling the
 uninformed GMM prior. Uses the
 [HOLA algorithm](concepts.md#gmm-strategy).
+When `exploration_budget` is omitted, the warm-up uses
+`min(floor(S / 5), 50 + 2n)`, rounded down to a power of two, for budget `S`
+and dimension `n`. `S` is `max_trials`, or 200 when no cap is set; that fallback
+does not impose a trial cap. Thus an uncapped default study warms up for 32
+issued suggestions, and exploitation also waits for a successful empirical fit.
 GMM exploitation uses seeded Owen-scrambled Gauss–Sobol' points: one
 Sobol' coordinate selects the component, and inverse-normal coordinates
 sample within it. Each successfully installed GMM starts a new
@@ -527,8 +606,10 @@ Study(strategy=Random(), ...)
 
 ### Hosting a Server
 
-You can start a REST server directly from a local `Study`,
-making it accessible to remote workers.
+You can start a REST server directly from a local `Study`. It binds to
+`127.0.0.1` by default, so clients on the same machine can connect. Set `host`
+and an `auth_token` explicitly for network access, and terminate TLS at a
+trusted reverse proxy when traffic leaves the host.
 
 ```python
 study = Study(space=space, objectives=objectives)
@@ -536,20 +617,38 @@ study = Study(space=space, objectives=objectives)
 # Blocking - serves until interrupted (Ctrl+C)
 study.serve(port=8000)
 
-# Background - serves in a background thread, study remains usable
+# Background - returns after binding succeeds; study remains usable
 study.serve(port=8000, background=True)
 study.run(objective, n_trials=100)  # runs locally while server is active
+study.stop()  # release the port when finished
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `port` | `int` | `8000` | TCP port to listen on |
-| `background` | `bool` | `False` | If `True`, runs in a background thread and returns immediately |
+| `background` | `bool` | `False` | If `True`, returns after startup succeeds and keeps the server running in the shared runtime |
 | `dashboard_path` | `str` or `None` | `None` | Path to a dashboard directory to serve the bundled UI. When omitted, no dashboard is served. Use `str(dashboard_dir())` to serve the bundled dashboard. |
+| `host` | `str` | `"127.0.0.1"` | Keyword-only interface to bind; non-loopback hosting requires `auth_token` |
+| `auth_token` | `str` or `None` | `None` | Keyword-only bearer token protecting API requests |
+| `lease_seconds` | `float` | `7200.0` | Keyword-only lease duration for remote allocations; must be positive and finite |
 
 When `background=True`, the study continues to work locally. Both
 local calls and remote HTTP requests share the same engine state,
 so trials from any source appear in the same leaderboard.
+Startup errors are raised to the caller, including an occupied port. One study
+can own one background server at a time; call `study.stop()` before starting
+another. `stop()` waits for graceful shutdown and is harmless when no server is
+running. Hosting and stopping servers are available only on local studies.
+Dropping the local study also requests shutdown of its background server.
+
+```python
+import os
+
+study.serve(
+    host="0.0.0.0", port=8000, background=True,
+    auth_token=os.environ["HOLA_TOKEN"],
+)
+```
 
 ### Study.connect()
 
@@ -583,7 +682,8 @@ for t in remote.pareto_front():
 ```
 
 Remote requests use a 10-second connection timeout and a 30-second
-whole-request timeout by default. Both are configurable, and a bearer token is
+whole-request timeout by default. Configured values must be finite, positive,
+and representable as a duration of at least one nanosecond. A bearer token is
 sent with every endpoint when provided:
 
 ```python

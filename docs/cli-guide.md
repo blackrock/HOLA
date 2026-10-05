@@ -81,6 +81,17 @@ strategy:
 #   max_checkpoints: 5
 ```
 
+Optional top-level `max_trials` caps lifetime completed plus currently pending
+trials. Cancelling work frees a slot without reusing its ID. This budget also
+supplies `S` for the automatic GMM warm-up; `strategy.total_budget` supplies the
+same cap when top-level `max_trials` is omitted. With neither budget configured,
+the warm-up uses `S=200` without imposing a trial cap.
+
+Set top-level `max_leaderboard_size` to a positive integer to bound retained
+completed history. For example, `max_leaderboard_size: 10000` retains the most
+recent 10,000 completions for ranking and fitting. Lifetime counts keep growing;
+evicted observations no longer participate in those calculations.
+
 ### Space Configuration
 
 Each parameter in the `space:` section has a `type` and
@@ -147,7 +158,7 @@ following fields.
 | `target` | no | The "satisfactory" value (for TLP) |
 | `limit` | no | The worst acceptable boundary (for TLP) |
 | `priority` | no | TLP score at the limit (when configured) and relative weight (default: 1.0) |
-| `group` | no | Priority group name. Objectives in the same group are summed; distinct groups form Pareto axes. Omit for single-group (scalar) studies. |
+| `group` | no | Priority group name. Objectives in the same group are summed; distinct groups form Pareto axes. When omitted, each field forms its own group. |
 
 ```yaml
 objectives:
@@ -187,7 +198,8 @@ strategy:
 | `type` | `"gmm"` | Strategy type: `"gmm"`, `"sobol"`, or `"random"` |
 | `refit_interval` | `20` | How often the GMM refits (only used by `"gmm"`) |
 | `seed` | none | Seed for reproducible runs. When omitted, HOLA draws one seed once and records it in full checkpoints. |
-| `exploration_budget` | none | Number of issued Sobol exploration suggestions before switching to GMM exploitation. Pending asks count against this budget. When omitted, we use a formula based on `total_budget` and the search dimension. |
+| `total_budget` | none | Alternative total trial cap and source for the warm-up budget when top-level `max_trials` is omitted |
+| `exploration_budget` | none | Number of issued Sobol exploration suggestions before switching to GMM exploitation. Pending asks count against this budget. The default is `min(floor(S/5), 50 + 2n)`, rounded down to a power of two, for total budget `S` and dimension `n`. |
 | `elite_fraction` | `0.25` | Fraction of top trials used for GMM refitting. Must be in (0.0, 1.0]. |
 | `ongoing_exploration_period` | `5` | Continue global Sobol' exploration every Nth post-warmup suggestion. Use `0` to disable; explicit periods must be at least 2. |
 | `max_components` | `3` | Maximum fitted GMM components. The effective count can be lower for small elite sets. |
@@ -342,10 +354,13 @@ latency = measure_latency()
 
 # Report results back to the server
 payload = json.dumps({"trial_id": int(trial_id), "metrics": {"loss": loss, "latency": latency}})
+headers = {"Content-Type": "application/json"}
+if token := os.environ.get("HOLA_API_TOKEN"):
+    headers["Authorization"] = f"Bearer {token}"
 req = urllib.request.Request(
     f"{server}/api/tell",
     data=payload.encode(),
-    headers={"Content-Type": "application/json"},
+    headers=headers,
 )
 urllib.request.urlopen(req)
 ```
@@ -364,7 +379,12 @@ LAYERS=$(echo "$HOLA_PARAMS" | jq -r '.num_layers')
 LOSS=$(python train.py --lr "$LR" --layers "$LAYERS" 2>/dev/null)
 
 # Report results back to the server
+AUTH=()
+if [[ -n "${HOLA_API_TOKEN:-}" ]]; then
+  AUTH=(-H "Authorization: Bearer $HOLA_API_TOKEN")
+fi
 curl -s -X POST "$HOLA_SERVER/api/tell" \
+  "${AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d "{\"trial_id\": $HOLA_TRIAL_ID, \"metrics\": {\"loss\": $LOSS}}"
 ```
@@ -383,7 +403,7 @@ from hola_opt import Study
 
 params = json.loads(os.environ["HOLA_PARAMS"])
 trial_id = int(os.environ["HOLA_TRIAL_ID"])
-remote = Study.connect(os.environ["HOLA_SERVER"])
+remote = Study.connect(os.environ["HOLA_SERVER"], token=os.environ.get("HOLA_API_TOKEN"))
 
 # Your training code here
 loss = train_model(**params)
@@ -443,9 +463,10 @@ server handles concurrent ask/tell requests safely.
 You can also connect from Python on any machine.
 
 ```python
+import os
 from hola_opt import Study
 
-remote = Study.connect("http://machine-a:8000")
+remote = Study.connect("http://machine-a:8000", token=os.environ["HOLA_API_TOKEN"])
 trial = remote.ask()
 # ... evaluate ...
 remote.tell(trial.trial_id, metrics)

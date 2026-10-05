@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import time
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +33,7 @@ from benchmarks.runner.config import RunConfig
 from benchmarks.runner.executor import (
     _bounded_futures,
     _format_error,
+    _process_pool,
 )
 
 
@@ -276,7 +276,7 @@ def run_hpo(
             done += 1
             _print_progress(done, total, row)
     else:
-        with ProcessPoolExecutor(max_workers=config.effective_workers) as executor:
+        with _process_pool(max_workers=config.effective_workers) as executor:
             for future, item in _bounded_futures(
                 executor,
                 _run_hpo_one,
