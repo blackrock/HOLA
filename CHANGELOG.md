@@ -16,6 +16,8 @@ paper and Dylan's approval.
 - The dashboard preserves offline previews across resets, resynchronizes live
   configuration changes, and reports incomplete large multi-group rankings
   explicitly. Preview constraints and extreme objective bounds match the engine.
+- Benchmark campaigns use spawned worker processes so an initialized native
+  runtime in the parent cannot strand worker execution after a fork.
 - Required packaged CLI/server tests now fail when their binary is missing,
   and CI covers fixture relocation and documented objective formulas.
 - Corrected the documented Forrester objective, lifetime/retained-history
