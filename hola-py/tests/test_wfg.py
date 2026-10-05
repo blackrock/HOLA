@@ -14,13 +14,8 @@
 import hashlib
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
-
-HOLA_PY_DIR = Path(__file__).parent.parent
-if str(HOLA_PY_DIR) not in sys.path:
-    sys.path.insert(0, str(HOLA_PY_DIR))
 
 pytest.importorskip("pymoo")
 
@@ -201,7 +196,9 @@ def test_wfg1_ideal_is_the_implemented_front_coordinatewise_minimum(n_obj):
 
 
 @pytest.mark.benchmarks
-def test_wfg_references_and_hypervolumes_are_byte_identical_across_fresh_processes():
+def test_wfg_references_and_hypervolumes_are_byte_identical_across_fresh_processes(
+    isolated_benchmarks_path, isolated_benchmarks_env
+):
     script = """
 import hashlib
 from benchmarks.problems.multi_objective import MULTI_OBJECTIVE_PROBLEMS
@@ -214,7 +211,8 @@ for name, problem in MULTI_OBJECTIVE_PROBLEMS.items():
     outputs = [
         subprocess.run(
             [sys.executable, "-c", script],
-            cwd=HOLA_PY_DIR,
+            cwd=isolated_benchmarks_path,
+            env=isolated_benchmarks_env,
             check=True,
             capture_output=True,
             text=True,
