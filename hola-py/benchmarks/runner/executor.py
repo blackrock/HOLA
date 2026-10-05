@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Executor, Future, ProcessPoolExecutor, wait
@@ -34,6 +35,13 @@ from benchmarks.problems.registry import MultiObjectiveProblem, SingleObjectiveP
 from benchmarks.runner.config import RunConfig
 
 WorkItem: TypeAlias = tuple[Any, ...]
+
+
+def _process_pool(max_workers: int) -> ProcessPoolExecutor:
+    """Start fresh workers instead of inheriting initialized native runtimes."""
+    return ProcessPoolExecutor(
+        max_workers=max_workers, mp_context=multiprocessing.get_context("spawn")
+    )
 
 
 def _format_error(error: Exception) -> str:
@@ -243,7 +251,7 @@ def run_single_objective(
             if done % 100 == 0 or done == total:
                 _print_single_progress(done, total, row)
     else:
-        with ProcessPoolExecutor(max_workers=config.effective_workers) as executor:
+        with _process_pool(max_workers=config.effective_workers) as executor:
             for future, item in _bounded_futures(
                 executor,
                 _run_single_one,
@@ -434,7 +442,7 @@ def run_multi_objective(
             if done % 50 == 0 or done == total:
                 _print_multi_progress(done, total, row)
     else:
-        with ProcessPoolExecutor(max_workers=config.effective_workers) as executor:
+        with _process_pool(max_workers=config.effective_workers) as executor:
             for future, item in _bounded_futures(
                 executor,
                 _run_multi_one,
