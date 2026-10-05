@@ -100,6 +100,7 @@ def test_dashboard_renders_untrusted_trial_as_inert_text():
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not available; skipping DOM XSS test")
+    assert node is not None
 
     if not _ensure_jsdom_installed():
         pytest.skip("jsdom could not be installed (no network?); skipping DOM XSS test")
@@ -133,6 +134,7 @@ def test_dashboard_dom_test_detects_injection():
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not available; skipping DOM XSS revert-check")
+    assert node is not None
 
     if not _ensure_jsdom_installed():
         pytest.skip("jsdom could not be installed (no network?); skipping DOM XSS revert-check")
