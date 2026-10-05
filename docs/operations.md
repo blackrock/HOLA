@@ -81,6 +81,9 @@ process tree and their trials are cancelled. Custom long-running workers can
 renew work through `POST /api/heartbeat`; otherwise the server reclaims an
 expired lease on the next job-lifecycle or metrics request. The server also caps
 pending work, so both memory use and orphan lifetime are bounded.
+Python `Study.connect(...).run()` renews leases during evaluations automatically.
+Custom Python ask/tell loops must call `remote.heartbeat(trial_id)` themselves
+when work can outlast its lease.
 
 ## Checkpoints and restart
 

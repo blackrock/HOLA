@@ -21,7 +21,6 @@ the dashboard via the "Load File" button.
 from __future__ import annotations
 
 import math
-import pathlib
 import random
 import time
 
@@ -78,18 +77,11 @@ def main() -> None:
         seed=42,
     )
 
-    # Serve the dashboard in the background.
-    # dashboard_dir() points to the bundled dashboard in release wheels.
-    # For editable installs from source, we fall back to the repo root.
+    # Dashboard assets are included in wheels and the source package.
     dash_path = dashboard_dir()
-    if not dash_path.exists():
-        dash_path = pathlib.Path(__file__).resolve().parents[2] / "dashboard"
     print(f"Serving dashboard from {dash_path}")
     print("Open http://localhost:8000 in a browser to watch.")
     study.serve(port=8000, background=True, dashboard_path=str(dash_path))
-
-    # Give the server a moment to start.
-    time.sleep(0.5)
 
     # Run trials one at a time so the dashboard can show live updates.
     for i in range(N_TRIALS):
@@ -116,6 +108,8 @@ def main() -> None:
             time.sleep(1)
     except KeyboardInterrupt:
         pass
+    finally:
+        study.stop()
 
 
 if __name__ == "__main__":
