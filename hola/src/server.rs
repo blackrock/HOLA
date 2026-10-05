@@ -682,6 +682,7 @@ async fn handle_heartbeat(
             "status": "ok",
             "trial_id": req.trial_id,
             "lease_expires_at_ms": expires_at,
+            "lease_duration_ms": state.lease_duration.as_millis().min(u128::from(u64::MAX)).max(1),
         }))),
         Err(error) => Err((
             StatusCode::BAD_REQUEST,
@@ -1325,11 +1326,83 @@ pub async fn serve(
     serve_with_options(engine, options).await
 }
 
+/// A background server whose listener has already been bound.
+///
+/// Dropping the handle requests graceful shutdown. Call [`Self::stop`] to wait
+/// until requests have drained and the listener can be reused.
+pub struct ServerHandle {
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+}
+
+impl ServerHandle {
+    /// Stop this server and wait for bounded graceful shutdown.
+    pub async fn stop(mut self) -> std::io::Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        match self.task.take() {
+            Some(task) => task.await.map_err(std::io::Error::other)?,
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+/// Bind a server and return its background lifecycle handle.
+///
+/// Configuration and bind failures are returned before success is reported.
+/// The caller must keep the handle alive for as long as it wants to serve.
+pub async fn start_server_with_options(
+    engine: HolaEngine,
+    options: ServerOptions,
+) -> Result<ServerHandle, Box<dyn std::error::Error>> {
+    let (listener, router, sse_shutdown) = prepare_server(engine, &options).await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let shutdown = async move {
+        tokio::select! {
+            _ = shutdown_signal() => {},
+            _ = shutdown_rx => {},
+        }
+        sse_shutdown.send_replace(true);
+    };
+    let task = tokio::spawn(serve_listener_with_shutdown(
+        listener,
+        router,
+        shutdown,
+        options.shutdown_timeout,
+    ));
+    Ok(ServerHandle {
+        shutdown: Some(shutdown_tx),
+        task: Some(task),
+    })
+}
+
 /// Start the server with explicit host, auth, CORS, and checkpoint options.
 pub async fn serve_with_options(
     engine: HolaEngine,
     options: ServerOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let (listener, router, sse_shutdown) = prepare_server(engine, &options).await?;
+    let shutdown = async move {
+        shutdown_signal().await;
+        sse_shutdown.send_replace(true);
+    };
+    serve_listener_with_shutdown(listener, router, shutdown, options.shutdown_timeout).await?;
+    Ok(())
+}
+
+async fn prepare_server(
+    engine: HolaEngine,
+    options: &ServerOptions,
+) -> Result<(tokio::net::TcpListener, Router, watch::Sender<bool>), Box<dyn std::error::Error>> {
     if !is_loopback_host(&options.host) && options.auth_token.is_none() {
         return Err(format!(
             "an auth token is required when binding to non-loopback host '{}'",
@@ -1337,33 +1410,19 @@ pub async fn serve_with_options(
         )
         .into());
     }
-    let dashboard_dir = options.dashboard_dir.clone();
     let (router, sse_shutdown) = create_router_with_options_and_shutdown(engine, options.clone())?;
-    let router = match dashboard_dir {
+    let router = match &options.dashboard_dir {
         Some(dir) => router.fallback_service(ServeDir::new(dir)),
         None => router,
     };
     let listener = tokio::net::TcpListener::bind((options.host.as_str(), options.port)).await?;
-    if let Some(dir) = &options.dashboard_dir {
-        tracing::info!(
-            host = options.host,
-            port = options.port,
-            dashboard = %dir.display(),
-            "HOLA server listening"
-        );
-    } else {
-        tracing::info!(
-            host = options.host,
-            port = options.port,
-            "HOLA server listening"
-        );
-    }
-    let shutdown = async move {
-        shutdown_signal().await;
-        sse_shutdown.send_replace(true);
-    };
-    serve_listener_with_shutdown(listener, router, shutdown, options.shutdown_timeout).await?;
-    Ok(())
+    tracing::info!(
+        host = options.host,
+        port = options.port,
+        dashboard = ?options.dashboard_dir,
+        "HOLA server listening"
+    );
+    Ok((listener, router, sse_shutdown))
 }
 
 async fn serve_listener_with_shutdown<F>(

@@ -20,9 +20,9 @@ use pyo3::exceptions::{PyRuntimeWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use serde::de::DeserializeOwned;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 // All public HOLA exceptions remain ValueError subclasses for compatibility
@@ -563,7 +563,20 @@ fn timeout_duration(name: &str, seconds: f64) -> PyResult<Duration> {
             "{name} must be a finite number greater than zero"
         )));
     }
-    Ok(Duration::from_secs_f64(seconds))
+    let duration = Duration::try_from_secs_f64(seconds).map_err(|_| {
+        ConfigurationError::new_err(format!("{name} is too large to represent as a duration"))
+    })?;
+    if duration.is_zero() {
+        return Err(ConfigurationError::new_err(format!(
+            "{name} must be at least one nanosecond"
+        )));
+    }
+    if std::time::Instant::now().checked_add(duration).is_none() {
+        return Err(ConfigurationError::new_err(format!(
+            "{name} is too large to represent as a deadline"
+        )));
+    }
+    Ok(duration)
 }
 
 struct RemoteHttpClient {
@@ -608,6 +621,125 @@ impl RemoteHttpClient {
 
     fn patch(&self, url: String) -> reqwest::RequestBuilder {
         self.with_auth(self.client.patch(url))
+    }
+}
+
+/// Cancelling or completing a run drops this guard, so renewal tasks cannot
+/// outlive their corresponding evaluation even on Python/executor failures.
+struct RemoteLeaseKeeper {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RemoteLeaseKeeper {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn renew_run_lease(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+    trial_id: u64,
+) -> Result<Option<tokio::time::Instant>, String> {
+    let started = tokio::time::Instant::now();
+    let mut request = client
+        .post(format!("{url}/api/heartbeat"))
+        .json(&serde_json::json!({ "trial_id": trial_id }));
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = send_remote(request).await?;
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+    ) {
+        // Servers predating leases have no heartbeat endpoint and no expiring
+        // allocations. Keep their existing run() behavior.
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err(response_error(response).await);
+    }
+    let body: serde_json::Value = response_json(response).await?;
+    validate_status_ok(&body, "Heartbeat")?;
+    if body.get("trial_id").and_then(serde_json::Value::as_u64) != Some(trial_id) {
+        return Err(format!(
+            "Heartbeat response has the wrong or missing trial_id for {trial_id}"
+        ));
+    }
+    let deadline_ms = body
+        .get("lease_expires_at_ms")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "Heartbeat response is missing lease_expires_at_ms".to_string())?;
+    let remaining_ms = match body.get("lease_duration_ms") {
+        Some(value) => value
+            .as_u64()
+            .filter(|duration| *duration > 0)
+            .ok_or_else(|| "Heartbeat response has invalid lease_duration_ms".to_string())?,
+        None => {
+            // Older lease-capable servers only return an absolute deadline.
+            // Current servers include the duration to avoid relying on clocks
+            // being synchronized between the client and server.
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            deadline_ms
+                .checked_sub(now_ms)
+                .filter(|remaining| *remaining > 0)
+                .ok_or_else(|| "Heartbeat response has an already expired lease".to_string())?
+        }
+    };
+    let deadline = started
+        .checked_add(Duration::from_millis(remaining_ms))
+        .ok_or_else(|| "Heartbeat lease duration is too large".to_string())?;
+    if deadline <= tokio::time::Instant::now() {
+        return Err("Heartbeat lease expired before the response was received".to_string());
+    }
+    Ok(Some(deadline))
+}
+
+async fn keep_run_lease_alive(
+    client: reqwest::Client,
+    url: String,
+    token: Option<String>,
+    trial_id: u64,
+    mut deadline: tokio::time::Instant,
+) {
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        tokio::time::sleep(remaining / 2).await;
+        let mut retry_delay = Duration::from_millis(50);
+        loop {
+            match tokio::time::timeout_at(
+                deadline,
+                renew_run_lease(&client, &url, token.as_deref(), trial_id),
+            )
+            .await
+            {
+                Ok(Ok(Some(renewed))) => {
+                    deadline = renewed;
+                    break;
+                }
+                Ok(Ok(None)) => return,
+                Ok(Err(_)) => {
+                    // A lost renewal response may still have renewed the server
+                    // lease. Retry while the last confirmed lease remains valid.
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return;
+                    }
+                    tokio::time::sleep(retry_delay.min(remaining)).await;
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                }
+                Err(_) => return,
+            }
+        }
     }
 }
 
@@ -754,6 +886,7 @@ enum StudyInner {
 #[pyclass(skip_from_py_object)]
 struct Study {
     inner: StudyInner,
+    server: Mutex<Option<hola_engine::server::ServerHandle>>,
 }
 
 fn extract_objectives(objectives: &Bound<'_, PyList>) -> PyResult<Vec<ObjectiveConfig>> {
@@ -918,6 +1051,7 @@ impl Study {
 
         Ok(Self {
             inner: StudyInner::Local { engine },
+            server: Mutex::new(None),
         })
     }
 
@@ -982,6 +1116,7 @@ impl Study {
                 url: normalized_url,
                 http,
             },
+            server: Mutex::new(None),
         })
     }
 
@@ -1010,6 +1145,7 @@ impl Study {
 
         Ok(Self {
             inner: StudyInner::Local { engine },
+            server: Mutex::new(None),
         })
     }
 
@@ -1440,7 +1576,13 @@ impl Study {
             for _ in 0..n_trials {
                 let trial = {
                     let study = slf.borrow(py);
-                    study.ask(py)?
+                    match study.ask(py) {
+                        Ok(trial) => trial,
+                        Err(error) => {
+                            let _ = study.finalize_run_rankings(py);
+                            return Err(error);
+                        }
+                    }
                 };
                 let trial_id = trial.trial_id;
 
@@ -1449,6 +1591,7 @@ impl Study {
                 // for so it does not linger in the engine's pending set or consume
                 // exploration budget, then propagate the error.
                 let outcome = (|| -> PyResult<()> {
+                    let _lease_keeper = slf.borrow(py).run_lease_keeper(py, trial_id)?;
                     let result = func.call1((trial.params,))?;
                     let metrics_dict = result.cast::<PyDict>().map_err(|_| {
                         ObjectiveError::new_err("Objective function must return a dict")
@@ -1476,23 +1619,26 @@ impl Study {
             let mut outstanding: Vec<u64> = Vec::new();
 
             let outcome = (|| -> PyResult<()> {
-                let mut pending: Vec<(u64, Py<PyAny>)> = Vec::with_capacity(n_workers);
+                let mut pending: Vec<(u64, Py<PyAny>, Option<RemoteLeaseKeeper>)> =
+                    Vec::with_capacity(n_workers);
                 let mut submitted = 0usize;
                 let mut deferred_ask_error: Option<PyErr> = None;
 
                 // Keep at most n_workers evaluations in flight. Recording the
                 // id before submit ensures a rare submit failure still cancels
                 // the trial that ask() already reserved in the engine.
-                let submit_one = |pending: &mut Vec<(u64, Py<PyAny>)>,
-                                  outstanding: &mut Vec<u64>|
-                 -> PyResult<()> {
-                    let trial = slf.borrow(py).ask(py)?;
-                    let trial_id = trial.trial_id;
-                    outstanding.push(trial_id);
-                    let future = executor.call_method1("submit", (func, trial.params))?;
-                    pending.push((trial_id, future.unbind()));
-                    Ok(())
-                };
+                let submit_one =
+                    |pending: &mut Vec<(u64, Py<PyAny>, Option<RemoteLeaseKeeper>)>,
+                     outstanding: &mut Vec<u64>|
+                     -> PyResult<()> {
+                        let trial = slf.borrow(py).ask(py)?;
+                        let trial_id = trial.trial_id;
+                        outstanding.push(trial_id);
+                        let lease_keeper = slf.borrow(py).run_lease_keeper(py, trial_id)?;
+                        let future = executor.call_method1("submit", (func, trial.params))?;
+                        pending.push((trial_id, future.unbind(), lease_keeper));
+                        Ok(())
+                    };
 
                 for _ in 0..n_workers {
                     match submit_one(&mut pending, &mut outstanding) {
@@ -1509,7 +1655,7 @@ impl Study {
                     // and advanced once. This waits for whichever objective
                     // finishes first, rather than blocking on submission order.
                     let futures = PyList::empty(py);
-                    for (_, future) in &pending {
+                    for (_, future, _) in &pending {
                         futures.append(future.bind(py))?;
                     }
                     let finished = cf
@@ -1518,7 +1664,7 @@ impl Study {
                         .call_method0("__next__")?;
                     let finished_index = pending
                         .iter()
-                        .position(|(_, future)| future.bind(py).is(&finished))
+                        .position(|(_, future, _)| future.bind(py).is(&finished))
                         .ok_or_else(|| {
                             HolaError::new_err("Executor returned a future that was not in flight")
                         })?;
@@ -1585,67 +1731,105 @@ impl Study {
 
     /// Start a REST server for this study.
     ///
-    /// Clones the engine (cheap: shared state via Arc) and starts an HTTP
-    /// server. Both local calls and remote HTTP requests share the same
-    /// leaderboard and strategy state.
-    ///
-    /// Args:
-    ///     port: listen port (default: 8000)
-    ///     background: if True, runs in background thread and returns immediately.
-    ///         The study remains usable for local ask/tell while serving.
-    ///         If False (default), blocks until the server is stopped.
-    #[pyo3(signature = (port=8000, background=false, dashboard_path=None))]
+    /// Background startup waits until the listener is bound. Call ``stop()``
+    /// to release its port. Remote access requires an explicit host and token.
+    #[pyo3(signature = (port=8000, background=false, dashboard_path=None, *, host="127.0.0.1", auth_token=None, lease_seconds=7200.0))]
+    #[allow(clippy::too_many_arguments)]
     fn serve(
         &self,
         py: Python<'_>,
         port: u16,
         background: bool,
         dashboard_path: Option<String>,
+        host: &str,
+        auth_token: Option<String>,
+        lease_seconds: f64,
     ) -> PyResult<()> {
-        match &self.inner {
-            StudyInner::Local { engine } => {
-                let engine_clone = engine.clone();
-                let dash = dashboard_path.map(std::path::PathBuf::from);
-                let runtime = shared_runtime()?;
-                if background {
-                    // Detach the server task onto the process-wide runtime. The
-                    // static runtime owns its lifecycle, so neither a dedicated
-                    // caller thread nor another Tokio worker pool is needed.
-                    std::mem::drop(runtime.spawn(async move {
-                        if let Err(e) =
-                            hola_engine::server::serve(engine_clone, port, dash.as_deref()).await
-                        {
-                            eprintln!("HOLA server error: {e}");
-                        }
-                    }));
-                    Ok(())
-                } else {
-                    // Block the current thread until the server is stopped.
-                    // Release the GIL for the server's whole lifetime so other
-                    // Python threads keep running; only owned values are moved in.
-                    // `serve` returns `Box<dyn Error>`, which is not `Send`, so
-                    // stringify the error inside the closure (its return value
-                    // must cross the GIL-release boundary as a `Send` type).
-                    py.detach(|| {
-                        runtime
-                            .block_on(hola_engine::server::serve(
-                                engine_clone,
-                                port,
-                                dash.as_deref(),
-                            ))
-                            .map_err(|e| e.to_string())
-                    })
-                    .map_err(|e| HolaError::new_err(format!("Server error: {e}")))
-                }
-            }
-            StudyInner::Remote { .. } => Err(ConfigurationError::new_err(
+        let StudyInner::Local { engine } = &self.inner else {
+            return Err(ConfigurationError::new_err(
                 "serve() is only available for local studies, not remote connections",
-            )),
+            ));
+        };
+        let mut options = hola_engine::server::ServerOptions::new(port);
+        options.host = host.to_owned();
+        options.auth_token = auth_token;
+        options.dashboard_dir = dashboard_path.map(std::path::PathBuf::from);
+        options.lease_duration = timeout_duration("lease_seconds", lease_seconds)?;
+        let runtime = shared_runtime()?;
+        let engine = engine.clone();
+        if background {
+            py.detach(|| {
+                // Serialize startup and stop on this study. Keep the lock out of
+                // Python so other threads can finish their requests while stop
+                // drains the existing listener.
+                let mut slot = self.server.lock().map_err(|_| {
+                    HolaError::new_err("Background server state is unavailable")
+                })?;
+                if slot.is_some() {
+                    return Err(ConfigurationError::new_err(
+                        "This study already has a background server; call stop() before restarting it",
+                    ));
+                }
+                let handle = runtime
+                    .block_on(hola_engine::server::start_server_with_options(engine, options))
+                    .map_err(|error| HolaError::new_err(format!("Server error: {error}")))?;
+                *slot = Some(handle);
+                Ok(())
+            })
+        } else {
+            py.detach(|| {
+                runtime
+                    .block_on(hola_engine::server::serve_with_options(engine, options))
+                    .map_err(|error| HolaError::new_err(format!("Server error: {error}")))
+            })
         }
+    }
+
+    /// Stop this study's background server and wait until its listener closes.
+    /// Calling this on a local study without a running background server is a no-op.
+    fn stop(&self, py: Python<'_>) -> PyResult<()> {
+        if matches!(&self.inner, StudyInner::Remote { .. }) {
+            return Err(ConfigurationError::new_err(
+                "stop() is only available for local studies, not remote connections",
+            ));
+        }
+        let runtime = shared_runtime()?;
+        py.detach(|| {
+            let mut slot = self
+                .server
+                .lock()
+                .map_err(|_| HolaError::new_err("Background server state is unavailable"))?;
+            if let Some(handle) = slot.take() {
+                runtime.block_on(handle.stop()).map_err(|error| {
+                    HolaError::new_err(format!("Server shutdown failed: {error}"))
+                })?;
+            }
+            Ok(())
+        })
     }
 }
 
 impl Study {
+    fn run_lease_keeper(
+        &self,
+        py: Python<'_>,
+        trial_id: u64,
+    ) -> PyResult<Option<RemoteLeaseKeeper>> {
+        let StudyInner::Remote { url, http } = &self.inner else {
+            return Ok(None);
+        };
+        let runtime = shared_runtime()?;
+        let client = http.client.clone();
+        let url = url.clone();
+        let token = http.token.clone();
+        let deadline = py
+            .detach(|| runtime.block_on(renew_run_lease(&client, &url, token.as_deref(), trial_id)))
+            .map_err(RemoteError::new_err)?;
+        Ok(deadline.map(|deadline| RemoteLeaseKeeper {
+            task: runtime.spawn(keep_run_lease_alive(client, url, token, trial_id, deadline)),
+        }))
+    }
+
     /// Internal completion path for `run()`. A local run does not expose the
     /// per-trial `CompletedTrial`, so the engine can defer leaderboard-wide
     /// ranking and materialize all receipts once at batch exit. Remote studies
@@ -1777,19 +1961,38 @@ fn json_to_py(
     }
 }
 
+const MAX_METRIC_NESTING: usize = 64;
+
 fn py_dict_to_json(dict: &Bound<'_, PyDict>) -> PyResult<serde_json::Value> {
+    py_to_json(dict.as_any(), &mut HashSet::new(), 0)
+}
+
+fn py_dict_to_json_inner(
+    dict: &Bound<'_, PyDict>,
+    ancestors: &mut HashSet<usize>,
+    depth: usize,
+) -> PyResult<serde_json::Value> {
     let mut map = serde_json::Map::new();
     for (key, val) in dict.iter() {
         let k: String = key
             .extract()
             .map_err(|_| ObjectiveError::new_err("Objective metrics keys must be strings"))?;
-        let v = py_to_json(&val)?;
+        let v = py_to_json(&val, ancestors, depth + 1)?;
         map.insert(k, v);
     }
     Ok(serde_json::Value::Object(map))
 }
 
-fn py_to_json(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+fn py_to_json(
+    obj: &Bound<'_, PyAny>,
+    ancestors: &mut HashSet<usize>,
+    depth: usize,
+) -> PyResult<serde_json::Value> {
+    if depth > MAX_METRIC_NESTING {
+        return Err(ObjectiveError::new_err(format!(
+            "Objective metrics exceed the maximum nesting depth of {MAX_METRIC_NESTING}"
+        )));
+    }
     if obj.is_none() {
         Ok(serde_json::Value::Null)
     } else if let Ok(b) = obj.extract::<bool>() {
@@ -1818,11 +2021,24 @@ fn py_to_json(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
         }
     } else if let Ok(s) = obj.extract::<String>() {
         Ok(serde_json::Value::String(s))
-    } else if let Ok(dict) = obj.cast::<PyDict>() {
-        py_dict_to_json(dict)
-    } else if let Ok(list) = obj.cast::<PyList>() {
-        let arr: Result<Vec<_>, _> = list.iter().map(|item| py_to_json(&item)).collect();
-        Ok(serde_json::Value::Array(arr?))
+    } else if obj.is_instance_of::<PyDict>() || obj.is_instance_of::<PyList>() {
+        let identity = obj.as_ptr() as usize;
+        if !ancestors.insert(identity) {
+            return Err(ObjectiveError::new_err(
+                "Objective metrics contain a circular reference",
+            ));
+        }
+        let result = if let Ok(dict) = obj.cast::<PyDict>() {
+            py_dict_to_json_inner(dict, ancestors, depth)
+        } else {
+            let list = obj.cast::<PyList>()?;
+            list.iter()
+                .map(|item| py_to_json(&item, ancestors, depth + 1))
+                .collect::<PyResult<Vec<_>>>()
+                .map(serde_json::Value::Array)
+        };
+        ancestors.remove(&identity);
+        result
     } else {
         Err(ObjectiveError::new_err(format!(
             "Cannot convert Python object to JSON: {:?}",
