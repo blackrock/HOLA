@@ -19,9 +19,13 @@ Apple Silicon), and Windows (x86_64).
 
 ### CLI binary
 
-Download a pre-built binary from the
-[latest release](https://github.com/blackrock/HOLA/releases/latest).
+Download a pre-built binary from
+[GitHub releases](https://github.com/blackrock/HOLA/releases).
 No installation required. Just untar and run.
+
+Starting with `1.0.1-rc9`, Linux CLI archives target glibc 2.35 or newer
+(for example, Ubuntu 22.04 or newer) on x86-64 and ARM64. Earlier archives
+may require a newer glibc. Build from source for other Linux environments.
 
 ### From source
 

@@ -254,18 +254,75 @@ def http_json(url, method="GET", body=None, timeout=5):
 # ==========================================================================
 
 
-def _wait_for_server(url, timeout=10):
+def _wait_for_server(url, timeout=10, *, process=None):
     """Poll GET /api/space until the server is ready."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            return False
         try:
-            status, _ = http_json(f"{url}/api/space")
+            status, _ = http_json(f"{url}/api/space", timeout=min(1, timeout))
             if status == 200:
                 return True
         except Exception:
             pass
         time.sleep(0.1)
     return False
+
+
+def _stop_server(proc, timeout=5):
+    """Terminate a server, reap it after escalation, and close captured handles."""
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=timeout)
+    finally:
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def _server_log_tail(path, limit=8192):
+    """Read a bounded diagnostic tail after the child has stopped writing."""
+    with open(path, "rb") as log:
+        size = log.seek(0, os.SEEK_END)
+        log.seek(max(0, size - limit))
+        return log.read(limit).decode("utf-8", errors="replace")
+
+
+def _start_server(cli_binary, config_path, port, *, attempts=5, startup_timeout=10):
+    """Start a loopback server with live logs going to a regular temporary file."""
+    last_output = ""
+    config_path = Path(config_path)
+    for attempt in range(attempts):
+        # A pipe that nobody drains can fill while tracing an HTTP response,
+        # blocking that response. Keep both streams in the test's temp directory.
+        log_path = config_path.with_name(f"{config_path.stem}-server-{attempt}.log")
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen(
+                [cli_binary, "serve", str(config_path), "--port", str(port)],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+
+        url = f"http://127.0.0.1:{port}"
+        try:
+            if _wait_for_server(url, timeout=startup_timeout, process=proc):
+                return proc, url
+        except BaseException:
+            _stop_server(proc)
+            raise
+
+        _stop_server(proc)
+        last_output = _server_log_tail(log_path)
+        if attempt < attempts - 1:
+            port = _allocate_free_port()
+
+    pytest.fail(f"Server failed to start within timeout. Server log tail: {last_output}")
 
 
 @pytest.fixture
@@ -280,43 +337,11 @@ def running_server(cli_binary, free_port, tmp_path, request):
 
     config_path = write_yaml_config(tmp_path, **config_kwargs)
 
-    # free_port has an inherent TOCTOU race: the port can be claimed between
-    # allocation and the server's bind. Retry a few times with a fresh port
-    # when startup fails (e.g. address already in use).
-    attempts = 5
-    proc = None
-    url = None
-    last_stderr = ""
-    port = free_port
-    for attempt in range(attempts):
-        url = f"http://localhost:{port}"
-        proc = subprocess.Popen(
-            [cli_binary, "serve", str(config_path), "--port", str(port)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        if _wait_for_server(url):
-            break
-
-        proc.kill()
-        proc.wait(timeout=5)
-        last_stderr = proc.stderr.read().decode() if proc.stderr else ""
-        proc = None
-        if attempt < attempts - 1:
-            port = _allocate_free_port()
-
-    if proc is None:
-        pytest.fail(f"Server failed to start within timeout. stderr: {last_stderr}")
-    assert proc is not None
-
-    yield url
-
-    proc.terminate()
+    proc, url = _start_server(cli_binary, config_path, free_port)
     try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+        yield url
+    finally:
+        _stop_server(proc)
 
 
 # ==========================================================================

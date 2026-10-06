@@ -18,6 +18,16 @@ the release notes. A failed item blocks the release; it is not a waiver.
   than an editable source build.
 - Confirm release-wheel smoke tests passed on Linux x86-64/aarch64, macOS
   x86-64/aarch64, and Windows x86-64.
+- Linux GNU CLI archives target glibc 2.35 or newer (Ubuntu 22.04). Build both
+  architectures on that baseline and test the downloaded archives and installed
+  wheels on native Ubuntu 22.04 x86-64/arm64 runners. Confirm the archive's ELF
+  version requirements do not exceed `GLIBC_2.35`; a successful run on a newer
+  Ubuntu runner does not establish this compatibility. Python wheels keep their
+  separate `manylinux_2_28` baseline.
+- The hosted Ubuntu 22.04 runners retire on
+  [April 17, 2027](https://github.com/actions/runner-images/issues/14254). Before
+  that date, move these baseline builds/tests into Ubuntu 22.04 containers on
+  supported runners while preserving the glibc check and native execution.
 - Confirm the wheel's real-server tests used the matching packaged CLI and
   ran without missing-binary skips. `HOLA_CLI_BINARY` selects that artifact;
   these tests must not rebuild a checkout CLI or silently skip a failed build.

@@ -4,6 +4,7 @@
 """Regression tests for native conversion and Python-hosted worker lifecycle."""
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -13,7 +14,7 @@ from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -31,11 +32,33 @@ def _study(**kwargs):
     )
 
 
+def _connect_with_timeout(
+    name: Literal["connect_timeout", "request_timeout"], value: float
+) -> Study:
+    if name == "connect_timeout":
+        return Study.connect("http://127.0.0.1:8000", connect_timeout=value)
+    return Study.connect("http://127.0.0.1:8000", request_timeout=value)
+
+
 @pytest.mark.parametrize("name", ["connect_timeout", "request_timeout"])
 @pytest.mark.parametrize("value", [1e100, 1e19, 1e-100])
 def test_timeout_conversion_rejects_unrepresentable_values(name, value):
     with pytest.raises(ConfigurationError):
-        Study.connect("http://127.0.0.1:8000", **{name: value})
+        _connect_with_timeout(name, value)
+
+
+@pytest.mark.parametrize("name", ["connect_timeout", "request_timeout"])
+def test_timeout_conversion_accepts_portable_upper_bound(name):
+    # Construct the native reqwest client and runtime without a network request.
+    remote = _connect_with_timeout(name, 3_153_600_000.0)
+    assert isinstance(remote, Study)
+
+
+@pytest.mark.parametrize("name", ["connect_timeout", "request_timeout"])
+def test_timeout_conversion_rejects_one_float_step_above_portable_upper_bound(name):
+    value = math.nextafter(3_153_600_000.0, math.inf)
+    with pytest.raises(ConfigurationError, match=f"{name} must not exceed 3153600000 seconds"):
+        _connect_with_timeout(name, value)
 
 
 def test_cyclic_and_deep_metrics_are_recoverable_in_a_subprocess():
