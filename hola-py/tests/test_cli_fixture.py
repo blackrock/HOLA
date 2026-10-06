@@ -98,9 +98,23 @@ def _noisy_cli(tmp_path, monkeypatch):
     script.write_text(
         """
 import json
+import socket
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from socketserver import TCPServer
+
+def forbidden_reverse_lookup(*args, **kwargs):
+    raise AssertionError("the noisy server fixture must not depend on reverse DNS")
+
+socket.getfqdn = forbidden_reverse_lookup
+
+class LoopbackHTTPServer(HTTPServer):
+    def server_bind(self):
+        # HTTPServer resolves a display name before listen(); a numeric test
+        # endpoint needs no DNS and must not inherit the runner's resolver delay.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 for stream, byte in ((sys.stdout, b"O"), (sys.stderr, b"E")):
     stream.buffer.write(byte * (1024 * 1024))
@@ -130,7 +144,7 @@ class Handler(BaseHTTPRequestHandler):
         self.rfile.read(int(self.headers.get("Content-Length", "0")))
         self.do_GET()
 
-HTTPServer(("127.0.0.1", int(sys.argv[2])), Handler).serve_forever()
+LoopbackHTTPServer(("127.0.0.1", int(sys.argv[2])), Handler).serve_forever()
 """,
         encoding="utf-8",
     )
