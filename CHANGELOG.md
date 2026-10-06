@@ -30,6 +30,8 @@ paper and Dylan's approval.
 - Updated Rust TLS and Python documentation/HTTP dependencies to resolve the
   audited vulnerabilities. Refreshed Clap, Hyper, UUID, and pinned CI/release
   actions after compatibility review.
+- Updated benchmark dependency Mako to 1.4.3, fixing Windows template-path
+  traversal (GHSA-5639-2j2p-m4mx).
 - Fresh GMM studies now use the held-out-calibrated defaults: twice the raw
   warm-up rule before power-of-two rounding, a 12.5% elite fraction, no ongoing
   post-warm-up Sobol' cadence, one mixture component, and a five-sample elite
