@@ -298,7 +298,8 @@ class Study:
         call only validates and stores the URL (no network request is made
         here). The optional bearer token is attached to every endpoint. Connect
         and whole-request timeouts are measured in seconds and must be positive
-        finite numbers.
+        finite numbers representing at least one nanosecond and no more than
+        3,153,600,000 seconds (100 years of 365 days).
 
         Raises:
             ConfigurationError: If ``url`` is malformed or does not use the ``http`` or
@@ -405,6 +406,8 @@ class Study:
         may run per study; call ``stop()`` before restarting it. Binding to a
         non-loopback host requires ``auth_token``. Dropping the study requests
         graceful shutdown of its background server.
+        ``lease_seconds`` accepts the same finite duration range as the
+        connection timeouts: one nanosecond through 3,153,600,000 seconds.
         """
         ...
     def stop(self) -> None:

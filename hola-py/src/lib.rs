@@ -540,6 +540,10 @@ fn rust_to_py_completed(
 
 const DEFAULT_CONNECT_TIMEOUT_SECONDS: f64 = 10.0;
 const DEFAULT_REQUEST_TIMEOUT_SECONDS: f64 = 30.0;
+// Rust recommends about 100 years for portable Instant arithmetic. Use a
+// conservative, explicit bound rather than a platform-dependent clock maximum;
+// it also stays well below Tokio's saturating u64 millisecond deadline range.
+const MAX_TIMEOUT_SECONDS: f64 = (100_u64 * 365 * 24 * 60 * 60) as f64;
 const MAX_ERROR_BODY_CHARS: usize = 4096;
 
 /// One runtime owns all async work issued by Python studies for the lifetime of
@@ -560,26 +564,83 @@ fn shared_runtime() -> PyResult<&'static tokio::runtime::Runtime> {
     }
 }
 
-fn timeout_duration(name: &str, seconds: f64) -> PyResult<Duration> {
+fn checked_timeout_duration(name: &str, seconds: f64) -> Result<Duration, String> {
     if !seconds.is_finite() || seconds <= 0.0 {
-        return Err(ConfigurationError::new_err(format!(
-            "{name} must be a finite number greater than zero"
-        )));
+        return Err(format!("{name} must be a finite number greater than zero"));
     }
-    let duration = Duration::try_from_secs_f64(seconds).map_err(|_| {
-        ConfigurationError::new_err(format!("{name} is too large to represent as a duration"))
-    })?;
+    if seconds > MAX_TIMEOUT_SECONDS {
+        return Err(format!(
+            "{name} must not exceed {MAX_TIMEOUT_SECONDS} seconds"
+        ));
+    }
+    let duration = Duration::try_from_secs_f64(seconds)
+        .map_err(|_| format!("{name} is too large to represent as a duration"))?;
     if duration.is_zero() {
-        return Err(ConfigurationError::new_err(format!(
-            "{name} must be at least one nanosecond"
-        )));
+        return Err(format!("{name} must be at least one nanosecond"));
     }
     if std::time::Instant::now().checked_add(duration).is_none() {
-        return Err(ConfigurationError::new_err(format!(
-            "{name} is too large to represent as a deadline"
-        )));
+        return Err(format!("{name} is too large to represent as a deadline"));
     }
     Ok(duration)
+}
+
+fn timeout_duration(name: &str, seconds: f64) -> PyResult<Duration> {
+    checked_timeout_duration(name, seconds).map_err(ConfigurationError::new_err)
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::{MAX_TIMEOUT_SECONDS, checked_timeout_duration};
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+    use std::time::Duration;
+
+    #[test]
+    fn timeout_validation_has_a_portable_inclusive_upper_bound() {
+        assert_eq!(MAX_TIMEOUT_SECONDS, 3_153_600_000.0);
+        let above_max = f64::from_bits(MAX_TIMEOUT_SECONDS.to_bits() + 1);
+        for name in ["connect_timeout", "request_timeout", "lease_seconds"] {
+            assert_eq!(
+                checked_timeout_duration(name, MAX_TIMEOUT_SECONDS).unwrap(),
+                Duration::from_secs(3_153_600_000)
+            );
+            for seconds in [above_max, 1e19, 1e100] {
+                assert_eq!(
+                    checked_timeout_duration(name, seconds).unwrap_err(),
+                    format!("{name} must not exceed 3153600000 seconds")
+                );
+            }
+            assert_eq!(
+                checked_timeout_duration(name, 1e-9).unwrap(),
+                Duration::from_nanos(1)
+            );
+            assert!(checked_timeout_duration(name, 1e-100).is_err());
+            for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                assert!(checked_timeout_duration(name, seconds).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn maximum_portable_timeout_registers_with_tokio() {
+        let duration = checked_timeout_duration("request_timeout", MAX_TIMEOUT_SECONDS).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + duration;
+            let mut sleep = std::pin::pin!(tokio::time::sleep_until(deadline));
+            assert_eq!(sleep.deadline(), deadline);
+            // Poll once to register with the actual timer driver, then cancel.
+            // A wheel horizon of roughly two years is not its duration limit.
+            poll_fn(|cx| {
+                assert!(sleep.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+        });
+    }
 }
 
 struct RemoteHttpClient {
@@ -1068,6 +1129,7 @@ impl Study {
     ///     token: Optional bearer token sent with every remote request.
     ///     connect_timeout: Maximum seconds allowed to establish a connection.
     ///     request_timeout: Maximum seconds allowed for a complete HTTP request.
+    ///         Both timeouts must be positive and at most 3,153,600,000 seconds.
     #[staticmethod]
     #[pyo3(signature = (url, token=None, *, connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS, request_timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS))]
     fn connect(
@@ -1757,6 +1819,7 @@ impl Study {
     ///
     /// Background startup waits until the listener is bound. Call ``stop()``
     /// to release its port. Remote access requires an explicit host and token.
+    /// ``lease_seconds`` must be positive and at most 3,153,600,000 seconds.
     #[pyo3(signature = (port=8000, background=false, dashboard_path=None, *, host="127.0.0.1", auth_token=None, lease_seconds=7200.0))]
     #[allow(clippy::too_many_arguments)]
     fn serve(

@@ -20,6 +20,11 @@ paper and Dylan's approval.
   runtime in the parent cannot strand worker execution after a fork.
 - Required packaged CLI/server tests now fail when their binary is missing,
   and CI covers fixture relocation and documented objective formulas.
+- Remote HTTP timeout validation has a portable upper bound instead of
+  accepting deadlines that the Windows timer silently shortens. Packaged
+  server tests capture logs without blocking HTTP responses on full pipes.
+- Linux CLI archives target glibc 2.35, with artifact checks on Ubuntu 22.04
+  for both architectures. The installation guide links to prerelease downloads.
 - Corrected the documented Forrester objective, lifetime/retained-history
   semantics, refit bounds, and server lifecycle examples.
 - Updated Rust TLS and Python documentation/HTTP dependencies to resolve the

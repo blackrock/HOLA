@@ -242,11 +242,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Build GNU/Linux binaries against the documented glibc 2.35 baseline.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: hola-linux-x86_64
             archive: hola-linux-x86_64.tar.gz
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             artifact: hola-linux-aarch64
             archive: hola-linux-aarch64.tar.gz
@@ -327,12 +328,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: cli-hola-linux-x86_64
             archive: hola-linux-x86_64.tar.gz
             binary: hola-linux-x86_64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: cli-hola-linux-aarch64
             archive: hola-linux-aarch64.tar.gz
@@ -359,12 +360,48 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist
 
-      - name: Extract and smoke CLI archive (Unix)
+      - name: Extract CLI archive (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           tar -xzf "dist/${{ matrix.archive }}" -C dist
+
+      - name: Verify Linux CLI glibc baseline
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python3 - "dist/${{ matrix.binary }}" <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          binary = sys.argv[1]
+          output = subprocess.check_output(["readelf", "--version-info", binary], text=True)
+          names = set(re.findall(r"\bName:\s+(GLIBC_[A-Za-z0-9_.]+)\b", output))
+          if not names:
+              raise SystemExit(f"{binary}: no glibc version requirements found")
+          versions = []
+          unsupported = []
+          for name in names:
+              match = re.fullmatch(r"GLIBC_(\d+)\.(\d+)(?:\.(\d+))?", name)
+              if match is None:
+                  unsupported.append(name)
+                  continue
+              version = tuple(int(part or 0) for part in match.groups())
+              versions.append((version, name))
+              if version > (2, 35, 0):
+                  unsupported.append(name)
+          if unsupported:
+              raise SystemExit(f"{binary}: requires unsupported glibc versions: {sorted(unsupported)}")
+          print(f"{binary}: highest requirement {max(versions)[1]} (supported baseline GLIBC_2.35)")
+          PY
+
+      - name: Smoke CLI archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
           "dist/${{ matrix.binary }}" --help
 
       - name: Extract and smoke CLI archive (Windows)
@@ -384,12 +421,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             python-version: "3.10"
             cli-artifact: cli-hola-linux-x86_64
             cli-archive: hola-linux-x86_64.tar.gz
             cli-binary: hola-linux-x86_64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             python-version: "3.11"
             cli-artifact: cli-hola-linux-aarch64
             cli-archive: hola-linux-aarch64.tar.gz

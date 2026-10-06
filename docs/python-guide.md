@@ -640,7 +640,7 @@ study.stop()  # release the port when finished
 | `dashboard_path` | `str` or `None` | `None` | Path to a dashboard directory to serve the bundled UI. When omitted, no dashboard is served. Use `str(dashboard_dir())` to serve the bundled dashboard. |
 | `host` | `str` | `"127.0.0.1"` | Keyword-only interface to bind; non-loopback hosting requires `auth_token` |
 | `auth_token` | `str` or `None` | `None` | Keyword-only bearer token protecting API requests |
-| `lease_seconds` | `float` | `7200.0` | Keyword-only lease duration for remote allocations; must be positive and finite |
+| `lease_seconds` | `float` | `7200.0` | Keyword-only lease duration for remote allocations; must be finite and represent at least one nanosecond, up to 3,153,600,000 seconds (100 years of 365 days) |
 
 When `background=True`, the study continues to work locally. Both
 local calls and remote HTTP requests share the same engine state,
@@ -693,7 +693,9 @@ for t in remote.pareto_front():
 
 Remote requests use a 10-second connection timeout and a 30-second
 whole-request timeout by default. Configured values must be finite, positive,
-and representable as a duration of at least one nanosecond. A bearer token is
+and representable as a duration of at least one nanosecond. The portable upper
+bound is 3,153,600,000 seconds (100 years of 365 days); values beyond it raise
+`ConfigurationError` before an HTTP client is created. A bearer token is
 sent with every endpoint when provided:
 
 ```python

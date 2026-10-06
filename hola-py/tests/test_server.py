@@ -21,11 +21,9 @@ updates, and Study.connect() ask/tell/top_k/connection-error.
 
 import json
 import os
-import socket
-import subprocess
 
 import pytest
-from conftest import _wait_for_server, http_json
+from conftest import _allocate_free_port, _start_server, _stop_server, http_json
 
 from hola_opt import Minimize, Real, Space, Study
 
@@ -174,12 +172,6 @@ class TestRestEndpoints:
         assert body["error"] == "request body or parameters are invalid"
 
 
-def _free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
 def _write_sobol_server_config(tmp_path, *, load_from=None):
     load_from_line = ""
     if load_from is not None:
@@ -206,37 +198,6 @@ def _write_sobol_server_config(tmp_path, *, load_from=None):
         encoding="utf-8",
     )
     return config_path
-
-
-def _start_server(cli_binary, config_path, port):
-    # The port was chosen via a bind-to-0 probe, which is racy: another
-    # process may grab it before the server binds. Retry a few times with a
-    # fresh free port on startup failure (e.g. address already in use).
-    attempts = 5
-    last_stderr = ""
-    for attempt in range(attempts):
-        url = f"http://localhost:{port}"
-        proc = subprocess.Popen(
-            [cli_binary, "serve", str(config_path), "--port", str(port)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if _wait_for_server(url):
-            return proc, url
-        proc.kill()
-        proc.wait(timeout=5)
-        last_stderr = proc.stderr.read().decode() if proc.stderr else ""
-        if attempt < attempts - 1:
-            port = _free_port()
-    pytest.fail(f"Server failed to start within timeout. stderr: {last_stderr}")
-
-
-def _stop_server(proc):
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
 
 
 def test_cli_load_from_rest_full_checkpoint_preserves_sobol_sequence(
@@ -283,7 +244,7 @@ def test_cli_load_from_rest_full_checkpoint_preserves_sobol_sequence(
     assert restored.ask().params == expected.params
 
     loaded_config_path = _write_sobol_server_config(tmp_path, load_from=checkpoint_path)
-    proc, loaded_url = _start_server(cli_binary, loaded_config_path, _free_port())
+    proc, loaded_url = _start_server(cli_binary, loaded_config_path, _allocate_free_port())
     try:
         status, trial = http_json(f"{loaded_url}/api/ask", method="POST")
         assert status == 200
