@@ -235,7 +235,7 @@ hola serve config.yaml --port 8000
 | `config` | required | Path to the YAML configuration file |
 | `--host` | `127.0.0.1` | Host/interface to bind. Use `0.0.0.0` explicitly for network access |
 | `--port` | `8000` | Port to listen on |
-| `--dashboard` | none | Path to a dashboard directory to serve at `/` (e.g. `--dashboard ./dashboard`) |
+| `--dashboard` | none | Path to a dashboard directory to serve at `/` (e.g. `--dashboard ./dashboard`). Its files are served without a token, so the server refuses a directory that contains a checkpoint directory |
 | `--auth-token-file` | none | File holding the bearer token required for all API endpoints |
 | `--read-token-file` | none | File holding an optional read-only token for dashboards, SSE, and metrics; never permits mutations |
 | `--auth-token`, `--read-token` | none | The same tokens given directly. Avoid these: see below |
@@ -243,6 +243,7 @@ hola serve config.yaml --port 8000
 | `--checkpoint-dir` | checkpoint config directory or config file directory | Directory where dashboard/API checkpoint saves are allowed |
 | `--cors-origin` | none | Allowed browser CORS origin. Repeat for multiple origins |
 | `--lease-seconds` | `7200` | Time a distributed trial may remain pending without completion, cancellation, or heartbeat |
+| `--max-saved-checkpoints` | `32` | Files `POST /api/checkpoint/save` may keep in the checkpoint directory; further saves are refused until older files are removed |
 
 The server starts listening on `127.0.0.1:<port>` by default and exposes
 the [REST API](rest-api.md). Binding a non-local host requires an API token.

@@ -47,6 +47,26 @@
   and reported, because it has already been sent to the web server. API
   requests refuse redirects, and response sizes, event-stream records, and
   request durations are bounded.
+- Security: `hola worker` and `Study.connect` refuse to send a bearer token to
+  a non-loopback `http://` server, where anyone on the network path could read
+  it. Use the `https://` URL of a TLS-terminating proxy, or opt in on a trusted
+  network with `--allow-insecure-http`, `HOLA_ALLOW_INSECURE_HTTP=1`, or
+  `allow_insecure_http=True`. Loopback and token-less connections are
+  unaffected. **Existing multi-machine setups that use `http://` with a token
+  need one of these.**
+- Tokens no longer have to appear on a command line: `hola serve` accepts
+  `--auth-token-file` and `--read-token-file` and reads `HOLA_READ_TOKEN`, and
+  `hola worker` accepts `--token-file`. The value flags still work but are
+  visible in the process list.
+- The CLI worker and the Python remote client no longer follow redirects, read
+  responses under a size limit (1 MiB for acknowledgements; 256 MiB by default
+  for `trials`, `top_k`, and `pareto_front`, adjustable with
+  `Study.connect(max_response_bytes=...)`), and escape control characters in
+  server-supplied text before printing or raising it.
+- On Linux and macOS the worker refuses an existing outbox directory that is a
+  symbolic link, is owned by another user, or is writable by its group or by
+  others, and reads queued results without following symbolic links. A
+  directory created by the worker is already private.
 
 ## 1.0.1-rc9
 

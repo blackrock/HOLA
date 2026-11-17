@@ -85,6 +85,15 @@ enum Commands {
         /// heartbeat a trial before this deadline.
         #[arg(long, default_value_t = 7200, value_parser = clap::value_parser!(u64).range(1..))]
         lease_seconds: u64,
+        /// Number of files POST /api/checkpoint/save may keep in the
+        /// checkpoint directory. Further saves are refused until older files
+        /// are removed; the server never deletes a saved checkpoint itself.
+        #[arg(
+            long,
+            default_value_t = hola::server::DEFAULT_MAX_SAVED_CHECKPOINTS,
+            value_parser = parse_positive_count
+        )]
+        max_saved_checkpoints: usize,
     },
     /// Run a worker that polls the server for trials.
     ///
@@ -142,6 +151,14 @@ enum WorkerMode {
     Callback,
     /// The worker parses the command's stdout as metrics and reports them.
     Exec,
+}
+
+fn parse_positive_count(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_string()),
+        Ok(count) => Ok(count),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn load_config(path: &PathBuf) -> Result<StudyConfig, Box<dyn std::error::Error>> {
@@ -1954,6 +1971,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cors_origins,
             allow_unauthenticated_reads,
             lease_seconds,
+            max_saved_checkpoints,
         } => {
             let study_config = load_config(&config)?;
             let load_from = study_config
@@ -2013,6 +2031,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             options.cors_allowed_origins = cors_origins;
             options.require_read_auth = !allow_unauthenticated_reads;
             options.lease_duration = Duration::from_secs(lease_seconds);
+            options.max_saved_checkpoints = max_saved_checkpoints;
 
             hola::server::serve_with_options(engine, options).await?;
         }

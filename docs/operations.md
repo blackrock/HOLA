@@ -32,8 +32,8 @@ The server speaks plain HTTP and has no TLS of its own. Terminate TLS at a
 trusted reverse proxy whenever traffic leaves the host, and give workers and
 Python clients the proxy's `https://` URL. They refuse to send a token to a
 non-loopback `http://` address unless started with `--allow-insecure-http`
-(`allow_insecure_http=True` in Python), which is appropriate only on a network
-where the token may be read in transit. They also never follow redirects, so
+(`allow_insecure_http=True` in Python), which is appropriate only on a private
+network you fully trust. They also never follow redirects, so
 configure the final URL. Do not use `--allow-unauthenticated-reads` when
 parameters, metrics, or study progress are sensitive.
 
