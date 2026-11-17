@@ -85,6 +85,11 @@ peak heap and compare it with the previous release.
 - Start a token-protected server on a non-loopback interface. Verify a
   disallowed `Origin` receives 403 for both reads and mutations and does not
   change pending/completed counts.
+- Start a server without a token. Verify a read and a mutation sent with
+  `Host: attacker.example` both receive 403 `host_forbidden` and change
+  nothing, while the same requests addressed to `localhost` succeed.
+- Open a connection and send only part of a request head. Verify the server
+  closes it after 120 seconds, and that `/healthz` answers throughout.
 - Run a worker, kill it mid-trial, let its lease expire, and verify the work is
   reclaimed. Restart an exec worker with a nonempty outbox and verify the exact
   tell is replayed without a second completion event.
