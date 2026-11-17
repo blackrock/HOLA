@@ -169,6 +169,21 @@ body {
 }
 #connect-panel input[type="text"]:focus,
 #connect-panel input[type="password"]:focus { border-color: var(--accent); }
+#token-status {
+  color: var(--text-1);
+  overflow-wrap: anywhere;
+}
+#token-status:empty { display: none; }
+#connection-notice {
+  flex-basis: 100%;
+  padding: 8px 12px;
+  border-left: 3px solid var(--orange);
+  background: var(--bg-2);
+  border-radius: var(--radius-sm);
+  color: var(--text-0);
+  overflow-wrap: anywhere;
+}
+#connection-notice[hidden] { display: none; }
 
 .visually-hidden {
   position: absolute;

@@ -235,17 +235,42 @@ hola serve config.yaml --port 8000
 | `config` | required | Path to the YAML configuration file |
 | `--host` | `127.0.0.1` | Host/interface to bind. Use `0.0.0.0` explicitly for network access |
 | `--port` | `8000` | Port to listen on |
-| `--dashboard` | none | Path to a dashboard directory to serve at `/` (e.g. `--dashboard ./dashboard`) |
-| `--auth-token` | none | Bearer token required for all API endpoints |
-| `--read-token` | none | Optional read-only token for dashboards, SSE, and metrics; never permits mutations |
+| `--dashboard` | none | Path to a dashboard directory to serve at `/` (e.g. `--dashboard ./dashboard`). Its files are served without a token, so the server refuses a directory that contains a checkpoint directory |
+| `--auth-token-file` | none | File holding the bearer token required for all API endpoints |
+| `--read-token-file` | none | File holding an optional read-only token for dashboards, SSE, and metrics; never permits mutations |
+| `--auth-token`, `--read-token` | none | The same tokens given directly. Avoid these: see below |
 | `--allow-unauthenticated-reads` | off | Explicitly leave read-only endpoints and SSE open when a token is configured |
 | `--checkpoint-dir` | checkpoint config directory or config file directory | Directory where dashboard/API checkpoint saves are allowed |
 | `--cors-origin` | none | Allowed browser CORS origin. Repeat for multiple origins |
 | `--lease-seconds` | `7200` | Time a distributed trial may remain pending without completion, cancellation, or heartbeat |
+| `--max-saved-checkpoints` | `32` | Files `POST /api/checkpoint/save` may keep in the checkpoint directory; further saves are refused until older files are removed |
 
 The server starts listening on `127.0.0.1:<port>` by default and exposes
-the [REST API](rest-api.md). Binding a non-local host requires `--auth-token`
-or the `HOLA_API_TOKEN` environment variable.
+the [REST API](rest-api.md). Binding a non-local host requires an API token.
+
+### Supplying tokens
+
+Each token is taken from the first of these that is set:
+
+| Token | Flag with the value | File | Environment variable |
+|-------|---------------------|------|----------------------|
+| Server write token | `--auth-token` | `--auth-token-file` | `HOLA_API_TOKEN` |
+| Server read-only token | `--read-token` | `--read-token-file` | `HOLA_READ_TOKEN` |
+| Worker token | `--token` | `--token-file` | `HOLA_API_TOKEN` |
+
+Use a file or the environment variable. A token passed as a flag value is
+part of the process command line, which other users on the same machine can
+read (for example with `ps`) for as long as the server or worker runs. A
+token file holds the token on one line; one trailing newline is ignored.
+Keep it readable only by its owner (`chmod 600`). A read-only token is
+accepted only together with a write token.
+
+```bash
+umask 077
+openssl rand -hex 32 > write.token
+openssl rand -hex 32 > read.token
+hola serve config.yaml --auth-token-file write.token --read-token-file read.token
+```
 
 ## Running Workers
 
@@ -258,10 +283,17 @@ hola worker --server http://localhost:8000 --exec "python train.py"
 | `--server` | required | URL of the HOLA server |
 | `--exec` | required | Shell command to execute for each trial |
 | `--mode` | `callback` | Worker mode: `"callback"` or `"exec"` |
-| `--token` | none | Bearer token for servers started with `--auth-token` |
+| `--token-file` | none | File holding the bearer token for a token-protected server. `HOLA_API_TOKEN` works too; see [Supplying tokens](#supplying-tokens) |
+| `--allow-insecure-http` | off | Send the token to a non-loopback `http://` server. See [Multi-Machine Setup](#multi-machine-setup) |
 | `--request-timeout` | `30` | Maximum seconds for an HTTP request |
 | `--command-timeout` | `3600` | Maximum seconds before the command process tree is terminated |
 | `--outbox-dir` | `.hola-worker-outbox` | Durable, server-scoped queue for exec-mode tells |
+
+The worker never follows an HTTP redirect. If the server or a proxy answers
+with a 3xx status, the request fails and names the redirect target; point
+`--server` at that final URL instead. Responses larger than 1 MiB are
+rejected, and server-supplied text is printed with control characters
+escaped.
 
 ### Callback mode (default)
 
@@ -276,11 +308,13 @@ In callback mode, the worker loop works as follows.
    - `HOLA_TRIAL_ID`. The numeric trial ID.
    - `HOLA_PARAMS`. Trial parameters as a JSON string.
    - `HOLA_API_TOKEN`. Set only when the worker has a token
-     configured (via `--token` or the `HOLA_API_TOKEN`
+     configured (via `--token-file`, `--token`, or the `HOLA_API_TOKEN`
      environment variable). When present, the script must send
      it as a `Bearer` header on its `POST /api/tell` and
      `POST /api/cancel` requests, since those write endpoints
      require authorization on a token-protected server.
+   - `HOLA_ALLOW_INSECURE_HTTP`. Set to `1` only when the worker
+     itself was allowed to send its token over unencrypted HTTP.
 3. The script is responsible for calling `POST /api/tell` to
    report results back to the server
 4. Reconcile the exact trial lifecycle with the server. A completed tell stays
@@ -312,6 +346,14 @@ reporting on its behalf.
 hola worker --server http://localhost:8000 \
   --exec "python train.py" --mode exec
 ```
+
+Every queued result is later sent with the worker's token, so the outbox
+must be writable only by the user running the worker. The worker creates
+`--outbox-dir` and its server-specific subdirectory with mode `0700`. On
+Unix it refuses to start with an existing outbox directory that is a
+symbolic link, is owned by another unprivileged user, or is writable by its
+group or by others, and it never reads a queued result through a symbolic
+link. Give each worker account its own outbox directory.
 
 ### The `HOLA_PARAMS` environment variable
 
@@ -405,7 +447,12 @@ from hola_opt import Study
 
 params = json.loads(os.environ["HOLA_PARAMS"])
 trial_id = int(os.environ["HOLA_TRIAL_ID"])
-remote = Study.connect(os.environ["HOLA_SERVER"], token=os.environ.get("HOLA_API_TOKEN"))
+remote = Study.connect(
+    os.environ["HOLA_SERVER"],
+    token=os.environ.get("HOLA_API_TOKEN"),
+    # Follow the decision the operator made when starting the worker.
+    allow_insecure_http=os.environ.get("HOLA_ALLOW_INSECURE_HTTP") == "1",
+)
 
 # Your training code here
 loss = train_model(**params)
@@ -447,20 +494,51 @@ To run distributed optimization across multiple machines, we
 start a server on one machine and point workers at it from the
 others.
 
-**Machine A (server):**
+The HOLA server speaks plain HTTP and has no TLS of its own. A token sent
+to it directly from another machine crosses the network unencrypted, and
+anyone who can observe that traffic can then read and change the study.
+Put a TLS-terminating reverse proxy (nginx, Caddy, a cloud load balancer)
+in front of the server and give workers the proxy's `https://` URL.
+
+**Machine A (server, behind a TLS proxy for `hola.example.com`):**
 
 ```bash
-hola serve config.yaml --host 0.0.0.0 --port 8000 --auth-token "$HOLA_API_TOKEN"
+export HOLA_API_TOKEN="$(openssl rand -hex 32)"
+hola serve config.yaml --host 127.0.0.1 --port 8000
 ```
+
+The server reads the token from `HOLA_API_TOKEN`. It can keep listening on
+loopback when the proxy runs on the same machine; use `--host 0.0.0.0` only
+when the proxy is on another host. Configure the proxy to forward requests
+to `http://127.0.0.1:8000`, to pass the `Authorization` header through, and
+not to buffer `/api/events`, which is a long-lived event stream. To use the
+dashboard through the proxy, also start the server with
+`--cors-origin https://hola.example.com`.
 
 **Machines B, C, D (workers):**
 
 ```bash
-hola worker --server http://machine-a:8000 --token "$HOLA_API_TOKEN" --exec "python train.py"
+export HOLA_API_TOKEN="..."   # the same token, distributed out of band
+hola worker --server https://hola.example.com --exec "python train.py"
 ```
 
 Each worker independently polls the server for trials. The
 server handles concurrent ask/tell requests safely.
+
+**Without TLS, on a network you trust.** A worker or Python client refuses
+to send a token to a non-loopback `http://` address. On an isolated network
+where you accept that the token is readable in transit, opt in explicitly:
+
+```bash
+# Machine A
+hola serve config.yaml --host 0.0.0.0 --port 8000
+# Machines B, C, D
+hola worker --server http://machine-a:8000 --allow-insecure-http --exec "python train.py"
+```
+
+Setting `HOLA_ALLOW_INSECURE_HTTP=1` in the worker's environment has the
+same effect as the flag. `http://localhost` and other loopback addresses
+never need it.
 
 You can also connect from Python on any machine.
 
@@ -468,7 +546,9 @@ You can also connect from Python on any machine.
 import os
 from hola_opt import Study
 
-remote = Study.connect("http://machine-a:8000", token=os.environ["HOLA_API_TOKEN"])
+remote = Study.connect("https://hola.example.com", token=os.environ["HOLA_API_TOKEN"])
+# Unencrypted, trusted network only:
+# remote = Study.connect("http://machine-a:8000", token=..., allow_insecure_http=True)
 trial = remote.ask()
 # ... evaluate ...
 remote.tell(trial.trial_id, metrics)

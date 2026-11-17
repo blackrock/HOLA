@@ -31,3 +31,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "fmt"] }
 command-group = "5.0.1"
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+# geteuid and O_NOFOLLOW, used to keep the worker outbox private.
+libc = "0.2"

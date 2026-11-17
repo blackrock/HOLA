@@ -545,6 +545,82 @@ const DEFAULT_REQUEST_TIMEOUT_SECONDS: f64 = 30.0;
 // it also stays well below Tokio's saturating u64 millisecond deadline range.
 const MAX_TIMEOUT_SECONDS: f64 = (100_u64 * 365 * 24 * 60 * 60) as f64;
 const MAX_ERROR_BODY_CHARS: usize = 4096;
+/// Bytes of an error response that are read at all. Only a short excerpt is
+/// quoted, so the remainder of an oversized body is never downloaded.
+const MAX_ERROR_BODY_BYTES: usize = 64 << 10;
+/// Largest acknowledgement, lifecycle or single-trial response accepted. The
+/// server caps request bodies at 64 KiB, so 1 MiB is far above a legitimate one.
+const MAX_SMALL_RESPONSE_BYTES: usize = 1 << 20;
+/// Default limit for the bulk reads (`trials`, `top_k`, `pareto_front`), whose
+/// size grows with the study. `Study.connect(max_response_bytes=...)` changes it.
+const DEFAULT_MAX_RESPONSE_BYTES: u64 = 256 << 20;
+/// Number of post-commit warnings surfaced for one tell, and the length of each.
+const MAX_POST_COMMIT_WARNINGS: usize = 16;
+const POST_COMMIT_WARNING_CHARS: usize = 512;
+const TRANSPORT_ERROR_CHARS: usize = 1024;
+
+/// Make server-controlled text safe to show in an exception, a warning, or a
+/// log line.
+///
+/// Control characters (C0, DEL and C1, which include ESC, CR and LF) and the
+/// Unicode line-separator and bidirectional-override characters are replaced
+/// with visible escapes, so a server cannot forge extra lines, hide text, or
+/// drive the terminal the message is printed on. The result holds at most
+/// `max_chars` characters of the input, followed by `...` when it was cut.
+fn sanitize_remote_text(text: &str, max_chars: usize) -> String {
+    use std::fmt::Write as _;
+
+    let mut safe = String::with_capacity(text.len().min(max_chars.saturating_mul(2)));
+    for (index, character) in text.chars().enumerate() {
+        if index == max_chars {
+            safe.push_str("...");
+            break;
+        }
+        match character {
+            '\n' => safe.push_str("\\n"),
+            '\r' => safe.push_str("\\r"),
+            '\t' => safe.push_str("\\t"),
+            character
+                if character.is_control()
+                    || matches!(
+                        character,
+                        '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                    ) =>
+            {
+                let _ = write!(safe, "\\u{{{:04x}}}", u32::from(character));
+            }
+            character => safe.push(character),
+        }
+    }
+    safe
+}
+
+/// True for `localhost` and loopback IP literals, including the bracketed IPv6
+/// form used in URLs.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>().is_ok_and(|ip| match ip {
+        std::net::IpAddr::V4(ip) => ip.is_loopback(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| mapped.is_loopback())
+        }
+    })
+}
+
+/// Whether sending a bearer token to `url` would expose it on the network: a
+/// plain `http://` URL whose host is not the local machine.
+fn token_would_travel_unencrypted(url: &reqwest::Url) -> bool {
+    url.scheme() == "http" && !url.host_str().is_some_and(is_loopback_host)
+}
 
 /// One runtime owns all async work issued by Python studies for the lifetime of
 /// the process. Keeping it in a `OnceLock` prevents each `Study` from creating a
@@ -586,6 +662,59 @@ fn checked_timeout_duration(name: &str, seconds: f64) -> Result<Duration, String
 
 fn timeout_duration(name: &str, seconds: f64) -> PyResult<Duration> {
     checked_timeout_duration(name, seconds).map_err(ConfigurationError::new_err)
+}
+
+#[cfg(test)]
+mod remote_text_tests {
+    use super::{is_loopback_host, sanitize_remote_text, token_would_travel_unencrypted};
+
+    #[test]
+    fn server_text_is_neutralized_and_bounded() {
+        assert_eq!(sanitize_remote_text("plain text é ✓", 64), "plain text é ✓");
+        assert_eq!(
+            sanitize_remote_text("a\r\nb\tc\u{1b}[2J\u{7}\u{7f}\u{9b}", 64),
+            "a\\r\\nb\\tc\\u{001b}[2J\\u{0007}\\u{007f}\\u{009b}"
+        );
+        assert_eq!(
+            sanitize_remote_text("x\u{202e}y\u{2028}z\u{2066}", 64),
+            "x\\u{202e}y\\u{2028}z\\u{2066}"
+        );
+        assert_eq!(sanitize_remote_text("abcdef", 3), "abc...");
+        assert_eq!(sanitize_remote_text("abc", 3), "abc");
+    }
+
+    #[test]
+    fn only_non_loopback_plain_http_exposes_a_token() {
+        for host in [
+            "localhost",
+            "LocalHost",
+            "127.0.0.1",
+            "127.9.9.9",
+            "::1",
+            "[::1]",
+        ] {
+            assert!(is_loopback_host(host), "{host}");
+        }
+        for host in [
+            "machine-a",
+            "localhost.example.com",
+            "10.0.0.1",
+            "0.0.0.0",
+            "::",
+        ] {
+            assert!(!is_loopback_host(host), "{host}");
+        }
+        let exposed =
+            |url: &str| token_would_travel_unencrypted(&reqwest::Url::parse(url).unwrap());
+        assert!(exposed("http://machine-a:8000"));
+        assert!(exposed("http://192.168.1.20:8000/prefix"));
+        assert!(exposed("http://[2001:db8::1]:8000"));
+        assert!(!exposed("http://localhost:8000"));
+        assert!(!exposed("http://127.0.0.1:8000"));
+        assert!(!exposed("http://[::1]:8000"));
+        assert!(!exposed("http://[::ffff:127.0.0.1]:8000"));
+        assert!(!exposed("https://machine-a:8443"));
+    }
 }
 
 #[cfg(test)]
@@ -646,6 +775,8 @@ mod timeout_tests {
 struct RemoteHttpClient {
     client: reqwest::Client,
     token: Option<String>,
+    /// Byte limit for bulk read responses; see `DEFAULT_MAX_RESPONSE_BYTES`.
+    max_response_bytes: usize,
     /// One unresolved ask key is retained until a complete, valid response is
     /// received. The mutex also serializes concurrent calls so two callers
     /// cannot accidentally share the same in-flight key/trial.
@@ -653,10 +784,24 @@ struct RemoteHttpClient {
 }
 
 impl RemoteHttpClient {
-    fn new(token: Option<String>, connect_timeout: f64, request_timeout: f64) -> PyResult<Self> {
+    fn new(
+        token: Option<String>,
+        connect_timeout: f64,
+        request_timeout: f64,
+        max_response_bytes: u64,
+    ) -> PyResult<Self> {
+        if max_response_bytes == 0 {
+            return Err(ConfigurationError::new_err(
+                "max_response_bytes must be at least 1",
+            ));
+        }
         let client = reqwest::Client::builder()
             .connect_timeout(timeout_duration("connect_timeout", connect_timeout)?)
             .timeout(timeout_duration("request_timeout", request_timeout)?)
+            // Never follow a redirect. A followed redirect would replay the
+            // request (and, on the same host, the bearer token) at an address
+            // the server chose, and could turn https:// into plain http://.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| {
                 ConfigurationError::new_err(format!("Failed to create HTTP client: {e}"))
@@ -664,6 +809,7 @@ impl RemoteHttpClient {
         Ok(Self {
             client,
             token,
+            max_response_bytes: usize::try_from(max_response_bytes).unwrap_or(usize::MAX),
             ask_idempotency_key: Mutex::new(None),
         })
     }
@@ -725,7 +871,7 @@ async fn renew_run_lease(
     if !response.status().is_success() {
         return Err(response_error(response).await);
     }
-    let body: serde_json::Value = response_json(response).await?;
+    let body: serde_json::Value = response_json(response, MAX_SMALL_RESPONSE_BYTES).await?;
     validate_status_ok(&body, "Heartbeat")?;
     if body.get("trial_id").and_then(serde_json::Value::as_u64) != Some(trial_id) {
         return Err(format!(
@@ -809,22 +955,86 @@ async fn keep_run_lease_alive(
 
 async fn send_remote(request: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
     request.send().await.map_err(|e| {
+        let detail = sanitize_remote_text(&e.to_string(), TRANSPORT_ERROR_CHARS);
         if e.is_timeout() {
-            format!("HTTP request timed out: {e}")
+            format!("HTTP request timed out: {detail}")
         } else if e.is_connect() {
-            format!("HTTP connection failed: {e}")
+            format!("HTTP connection failed: {detail}")
         } else {
-            format!("HTTP request failed: {e}")
+            format!("HTTP request failed: {detail}")
         }
     })
 }
 
+/// Read a response body, failing as soon as it is known to exceed `limit`.
+///
+/// A declared `Content-Length` above the limit is rejected before any body
+/// byte is read, and the bytes actually received are counted as well because
+/// a chunked or mislabelled body declares nothing reliable. The client is
+/// built without response decompression, so received bytes are the body size.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    if let Some(declared) = response.content_length() {
+        if declared > limit as u64 {
+            return Err(format!(
+                "Server response of {declared} bytes exceeds the {limit}-byte limit"
+            ));
+        }
+    }
+    let mut body = Vec::new();
+    loop {
+        let chunk = response.chunk().await.map_err(|e| {
+            format!(
+                "Failed to read server response: {}",
+                sanitize_remote_text(&e.to_string(), TRANSPORT_ERROR_CHARS)
+            )
+        })?;
+        let Some(chunk) = chunk else {
+            return Ok(body);
+        };
+        if chunk.len() > limit - body.len() {
+            return Err(format!("Server response exceeds the {limit}-byte limit"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+}
+
+/// Read at most `MAX_ERROR_BODY_BYTES` of an error body and stop. An error
+/// body is only quoted in a diagnostic, so an oversized one is cut, not failed.
+async fn read_error_body(mut response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    while body.len() < MAX_ERROR_BODY_BYTES {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = MAX_ERROR_BODY_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            Ok(None) => break,
+            Err(e) if body.is_empty() => return format!("unable to read error response: {e}"),
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
 async fn response_error(response: reqwest::Response) -> String {
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|e| format!("unable to read error response: {e}"));
+    if status.is_redirection() {
+        let target = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .map(|value| {
+                let location = String::from_utf8_lossy(value.as_bytes());
+                format!(" to '{}'", sanitize_remote_text(&location, 256))
+            })
+            .unwrap_or_default();
+        return format!(
+            "Server returned HTTP {status}{target}; HOLA does not follow redirects, so connect to the final URL"
+        );
+    }
+    let body = read_error_body(response).await;
     let detail = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|value| {
@@ -838,14 +1048,14 @@ async fn response_error(response: reqwest::Response) -> String {
                         .unwrap_or_else(|| detail.to_string())
                 })
         })
-        .unwrap_or_else(|| {
-            let trimmed = body.trim();
-            if trimmed.is_empty() {
-                "empty response body".to_string()
-            } else {
-                trimmed.chars().take(MAX_ERROR_BODY_CHARS).collect()
-            }
-        });
+        .unwrap_or_else(|| body.trim().to_string());
+    // The detail is whatever the server chose to send. Bound it and neutralize
+    // control characters before it becomes an exception message.
+    let detail = if detail.is_empty() {
+        "empty response body".to_string()
+    } else {
+        sanitize_remote_text(&detail, MAX_ERROR_BODY_CHARS)
+    };
     format!("Server returned HTTP {status}: {detail}")
 }
 
@@ -858,15 +1068,25 @@ async fn checked_response(request: reqwest::RequestBuilder) -> Result<reqwest::R
     }
 }
 
-async fn response_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, String> {
-    response
-        .json()
-        .await
-        .map_err(|e| format!("Invalid JSON response from server: {e}"))
+/// Parse a successful response as JSON after reading at most `limit` bytes.
+async fn response_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<T, String> {
+    let body = read_body_capped(response, limit).await?;
+    serde_json::from_slice(&body).map_err(|e| {
+        format!(
+            "Invalid JSON response from server: {}",
+            sanitize_remote_text(&e.to_string(), TRANSPORT_ERROR_CHARS)
+        )
+    })
 }
 
-async fn checked_json<T: DeserializeOwned>(request: reqwest::RequestBuilder) -> Result<T, String> {
-    response_json(checked_response(request).await?).await
+async fn checked_json<T: DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    limit: usize,
+) -> Result<T, String> {
+    response_json(checked_response(request).await?, limit).await
 }
 
 fn validate_remote_trial_identity(
@@ -901,16 +1121,32 @@ fn validate_post_commit_warnings(
 ) -> Result<Vec<String>, String> {
     match body.get("post_commit_warnings") {
         None => Ok(Vec::new()),
-        Some(serde_json::Value::Array(warnings)) => warnings
-            .iter()
-            .map(|warning| {
-                warning.as_str().map(ToOwned::to_owned).ok_or_else(|| {
-                    format!(
-                        "{operation} acknowledgement has a non-string post_commit_warnings entry"
-                    )
+        Some(serde_json::Value::Array(warnings)) => {
+            let warnings = warnings
+                .iter()
+                .map(|warning| {
+                    warning.as_str().ok_or_else(|| {
+                        format!(
+                            "{operation} acknowledgement has a non-string post_commit_warnings entry"
+                        )
+                    })
                 })
-            })
-            .collect(),
+                .collect::<Result<Vec<_>, _>>()?;
+            // The text is server-controlled and is shown through Python's
+            // warning machinery: neutralize it and bound its length and count.
+            let mut printable: Vec<String> = warnings
+                .iter()
+                .take(MAX_POST_COMMIT_WARNINGS)
+                .map(|warning| sanitize_remote_text(warning, POST_COMMIT_WARNING_CHARS))
+                .collect();
+            if warnings.len() > MAX_POST_COMMIT_WARNINGS {
+                printable.push(format!(
+                    "{} further post-commit warnings were not shown",
+                    warnings.len() - MAX_POST_COMMIT_WARNINGS
+                ));
+            }
+            Ok(printable)
+        }
         Some(_) => Err(format!(
             "{operation} acknowledgement has non-array post_commit_warnings"
         )),
@@ -1130,13 +1366,20 @@ impl Study {
     ///     connect_timeout: Maximum seconds allowed to establish a connection.
     ///     request_timeout: Maximum seconds allowed for a complete HTTP request.
     ///         Both timeouts must be positive and at most 3,153,600,000 seconds.
+    ///     allow_insecure_http: Permit sending ``token`` to a non-loopback
+    ///         ``http://`` URL. Refused by default because the token would
+    ///         cross the network unencrypted.
+    ///     max_response_bytes: Largest ``trials``/``top_k``/``pareto_front``
+    ///         response accepted, in bytes (default 268,435,456).
     #[staticmethod]
-    #[pyo3(signature = (url, token=None, *, connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS, request_timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS))]
+    #[pyo3(signature = (url, token=None, *, connect_timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS, request_timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS, allow_insecure_http=false, max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES))]
     fn connect(
         url: &str,
         token: Option<String>,
         connect_timeout: f64,
         request_timeout: f64,
+        allow_insecure_http: bool,
+        max_response_bytes: u64,
     ) -> PyResult<Self> {
         // Validate the URL up front so a malformed or non-HTTP URL fails here
         // with a clear error rather than at the first ask/tell. No network
@@ -1174,7 +1417,20 @@ impl Study {
         let normalized_path = parsed.path().trim_end_matches('/').to_string();
         parsed.set_path(&normalized_path);
         let normalized_url = parsed.to_string().trim_end_matches('/').to_string();
-        let http = RemoteHttpClient::new(token, connect_timeout, request_timeout)?;
+        // The HOLA server speaks plain HTTP. Decide before any request exists
+        // whether the token may travel to this address at all.
+        let has_token = token.as_deref().is_some_and(|token| !token.is_empty());
+        if has_token && !allow_insecure_http && token_would_travel_unencrypted(&parsed) {
+            return Err(ConfigurationError::new_err(format!(
+                "Refusing to send the bearer token to {normalized_url} over unencrypted HTTP: \
+                 anyone on the network path could read it and use it against the server. The \
+                 HOLA server does not speak TLS itself, so put a TLS-terminating reverse proxy \
+                 in front of it and connect to its https:// URL. On a network you trust, pass \
+                 allow_insecure_http=True to send it anyway."
+            )));
+        }
+        let http =
+            RemoteHttpClient::new(token, connect_timeout, request_timeout, max_response_bytes)?;
         shared_runtime()?;
         Ok(Self {
             inner: StudyInner::Remote {
@@ -1247,6 +1503,7 @@ impl Study {
                         let resp: serde_json::Value = runtime.block_on(checked_json(
                             http.post(format!("{url}/api/ask"))
                                 .header("Idempotency-Key", idempotency_key),
+                            MAX_SMALL_RESPONSE_BYTES,
                         ))?;
                         let trial_id = resp
                             .get("trial_id")
@@ -1299,6 +1556,7 @@ impl Study {
                                         "trial_id": trial_id,
                                         "metrics": raw,
                                     })),
+                                MAX_SMALL_RESPONSE_BYTES,
                             )
                             .await?;
                             validate_status_ok(&tell_body, "Tell")?;
@@ -1324,7 +1582,8 @@ impl Study {
                             )))
                             .await?;
                             if trial_resp.status().is_success() {
-                                let trial = response_json(trial_resp).await?;
+                                let trial =
+                                    response_json(trial_resp, MAX_SMALL_RESPONSE_BYTES).await?;
                                 return Ok((
                                     validate_remote_trial_identity(
                                         trial,
@@ -1340,9 +1599,12 @@ impl Study {
                                 return Err(response_error(trial_resp).await);
                             }
 
-                            let trials_resp: Vec<serde_json::Value> = checked_json(http.get(
-                                format!("{url}/api/trials?sorted_by=index&include_infeasible=true"),
-                            ))
+                            let trials_resp: Vec<serde_json::Value> = checked_json(
+                                http.get(format!(
+                                    "{url}/api/trials?sorted_by=index&include_infeasible=true"
+                                )),
+                                http.max_response_bytes,
+                            )
                             .await?;
                             let trial = trials_resp
                                 .into_iter()
@@ -1358,8 +1620,7 @@ impl Study {
                     .map_err(RemoteError::new_err)?;
 
                 let ct: hola_engine::hola_engine::CompletedTrial =
-                    serde_json::from_value(trial_json)
-                        .map_err(|e| RemoteError::new_err(format!("Deserialization error: {e}")))?;
+                    serde_json::from_value(trial_json).map_err(deserialization_error)?;
                 let runtime_warning = py.get_type::<PyRuntimeWarning>();
                 let warnings = PyModule::import(py, "warnings")?;
                 for warning in post_commit_warnings {
@@ -1391,6 +1652,7 @@ impl Study {
                         let acknowledgement: serde_json::Value = checked_json(
                             http.post(format!("{url}/api/cancel"))
                                 .json(&serde_json::json!({ "trial_id": trial_id })),
+                            MAX_SMALL_RESPONSE_BYTES,
                         )
                         .await?;
                         validate_status_ok(&acknowledgement, "Cancel")?;
@@ -1427,6 +1689,7 @@ impl Study {
                         runtime.block_on(checked_json(
                             http.post(format!("{url}/api/heartbeat"))
                                 .json(&serde_json::json!({ "trial_id": trial_id })),
+                            MAX_SMALL_RESPONSE_BYTES,
                         ))
                     })
                     .map_err(RemoteError::new_err)?;
@@ -1468,9 +1731,12 @@ impl Study {
             StudyInner::Remote { url, http } => {
                 let resp: Vec<serde_json::Value> = py
                     .detach(|| {
-                        runtime.block_on(checked_json(http.get(format!(
-                            "{url}/api/top_k?k={k}&include_infeasible={include_infeasible}"
-                        ))))
+                        runtime.block_on(checked_json(
+                            http.get(format!(
+                                "{url}/api/top_k?k={k}&include_infeasible={include_infeasible}"
+                            )),
+                            http.max_response_bytes,
+                        ))
                     })
                     .map_err(RemoteError::new_err)?;
                 json_vec_to_completed_pylist(py, resp)
@@ -1496,9 +1762,12 @@ impl Study {
             StudyInner::Remote { url, http } => {
                 let resp: Vec<serde_json::Value> = py
                     .detach(|| {
-                        runtime.block_on(checked_json(http.get(format!(
-                                    "{url}/api/pareto_front?front={front}&include_infeasible={include_infeasible}"
-                                ))))
+                        runtime.block_on(checked_json(
+                            http.get(format!(
+                                "{url}/api/pareto_front?front={front}&include_infeasible={include_infeasible}"
+                            )),
+                            http.max_response_bytes,
+                        ))
                     })
                     .map_err(RemoteError::new_err)?;
                 json_vec_to_completed_pylist(py, resp)
@@ -1526,9 +1795,12 @@ impl Study {
             StudyInner::Remote { url, http } => {
                 let resp: Vec<serde_json::Value> = py
                     .detach(|| {
-                        runtime.block_on(checked_json(http.get(format!(
-                                    "{url}/api/trials?sorted_by={sorted_by}&include_infeasible={include_infeasible}"
-                                ))))
+                        runtime.block_on(checked_json(
+                            http.get(format!(
+                                "{url}/api/trials?sorted_by={sorted_by}&include_infeasible={include_infeasible}"
+                            )),
+                            http.max_response_bytes,
+                        ))
                     })
                     .map_err(RemoteError::new_err)?;
                 json_vec_to_completed_pylist(py, resp)
@@ -1546,7 +1818,10 @@ impl Study {
             StudyInner::Remote { url, http } => {
                 let resp: serde_json::Value = py
                     .detach(|| {
-                        runtime.block_on(checked_json(http.get(format!("{url}/api/trial_count"))))
+                        runtime.block_on(checked_json(
+                            http.get(format!("{url}/api/trial_count")),
+                            MAX_SMALL_RESPONSE_BYTES,
+                        ))
                     })
                     .map_err(RemoteError::new_err)?;
                 resp.get("trial_count")
@@ -1593,6 +1868,7 @@ impl Study {
                         let acknowledgement: serde_json::Value = checked_json(
                             http.patch(format!("{url}/api/objectives"))
                                 .json(&serde_json::json!({ "objectives": obj_configs })),
+                            MAX_SMALL_RESPONSE_BYTES,
                         )
                         .await?;
                         validate_status_ok(&acknowledgement, "Objective update")?;
@@ -1967,6 +2243,15 @@ fn completed_vec_to_pylist(
     Ok(list.into())
 }
 
+/// A server trial that does not match the expected schema. serde quotes the
+/// offending value, which the server chose, so the text is neutralized.
+fn deserialization_error(error: serde_json::Error) -> PyErr {
+    RemoteError::new_err(format!(
+        "Deserialization error: {}",
+        sanitize_remote_text(&error.to_string(), TRANSPORT_ERROR_CHARS)
+    ))
+}
+
 fn json_vec_to_completed_pylist(
     py: Python<'_>,
     items: Vec<serde_json::Value>,
@@ -1974,8 +2259,8 @@ fn json_vec_to_completed_pylist(
     let list = PyList::empty(py);
     // Consume each Value via into_iter() so deserialization does not clone.
     for item in items {
-        let ct: hola_engine::hola_engine::CompletedTrial = serde_json::from_value(item)
-            .map_err(|e| RemoteError::new_err(format!("Deserialization error: {e}")))?;
+        let ct: hola_engine::hola_engine::CompletedTrial =
+            serde_json::from_value(item).map_err(deserialization_error)?;
         let py_ct = rust_to_py_completed(py, &ct)?;
         list.append(Py::new(py, py_ct)?)?;
     }

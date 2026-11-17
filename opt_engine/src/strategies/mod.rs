@@ -25,6 +25,7 @@ mod sobol;
 
 pub use gmm::{
     DEFAULT_GMM_COMPONENTS, GaussianComponent, GmmError, GmmParams, GmmRefitConfig, GmmStrategy,
+    MAX_GMM_DIMS,
 };
 pub use random::RandomStrategy;
 pub use sobol::SobolStrategy;

@@ -57,42 +57,216 @@ const S = {
 // ============================================================================
 // Connection
 // ============================================================================
-// API token is kept in memory only (never localStorage) so it cannot be read
-// by extensions or persisted XSS. If supplied via ?token= for convenience it is
-// captured once and stripped from the URL to avoid leaking through history,
-// referrer headers, and access logs.
+// The API token is kept in memory only (never localStorage, never a form
+// field after it has been read) and is bound to the origin it was supplied
+// for. apiFetch attaches it only to requests for that origin, and connecting
+// to a different origin drops it unless a token is supplied for the new one.
+//
+// A link may carry the token in the URL fragment (#token=...). A fragment is
+// never sent in an HTTP request or a Referer header, so it cannot reach an
+// access log. It is read here, before this script makes any request, and
+// erased from the address bar at once. A ?token= query parameter has already
+// been sent to whichever server delivered this page by the time any script
+// runs, so it is refused rather than used.
 let _apiToken = '';
+let _apiTokenOrigin = null;  // origin the in-memory token is bound to
+let _unboundToken = '';      // fragment token with no origin yet (file:// page)
+let _queryTokenRefused = false;
 
+// Deadlines and size caps for what a server may make this page hold. They
+// bound memory and concurrent work if a server misbehaves; an honest server
+// stays far below them.
+const API_TIMEOUT_MS = 30_000;                    // metadata and single-trial requests
+const SLOW_API_TIMEOUT_MS = 120_000;              // snapshot, objective update, checkpoint save
+const MAX_API_RESPONSE_BYTES = 4 * 1024 * 1024;   // every response except the snapshot
+const MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024;     // /api/trials
+const MAX_SSE_RECORD_CHARS = 1024 * 1024;         // one text/event-stream record
+const MAX_SSE_RECORDS_PER_READ = 1024;            // records applied per network read
+const MAX_EVENT_FETCHES = 4;                      // concurrent event-triggered trial fetches
+let _eventFetches = 0;
+
+// Origin of an absolute http(s) URL, or null for anything else.
+function httpOrigin(url) {
+    try {
+        const parsed = new URL(url);
+        return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.origin : null;
+    } catch {
+        return null;
+    }
+}
+
+function isLoopbackHostname(hostname) {
+    const host = String(hostname).toLowerCase();
+    return host === 'localhost' || host.endsWith('.localhost')
+        || host === '[::1]' || /^127(?:\.\d{1,3}){3}$/.test(host);
+}
+
+// Read a token from the page URL and erase it from the address bar. Returns
+// true when the URL carried one in either position.
 function captureUrlToken() {
-    const params = new URLSearchParams(window.location.search);
-    const urlToken = params.get('token');
-    if (!urlToken) return;
-    _apiToken = urlToken;
-    params.delete('token');
-    const query = params.toString();
-    const newUrl = window.location.pathname + (query ? '?' + query : '') + window.location.hash;
-    window.history.replaceState(null, '', newUrl);
+    const { pathname, search, hash } = window.location;
+    const query = new URLSearchParams(search);
+    // Split the fragment by hand: URLSearchParams would turn "+" into a space
+    // and re-encode the parts we keep.
+    const fragmentParts = hash.replace(/^#/, '').split('&');
+    const tokenParts = fragmentParts.filter(part => part.startsWith('token='));
+    const queryHadToken = query.has('token');
+    if (tokenParts.length === 0 && !queryHadToken) return false;
+
+    const server = query.get('server');
+    query.delete('token');
+    const keptQuery = query.toString();
+    const keptFragment = fragmentParts.filter(part => !part.startsWith('token=')).join('&');
+    const cleanUrl = pathname + (keptQuery ? '?' + keptQuery : '')
+        + (keptFragment ? '#' + keptFragment : '');
+    try {
+        window.history.replaceState(null, '', cleanUrl);
+    } catch {
+        // Some embeddings refuse replaceState; clearing the fragment alone
+        // still removes the secret from the address bar.
+        window.location.hash = keptFragment;
+    }
+
+    if (queryHadToken) _queryTokenRefused = true;
+    let fragmentToken = '';
+    if (tokenParts.length > 0) {
+        const raw = tokenParts[tokenParts.length - 1].slice('token='.length);
+        try { fragmentToken = decodeURIComponent(raw); } catch { fragmentToken = raw; }
+    }
+    if (fragmentToken) {
+        // The token belongs to the server this link names: ?server= if given,
+        // otherwise the server that delivered this page. A page opened from
+        // disk names neither, so the token waits for the first connection.
+        const origin = (server && httpOrigin(server.trim())) || httpOrigin(window.location.href);
+        if (origin) {
+            setApiToken(fragmentToken, origin);
+        } else {
+            setApiToken('', null);
+            _unboundToken = fragmentToken;
+        }
+    }
+    return true;
 }
 
-function apiToken() {
-    return _apiToken;
+captureUrlToken();
+
+// The token to send with a request to `url`: only for the bound origin.
+function apiToken(url) {
+    if (!_apiToken || !_apiTokenOrigin) return '';
+    return httpOrigin(url) === _apiTokenOrigin ? _apiToken : '';
 }
 
-function setApiToken(token) {
-    _apiToken = token || '';
+function setApiToken(token, origin) {
+    _apiToken = token && origin ? token : '';
+    _apiTokenOrigin = _apiToken ? origin : null;
+    _unboundToken = '';
 }
 
 function clearApiToken() {
-    _apiToken = '';
+    setApiToken('', null);
     const field = document.getElementById('api-token');
     if (field) field.value = '';
+    updateTokenStatus();
+}
+
+// Show which origin holds a token, and anything the user should know about
+// how it travels. Never displays the token itself.
+function updateTokenStatus() {
+    const status = document.getElementById('token-status');
+    if (status) {
+        status.textContent = _apiToken ? `Token set for ${_apiTokenOrigin}`
+            : _unboundToken ? 'Token from link: used for the next server you connect to'
+                : '';
+    }
+    const notices = [];
+    if (_queryTokenRefused) {
+        notices.push('Ignored the API token in the page address: a "?token=" value is sent to '
+            + 'the web server and may be logged, so rotate that token. Put it after "#" '
+            + '(#token=...) or type it into the token field instead.');
+    }
+    if (_apiToken) {
+        const bound = new URL(_apiTokenOrigin);
+        if (bound.protocol === 'http:' && !isLoopbackHostname(bound.hostname)) {
+            notices.push(`Connection is not encrypted: the API token is sent to ${_apiTokenOrigin} `
+                + 'in clear text. Use HTTPS when traffic leaves this machine.');
+        }
+    }
+    const notice = document.getElementById('connection-notice');
+    if (notice) {
+        notice.textContent = notices.join(' ');
+        notice.hidden = notices.length === 0;
+    }
 }
 
 function apiFetch(url, options = {}) {
     const headers = new Headers(options.headers || {});
-    const token = apiToken();
+    const token = apiToken(url);
     if (token) headers.set('Authorization', `Bearer ${token}`);
-    return fetch(url, { ...options, headers });
+    // A HOLA server never redirects an API call. Refusing redirects keeps a
+    // server from steering this browser's requests, and any body resent with
+    // them, to another destination.
+    return fetch(url, { ...options, headers, redirect: 'error' });
+}
+
+// Read a JSON body without holding more than `maxBytes` of it. The bytes are
+// counted as they arrive (after any content decoding), so neither a missing
+// nor an understated Content-Length gets past the cap.
+async function readJsonCapped(resp, maxBytes) {
+    const tooLarge = () => new Error(
+        `Server response exceeds the ${Math.round(maxBytes / (1024 * 1024))} MB limit`);
+    const reader = resp.body?.getReader?.();
+    // A response without a body stream has no content to bound.
+    if (!reader) return resp.json();
+    const declared = Number(resp.headers?.get?.('content-length') ?? NaN);
+    if (declared > maxBytes) {
+        void reader.cancel().catch(() => {});
+        throw tooLarge();
+    }
+    const decoder = new TextDecoder();
+    const parts = [];
+    let received = 0;
+    for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+        if (received > maxBytes) {
+            void reader.cancel().catch(() => {});
+            throw tooLarge();
+        }
+        parts.push(decoder.decode(value, { stream: true }));
+    }
+    parts.push(decoder.decode());
+    return JSON.parse(parts.join(''));
+}
+
+// One REST call with a deadline covering the response and its body. Resolves
+// to { ok, status, data }. `data` is null when an error response is not JSON;
+// a successful response that is not valid JSON rejects.
+async function apiJson(url, options = {}) {
+    const {
+        maxBytes = MAX_API_RESPONSE_BYTES,
+        timeoutMs = API_TIMEOUT_MS,
+        ...init
+    } = options;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const resp = await apiFetch(url, { ...init, signal: controller.signal });
+        let data = null;
+        try {
+            data = await readJsonCapped(resp, maxBytes);
+        } catch (e) {
+            if (resp.ok || controller.signal.aborted) throw e;
+        }
+        return { ok: resp.ok, status: resp.status, data };
+    } catch (e) {
+        if (controller.signal.aborted) {
+            throw new Error(`Server did not answer within ${Math.round(timeoutMs / 1000)} s`);
+        }
+        throw e;
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 function clearElement(el) {
@@ -125,6 +299,11 @@ async function connectToServer() {
     const url = document.getElementById('server-url').value.trim().replace(/\/+$/, '')
         || 'http://localhost:8000';
     document.getElementById('server-url').value = url;
+    const serverOrigin = httpOrigin(url);
+    if (!serverOrigin) {
+        alert('Failed to connect: the server URL must start with http:// or https://');
+        return;
+    }
 
     // A connect attempt supersedes every earlier connect, resync, stream, and
     // in-flight checkpoint read, including another attempt to the same URL.
@@ -135,47 +314,57 @@ async function connectToServer() {
     S.serverUrl = url;
     S.lastEventId = null;
 
+    // Bind the token to this server's origin. A token typed for this attempt
+    // wins and leaves the form field; a link token without an origin binds to
+    // the first server connected to. Otherwise a token held for a different
+    // origin is dropped: it is never carried over to another server.
     const tokenField = document.getElementById('api-token');
-    if (tokenField && tokenField.value) setApiToken(tokenField.value);
+    if (tokenField && tokenField.value) {
+        setApiToken(tokenField.value, serverOrigin);
+        tokenField.value = '';
+    } else if (_unboundToken) {
+        setApiToken(_unboundToken, serverOrigin);
+    } else if (_apiTokenOrigin !== serverOrigin) {
+        setApiToken('', null);
+    }
+    updateTokenStatus();
 
     try {
         // Capture the event watermark before reading the REST snapshot. The
         // stream later reconnects from this cursor, replaying every completion
         // that races the space/objectives/trials requests (duplicates are
         // harmless because trials are upserted by id).
-        const cursorResp = await apiFetch(`${url}/api/event_cursor`);
+        const cursor = await apiJson(`${url}/api/event_cursor`);
         if (!isCurrentConnection(generation, url)) return;
-        if (cursorResp.status === 401) {
+        if (cursor.status === 401) {
             throw new Error('Authentication failed: missing or invalid API token');
         }
-        if (!cursorResp.ok) throw new Error('Failed to fetch event cursor');
-        const cursorData = await cursorResp.json();
-        if (!isCurrentConnection(generation, url)) return;
-        const eventCursor = String(cursorData.last_event_id ?? '');
+        if (!cursor.ok) throw new Error('Failed to fetch event cursor');
+        const eventCursor = String(cursor.data?.last_event_id ?? '');
         if (!/^\d+$/.test(eventCursor)) throw new Error('Server returned an invalid event cursor');
 
         // Probe server by fetching space. All reads go through apiFetch so the
         // bearer token rides along when the server opts into read auth.
-        const spaceResp = await apiFetch(`${url}/api/space`);
+        const space = await apiJson(`${url}/api/space`);
         if (!isCurrentConnection(generation, url)) return;
-        if (spaceResp.status === 401) throw new Error('Authentication failed: missing or invalid API token');
-        if (!spaceResp.ok) throw new Error('Server not responding');
-        const spaceData = await spaceResp.json();
-        if (!isCurrentConnection(generation, url)) return;
+        if (space.status === 401) throw new Error('Authentication failed: missing or invalid API token');
+        if (!space.ok) throw new Error('Server not responding');
+        const spaceData = space.data ?? {};
 
         // Fetch objectives
-        const objResp = await apiFetch(`${url}/api/objectives`);
+        const objectives = await apiJson(`${url}/api/objectives`);
         if (!isCurrentConnection(generation, url)) return;
-        if (!objResp.ok) throw new Error('Failed to fetch objectives');
-        const objData = await objResp.json();
-        if (!isCurrentConnection(generation, url)) return;
+        if (!objectives.ok) throw new Error('Failed to fetch objectives');
+        const objData = objectives.data ?? {};
 
         // Fetch trials
-        const trialsResp = await apiFetch(`${url}/api/trials?sorted_by=index&include_infeasible=true`);
+        const snapshot = await apiJson(
+            `${url}/api/trials?sorted_by=index&include_infeasible=true`,
+            { maxBytes: MAX_SNAPSHOT_BYTES, timeoutMs: SLOW_API_TIMEOUT_MS },
+        );
         if (!isCurrentConnection(generation, url)) return;
-        if (!trialsResp.ok) throw new Error('Failed to fetch trials');
-        const trials = await trialsResp.json();
-        if (!isCurrentConnection(generation, url)) return;
+        if (!snapshot.ok) throw new Error('Failed to fetch trials');
+        const trials = snapshot.data;
 
         // Commit only after the complete snapshot belongs to the newest
         // connection attempt. This prevents a slow response from an older
@@ -254,11 +443,21 @@ async function streamEvents(controller, generation, serverUrl) {
             // Events are separated by a blank line; process each complete one
             // and keep any partial trailing event in the buffer.
             let sep;
+            let records = 0;
             while ((sep = buffer.indexOf('\n\n')) >= 0) {
+                if (sep > MAX_SSE_RECORD_CHARS || ++records > MAX_SSE_RECORDS_PER_READ) {
+                    abandonStream(controller, generation, serverUrl);
+                    return;
+                }
                 const chunk = buffer.slice(0, sep);
                 buffer = buffer.slice(sep + 2);
                 handleStreamEvent(chunk, generation, serverUrl);
                 if (S.sse !== controller) return;
+            }
+            // An unterminated record may not grow without bound either.
+            if (buffer.length > MAX_SSE_RECORD_CHARS) {
+                abandonStream(controller, generation, serverUrl);
+                return;
             }
         }
         // Stream ended cleanly; reconnect unless this stream was superseded.
@@ -271,6 +470,17 @@ async function streamEvents(controller, generation, serverUrl) {
         setDot('disconnected');
         scheduleReconnect(controller, generation, serverUrl);
     }
+}
+
+// The server sent more than this page will buffer: one oversized record, or
+// a burst of more records than one read may apply. Drop the stream and
+// rebuild from a fresh snapshot after the resync delay. Reconnecting from the
+// cursor instead would request the same data again.
+function abandonStream(controller, generation, serverUrl) {
+    if (S.sse !== controller || !isCurrentLiveConnection(generation, serverUrl)) return;
+    stopStream();
+    setDot('disconnected');
+    scheduleResyncRetry(generation, serverUrl);
 }
 
 function scheduleReconnect(controller, generation, serverUrl) {
@@ -367,29 +577,29 @@ async function performLiveResync(generation, serverUrl, objectiveRequestGenerati
     stopStream();
     let resynced = false;
     try {
-        const cursorResp = await apiFetch(`${serverUrl}/api/event_cursor`);
+        const cursor = await apiJson(`${serverUrl}/api/event_cursor`);
         if (!isCurrentLiveConnection(generation, serverUrl)) return;
-        if (!cursorResp.ok) throw new Error('Failed to fetch event cursor during resync');
-        const cursorData = await cursorResp.json();
-        if (!isCurrentLiveConnection(generation, serverUrl)) return;
-        const eventCursor = String(cursorData.last_event_id ?? '');
+        if (!cursor.ok) throw new Error('Failed to fetch event cursor during resync');
+        const eventCursor = String(cursor.data?.last_event_id ?? '');
         if (!/^\d+$/.test(eventCursor)) throw new Error('Invalid event cursor during resync');
 
-        const [spaceResp, objectivesResp, trialsResp] = await Promise.all([
-            apiFetch(`${serverUrl}/api/space`),
-            apiFetch(`${serverUrl}/api/objectives`),
-            apiFetch(`${serverUrl}/api/trials?sorted_by=index&include_infeasible=true`),
-        ]);
-        if (!isCurrentLiveConnection(generation, serverUrl)) return;
-        if (!spaceResp.ok || !objectivesResp.ok || !trialsResp.ok) {
-            throw new Error('Failed to fetch live snapshot during resync');
-        }
-        const [spaceData, objectivesData, trials] = await Promise.all([
-            spaceResp.json(), objectivesResp.json(), trialsResp.json(),
+        const [space, objectives, snapshot] = await Promise.all([
+            apiJson(`${serverUrl}/api/space`),
+            apiJson(`${serverUrl}/api/objectives`),
+            apiJson(
+                `${serverUrl}/api/trials?sorted_by=index&include_infeasible=true`,
+                { maxBytes: MAX_SNAPSHOT_BYTES, timeoutMs: SLOW_API_TIMEOUT_MS },
+            ),
         ]);
         // Ignore a late response after any newer connection or checkpoint
         // load, even when it targets the same URL.
         if (!isCurrentLiveConnection(generation, serverUrl)) return;
+        if (!space.ok || !objectives.ok || !snapshot.ok) {
+            throw new Error('Failed to fetch live snapshot during resync');
+        }
+        const spaceData = space.data ?? {};
+        const objectivesData = objectives.data ?? {};
+        const trials = snapshot.data;
         if (objectiveRequestGeneration != null
             && objectiveRequestGeneration !== S.objectiveRequestGeneration) return;
         S.space = Array.isArray(spaceData.params) ? spaceData.params : [];
@@ -433,7 +643,24 @@ async function handleEngineEvent(
     if (event.type === 'ObjectivesChanged') {
         await resyncLiveState(generation, serverUrl);
     } else if (event.type === 'TrialCompleted') {
-        const trial = event.trial || await fetchCompletedTrial(event.trial_id, serverUrl);
+        let trial = event.trial;
+        if (!trial) {
+            // Older servers omit the trial from the event, so it is fetched.
+            // Only a few such requests run at once: a burst of events falls
+            // back to one coalesced snapshot instead of a request per event.
+            if (_eventFetches >= MAX_EVENT_FETCHES) {
+                await resyncLiveState(generation, serverUrl);
+                return;
+            }
+            _eventFetches++;
+            try {
+                trial = await fetchCompletedTrial(event.trial_id, serverUrl);
+            } catch {
+                trial = null;
+            } finally {
+                _eventFetches--;
+            }
+        }
         if (!isCurrentLiveConnection(generation, serverUrl)) return;
         if (!trial) return;
         if (S.previewActive) {
@@ -467,9 +694,8 @@ async function handleEngineEvent(
 }
 
 async function fetchCompletedTrial(trialId, serverUrl = S.serverUrl) {
-    const resp = await apiFetch(`${serverUrl}/api/trial/${trialId}?include_infeasible=true`);
-    if (!resp.ok) return null;
-    return resp.json();
+    const resp = await apiJson(`${serverUrl}/api/trial/${trialId}?include_infeasible=true`);
+    return resp.ok ? resp.data : null;
 }
 
 function setParamNames(names) {
@@ -2344,10 +2570,11 @@ async function applyObjectives() {
     const objectives = JSON.parse(JSON.stringify(S.objectives));
     const requestGeneration = ++S.objectiveRequestGeneration;
     try {
-        const resp = await apiFetch(`${serverUrl}/api/objectives`, {
+        const resp = await apiJson(`${serverUrl}/api/objectives`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ objectives }),
+            timeoutMs: SLOW_API_TIMEOUT_MS,
         });
         if (!isCurrentLiveConnection(generation, serverUrl)
             || requestGeneration !== S.objectiveRequestGeneration) return;
@@ -2369,12 +2596,13 @@ async function applyObjectives() {
 async function saveCheckpoint() {
     if (S.mode !== 'live') return;
     try {
-        const resp = await apiFetch(`${S.serverUrl}/api/checkpoint/save`, {
+        const resp = await apiJson(`${S.serverUrl}/api/checkpoint/save`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ description: `Dashboard save at ${new Date().toISOString()}` }),
+            timeoutMs: SLOW_API_TIMEOUT_MS,
         });
-        const data = await resp.json();
+        const data = resp.data ?? {};
         if (resp.ok) {
             const kind = data.checkpoint_type ? `${data.checkpoint_type} checkpoint` : 'checkpoint';
             alert(`Saved ${kind}: ${data.path} (${data.trials_saved} trials)`);
@@ -2447,8 +2675,13 @@ function wireEvents() {
 
 function startup() {
     wireEvents();
-    // Capture a ?token= once into memory and strip it from the URL.
-    captureUrlToken();
+    // The page URL was already read for a token at the top of this script.
+    // A link followed while the page is open changes only the fragment and
+    // does not reload it, so read and erase that token too.
+    window.addEventListener('hashchange', () => {
+        if (captureUrlToken()) updateTokenStatus();
+    });
+    updateTokenStatus();
     // Auto-connect from URL params
     const params = new URLSearchParams(location.search);
     const server = params.get('server');

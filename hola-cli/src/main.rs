@@ -16,9 +16,10 @@ use command_group::{CommandGroup, GroupChild};
 use hola::hola_engine::{HolaEngine, StudyConfig};
 use hola::server::ServerOptions;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::fmt::Write as _;
+use std::io::{Read, Write};
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,12 +52,25 @@ enum Commands {
         /// Serve the dashboard UI from this directory.
         #[arg(long)]
         dashboard: Option<PathBuf>,
-        /// Bearer token required for write-capable API endpoints.
-        #[arg(long)]
+        /// Bearer token required for write-capable API endpoints. A value given
+        /// on the command line is visible to other local users in the process
+        /// list; prefer --auth-token-file or the HOLA_API_TOKEN environment variable.
+        #[arg(long, conflicts_with = "auth_token_file")]
         auth_token: Option<String>,
-        /// Optional read-only bearer token for dashboards and monitoring.
-        #[arg(long)]
+        /// Read the write-capable bearer token from this file. One trailing
+        /// newline is ignored.
+        #[arg(long, value_name = "PATH")]
+        auth_token_file: Option<PathBuf>,
+        /// Optional read-only bearer token for dashboards and monitoring. A value
+        /// given on the command line is visible to other local users in the
+        /// process list; prefer --read-token-file or the HOLA_READ_TOKEN
+        /// environment variable.
+        #[arg(long, conflicts_with = "read_token_file")]
         read_token: Option<String>,
+        /// Read the read-only bearer token from this file. One trailing newline
+        /// is ignored.
+        #[arg(long, value_name = "PATH")]
+        read_token_file: Option<PathBuf>,
         /// Directory where dashboard/API checkpoint saves are allowed.
         #[arg(long)]
         checkpoint_dir: Option<PathBuf>,
@@ -71,6 +85,15 @@ enum Commands {
         /// heartbeat a trial before this deadline.
         #[arg(long, default_value_t = 7200, value_parser = clap::value_parser!(u64).range(1..))]
         lease_seconds: u64,
+        /// Number of files POST /api/checkpoint/save may keep in the
+        /// checkpoint directory. Further saves are refused until older files
+        /// are removed; the server never deletes a saved checkpoint itself.
+        #[arg(
+            long,
+            default_value_t = hola::server::DEFAULT_MAX_SAVED_CHECKPOINTS,
+            value_parser = parse_positive_count
+        )]
+        max_saved_checkpoints: usize,
     },
     /// Run a worker that polls the server for trials.
     ///
@@ -94,9 +117,20 @@ enum Commands {
         /// Worker mode: "callback" (default) or "exec".
         #[arg(long, value_enum, default_value_t = WorkerMode::Callback)]
         mode: WorkerMode,
-        /// Bearer token for servers started with --auth-token.
-        #[arg(long)]
+        /// Bearer token for a token-protected server. A value given on the
+        /// command line is visible to other local users in the process list;
+        /// prefer --token-file or the HOLA_API_TOKEN environment variable.
+        #[arg(long, conflicts_with = "token_file")]
         token: Option<String>,
+        /// Read the bearer token from this file. One trailing newline is ignored.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
+        /// Allow sending the bearer token to a non-loopback server over
+        /// unencrypted http://. Without this flag (or HOLA_ALLOW_INSECURE_HTTP=1)
+        /// the worker refuses, because anyone on the network path could read the
+        /// token. Prefer an https:// URL served by a TLS-terminating proxy.
+        #[arg(long)]
+        allow_insecure_http: bool,
         /// Maximum duration of one HTTP request, in seconds.
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
         request_timeout: u64,
@@ -119,17 +153,39 @@ enum WorkerMode {
     Exec,
 }
 
+fn parse_positive_count(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err("must be at least 1".to_string()),
+        Ok(count) => Ok(count),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 fn load_config(path: &PathBuf) -> Result<StudyConfig, Box<dyn std::error::Error>> {
     let contents = std::fs::read_to_string(path)?;
     let config: StudyConfig = serde_yaml::from_str(&contents)?;
     Ok(config)
 }
 
+/// True for `localhost` and loopback IP literals. Accepts the bracketed IPv6
+/// form that URLs use (`[::1]`).
 fn is_local_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    host.parse::<IpAddr>().is_ok_and(|ip| match ip {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| mapped.is_loopback())
+        }
+    })
 }
 
 /// Validate and normalize a server base URL.
@@ -180,10 +236,110 @@ fn normalize_server_url(server: &str) -> Result<String, Box<dyn std::error::Erro
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
-fn configured_token(cli_token: Option<String>) -> Option<String> {
-    cli_token
-        .or_else(|| std::env::var("HOLA_API_TOKEN").ok())
-        .filter(|token| !token.is_empty())
+const API_TOKEN_ENV: &str = "HOLA_API_TOKEN";
+const READ_TOKEN_ENV: &str = "HOLA_READ_TOKEN";
+const ALLOW_INSECURE_HTTP_ENV: &str = "HOLA_ALLOW_INSECURE_HTTP";
+const MAX_TOKEN_FILE_BYTES: u64 = 16 << 10;
+
+/// Read a bearer token from a file so it never appears in a process listing.
+/// One trailing newline (LF or CRLF) is ignored; everything else is the token.
+fn read_token_file(path: &Path, flag: &str) -> Result<String, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("{flag}: cannot open '{}': {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = file.metadata() {
+            let mode = metadata.mode() & 0o777;
+            if mode & 0o077 != 0 {
+                eprintln!(
+                    "warning: token file '{}' is accessible to other users (mode {mode:03o}); restrict it with chmod 600",
+                    path.display()
+                );
+            }
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_TOKEN_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{flag}: cannot read '{}': {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_TOKEN_FILE_BYTES {
+        return Err(format!(
+            "{flag}: '{}' is larger than {MAX_TOKEN_FILE_BYTES} bytes, which is not a token file",
+            path.display()
+        ));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| format!("{flag}: '{}' is not valid UTF-8", path.display()))?;
+    let token = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(&text);
+    if token.is_empty() {
+        return Err(format!("{flag}: '{}' is empty", path.display()));
+    }
+    if token.chars().any(char::is_control) {
+        return Err(format!(
+            "{flag}: '{}' must hold a single-line token without control characters",
+            path.display()
+        ));
+    }
+    Ok(token.to_string())
+}
+
+/// Resolve one bearer token. An explicit command-line value wins, then the
+/// token file, then the environment variable's value. Empty values count as
+/// unset.
+fn resolve_token(
+    cli_token: Option<String>,
+    token_file: Option<&Path>,
+    file_flag: &str,
+    env_value: Option<String>,
+) -> Result<Option<String>, String> {
+    if let Some(token) = cli_token {
+        return Ok(Some(token).filter(|token| !token.is_empty()));
+    }
+    if let Some(path) = token_file {
+        return read_token_file(path, file_flag).map(Some);
+    }
+    Ok(env_value.filter(|token| !token.is_empty()))
+}
+
+fn insecure_http_allowed_by_env() -> bool {
+    std::env::var(ALLOW_INSECURE_HTTP_ENV)
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+/// Decide whether a bearer token may be sent to `server`.
+///
+/// The HOLA server speaks plain HTTP. A token sent to a non-loopback `http://`
+/// address crosses the network unencrypted, and whoever observes it gains the
+/// token's full API access, so that is refused unless the operator opted in.
+/// Returns a warning to print when the opt-in is what allowed the connection.
+fn check_token_transport(
+    server: &str,
+    has_token: bool,
+    allow_insecure_http: bool,
+) -> Result<Option<String>, String> {
+    if !has_token {
+        return Ok(None);
+    }
+    let url = reqwest::Url::parse(server).map_err(|error| error.to_string())?;
+    if url.scheme() != "http" || url.host_str().is_some_and(is_local_host) {
+        return Ok(None);
+    }
+    if allow_insecure_http {
+        return Ok(Some(format!(
+            "warning: sending the bearer token to {server} over unencrypted HTTP; anyone on the network path can read it"
+        )));
+    }
+    Err(format!(
+        "refusing to send the bearer token to {server} over unencrypted HTTP: anyone on the \
+         network path could read it and use it against the server. The HOLA server does not \
+         speak TLS itself, so put a TLS-terminating reverse proxy in front of it and use its \
+         https:// URL. On a network you trust, pass --allow-insecure-http or set \
+         {ALLOW_INSECURE_HTTP_ENV}=1 to send it anyway."
+    ))
 }
 
 fn with_bearer_auth(
@@ -202,24 +358,157 @@ const HTTP_ERROR_SNIPPET_CHARS: usize = 4096;
 const MAX_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const HEARTBEAT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Largest successful response body the worker accepts. Every response it
+/// parses is an acknowledgement, one trial, or a lifecycle status; the server
+/// caps request bodies at 64 KiB, so 1 MiB is far above any legitimate reply.
+const MAX_RESPONSE_BODY_BYTES: usize = 1 << 20;
+/// Bytes of an error response that are read at all. Only a short excerpt is
+/// shown, so the remainder of an oversized body is never downloaded.
+const MAX_ERROR_BODY_BYTES: usize = 64 << 10;
+/// Number of post-commit warnings echoed for one tell, and the length of each.
+const MAX_POST_COMMIT_WARNINGS: usize = 16;
+const POST_COMMIT_WARNING_CHARS: usize = 512;
+const REQUEST_ERROR_CHARS: usize = 1024;
+
 fn build_http_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .connect_timeout(timeout.min(Duration::from_secs(10)))
         .timeout(timeout)
+        // Never follow a redirect. A followed redirect would replay the request
+        // (and, on the same host, the bearer token) at an address the server
+        // chose, and could turn an https:// connection into plain http://.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
 }
 
-async fn http_error(operation: &str, response: reqwest::Response) -> String {
+/// Make untrusted text safe to print on a terminal or in a log.
+///
+/// Control characters (C0, DEL and C1, which include ESC, CR and LF) and the
+/// Unicode line-separator and bidirectional-override characters are replaced
+/// with visible escapes, so a server cannot forge extra log lines, hide text,
+/// or drive the terminal. The result holds at most `max_chars` characters of
+/// the input, followed by `...` when it was cut.
+fn sanitize_for_terminal(text: &str, max_chars: usize) -> String {
+    let mut safe = String::with_capacity(text.len().min(max_chars.saturating_mul(2)));
+    for (index, character) in text.chars().enumerate() {
+        if index == max_chars {
+            safe.push_str("...");
+            break;
+        }
+        match character {
+            '\n' => safe.push_str("\\n"),
+            '\r' => safe.push_str("\\r"),
+            '\t' => safe.push_str("\\t"),
+            character
+                if character.is_control()
+                    || matches!(
+                        character,
+                        '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+                    ) =>
+            {
+                let _ = write!(safe, "\\u{{{:04x}}}", u32::from(character));
+            }
+            character => safe.push(character),
+        }
+    }
+    safe
+}
+
+/// Read a response body, failing as soon as it is known to exceed `limit`.
+///
+/// A declared `Content-Length` above the limit is rejected before any body
+/// byte is read, and the bytes actually received are counted as well because
+/// a chunked or mislabelled body declares nothing reliable. The client is
+/// built without response decompression, so received bytes are the body size.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    if let Some(declared) = response.content_length() {
+        if declared > limit as u64 {
+            return Err(format!(
+                "response body of {declared} bytes exceeds the {limit}-byte limit"
+            ));
+        }
+    }
+    let mut body = Vec::new();
+    loop {
+        let chunk = response.chunk().await.map_err(|error| {
+            format!(
+                "failed to read response body: {}",
+                sanitize_for_terminal(&error.to_string(), REQUEST_ERROR_CHARS)
+            )
+        })?;
+        let Some(chunk) = chunk else {
+            return Ok(body);
+        };
+        if chunk.len() > limit - body.len() {
+            return Err(format!("response body exceeds the {limit}-byte limit"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+}
+
+/// Parse a bounded successful response as JSON.
+async fn read_json_capped(response: reqwest::Response) -> Result<serde_json::Value, String> {
+    let body = read_body_capped(response, MAX_RESPONSE_BODY_BYTES).await?;
+    serde_json::from_slice(&body)
+        .map_err(|error| sanitize_for_terminal(&error.to_string(), REQUEST_ERROR_CHARS))
+}
+
+/// Read at most `MAX_ERROR_BODY_BYTES` of an error body and stop. An error
+/// body is only quoted in a diagnostic, so an oversized one is cut, not failed.
+async fn read_error_body(mut response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    while body.len() < MAX_ERROR_BODY_BYTES {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = MAX_ERROR_BODY_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            Ok(None) => break,
+            Err(error) if body.is_empty() => {
+                return format!("unable to read error response: {error}");
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+/// A non-success response: its status, the bounded raw body for protocol
+/// classification, and a terminal-safe message for the operator.
+struct HttpFailure {
+    status: reqwest::StatusCode,
+    body: String,
+    message: String,
+}
+
+async fn http_failure(operation: &str, response: reqwest::Response) -> HttpFailure {
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|error| format!("unable to read error response: {error}"));
-    format_http_error(operation, status, &body)
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+    let body = read_error_body(response).await;
+    let message = if status.is_redirection() {
+        format_redirect_error(operation, status, location.as_deref())
+    } else {
+        format_http_error(operation, status, &body)
+    };
+    HttpFailure {
+        status,
+        body,
+        message,
+    }
+}
+
+async fn http_error(operation: &str, response: reqwest::Response) -> String {
+    http_failure(operation, response).await.message
 }
 
 fn format_http_error(operation: &str, status: reqwest::StatusCode, body: &str) -> String {
-    let detail: String = body.trim().chars().take(HTTP_ERROR_SNIPPET_CHARS).collect();
+    let detail = sanitize_for_terminal(body.trim(), HTTP_ERROR_SNIPPET_CHARS);
     let detail = if detail.is_empty() {
         "empty response body"
     } else {
@@ -228,13 +517,27 @@ fn format_http_error(operation: &str, status: reqwest::StatusCode, body: &str) -
     format!("{operation} returned HTTP {status}: {detail}")
 }
 
+fn format_redirect_error(
+    operation: &str,
+    status: reqwest::StatusCode,
+    location: Option<&str>,
+) -> String {
+    let target = location.map_or_else(String::new, |location| {
+        format!(" to '{}'", sanitize_for_terminal(location, 256))
+    });
+    format!(
+        "{operation} was redirected (HTTP {status}{target}); HOLA does not follow redirects, so point --server at the final URL"
+    )
+}
+
 fn request_error(operation: &str, error: reqwest::Error) -> String {
+    let detail = sanitize_for_terminal(&error.to_string(), REQUEST_ERROR_CHARS);
     if error.is_timeout() {
-        format!("{operation} request timed out: {error}")
+        format!("{operation} request timed out: {detail}")
     } else if error.is_connect() {
-        format!("{operation} connection failed: {error}")
+        format!("{operation} connection failed: {detail}")
     } else {
-        format!("{operation} request failed: {error}")
+        format!("{operation} request failed: {detail}")
     }
 }
 
@@ -283,7 +586,13 @@ impl PendingTell {
 }
 
 /// Server-scoped, crash-safe queue for exec-mode tells.
+///
+/// Every record in the queue is later sent with the worker's bearer token, so
+/// the queue must not be writable by anyone else. Both directories are created
+/// private and an existing one is used only if [`validate_private_directory`]
+/// accepts it; the check is repeated before each use of the queue.
 struct TellOutbox {
+    root: PathBuf,
     directory: PathBuf,
     server: String,
 }
@@ -291,11 +600,19 @@ struct TellOutbox {
 impl TellOutbox {
     fn open(root: &std::path::Path, server: &str) -> std::io::Result<Self> {
         let directory = root.join(format!("{:016x}", stable_server_hash(server)));
-        create_private_directory(&directory)?;
+        ensure_private_directory(root)?;
+        ensure_private_directory(&directory)?;
         Ok(Self {
+            root: root.to_path_buf(),
             directory,
             server: server.to_string(),
         })
+    }
+
+    /// Confirm that the queue is still the private directory that was opened.
+    fn validate(&self) -> std::io::Result<()> {
+        validate_private_directory(&self.root)?;
+        validate_private_directory(&self.directory)
     }
 
     fn record_path(&self, trial_id: u64) -> PathBuf {
@@ -303,20 +620,42 @@ impl TellOutbox {
     }
 
     fn read_record(&self, path: &std::path::Path) -> std::io::Result<PendingTell> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        if !metadata.file_type().is_file() {
-            return Err(std::io::Error::new(
+        let not_regular = || {
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("outbox entry '{}' is not a regular file", path.display()),
-            ));
+            )
+        };
+        // Open first and then inspect the handle: a path that was checked and
+        // then reopened could be replaced in between. The open never follows a
+        // symbolic link and never blocks on a FIFO.
+        let file = match open_outbox_record(path) {
+            Ok(file) => file,
+            Err(error) => {
+                let irregular = std::fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| !metadata.file_type().is_file());
+                return Err(if irregular { not_regular() } else { error });
+            }
+        };
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(not_regular());
         }
-        if metadata.len() > MAX_OUTBOX_RECORD_BYTES {
-            return Err(std::io::Error::new(
+        let too_large = || {
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("outbox entry '{}' exceeds the size limit", path.display()),
-            ));
+            )
+        };
+        if metadata.len() > MAX_OUTBOX_RECORD_BYTES {
+            return Err(too_large());
         }
-        let bytes = std::fs::read(path)?;
+        let mut bytes = Vec::new();
+        file.take(MAX_OUTBOX_RECORD_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_OUTBOX_RECORD_BYTES {
+            return Err(too_large());
+        }
         let record: PendingTell = serde_json::from_slice(&bytes).map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -353,9 +692,10 @@ impl TellOutbox {
     /// Persist a tell before any network attempt. Re-persisting an identical
     /// trial is harmless; different metrics for the same id are rejected.
     fn persist(&self, record: &PendingTell) -> std::io::Result<PathBuf> {
+        self.validate()?;
         self.validate_record(&self.record_path(record.trial_id), record)?;
         let path = self.record_path(record.trial_id);
-        if path.exists() {
+        if outbox_entry_exists(&path)? {
             let existing = self.read_record(&path)?;
             if existing == *record {
                 return Ok(path);
@@ -407,7 +747,7 @@ impl TellOutbox {
             let _ = std::fs::remove_file(&temp_path);
             // A second worker may have won the same-id race. Accept it only if
             // its durable record is byte-for-byte equivalent after parsing.
-            if path.exists() && self.read_record(&path).is_ok_and(|saved| saved == *record) {
+            if self.read_record(&path).is_ok_and(|saved| saved == *record) {
                 return Ok(path);
             }
             return Err(error);
@@ -416,6 +756,7 @@ impl TellOutbox {
     }
 
     fn pending(&self) -> std::io::Result<Vec<(PathBuf, PendingTell)>> {
+        self.validate()?;
         let mut paths = Vec::new();
         for entry in std::fs::read_dir(&self.directory)? {
             let entry = entry?;
@@ -461,6 +802,105 @@ fn create_private_directory(path: &std::path::Path) -> std::io::Result<()> {
         builder.mode(0o700);
     }
     builder.create(path)
+}
+
+/// Create `path` as a private directory if it is missing, then require that
+/// whatever is there now is trustworthy. A directory that already existed is
+/// never trusted merely because it has the expected name.
+fn ensure_private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            create_private_directory(path)?;
+        }
+        Err(error) => return Err(error),
+    }
+    validate_private_directory(path)
+}
+
+/// Why a directory with this owner and mode cannot hold the outbox, if it
+/// cannot. Only its owner (or root) may be able to add, replace or remove
+/// entries: a record placed there by anyone else would be sent to the server
+/// under this worker's bearer token.
+#[cfg(unix)]
+fn directory_trust_problem(owner: u32, mode: u32, current_user: u32) -> Option<String> {
+    if owner != current_user && owner != 0 {
+        return Some(format!(
+            "is owned by uid {owner}, not by the user running this worker (uid {current_user})"
+        ));
+    }
+    if mode & 0o022 != 0 {
+        return Some(format!(
+            "is writable by its group or by other users (mode {:03o}); run chmod go-w on it",
+            mode & 0o777
+        ));
+    }
+    None
+}
+
+/// Require an outbox directory that nobody else can redirect or write to.
+fn validate_private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    let refuse = |problem: String| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "outbox directory '{}' {problem}; choose a private directory with --outbox-dir",
+                path.display()
+            ),
+        )
+    };
+    // lstat, not stat: a symbolic link planted under the expected name would
+    // otherwise point the queue at a directory of someone else's choosing.
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(refuse("is a symbolic link".to_string()));
+    }
+    if !metadata.is_dir() {
+        return Err(refuse("is not a directory".to_string()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let current_user = unsafe { libc::geteuid() };
+        if let Some(problem) =
+            directory_trust_problem(metadata.uid(), metadata.mode(), current_user)
+        {
+            return Err(refuse(problem));
+        }
+    }
+    Ok(())
+}
+
+/// Open an outbox record for reading without following a symbolic link at the
+/// final path component and without blocking if the entry is a FIFO.
+#[cfg(unix)]
+fn open_outbox_record(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_outbox_record(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("outbox entry '{}' is not a regular file", path.display()),
+        ));
+    }
+    std::fs::File::open(path)
+}
+
+/// Whether a directory entry exists at `path`, without following a link.
+fn outbox_entry_exists(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
@@ -537,7 +977,7 @@ async fn deliver_tell(
 
     // A 2xx status alone is not enough to delete an expensive durable result:
     // validate the canonical acknowledgement and ensure it names this trial.
-    let acknowledgement: serde_json::Value = response.json().await.map_err(|error| {
+    let acknowledgement = read_json_capped(response).await.map_err(|error| {
         OutboxFlushError::Permanent(format!(
             "{operation} returned invalid acknowledgement JSON: {error}"
         ))
@@ -568,16 +1008,19 @@ async fn deliver_tell(
 
     let post_commit_warnings = match acknowledgement.get("post_commit_warnings") {
         None => Vec::new(),
-        Some(serde_json::Value::Array(warnings)) => warnings
-            .iter()
-            .map(|warning| {
-                warning.as_str().map(ToOwned::to_owned).ok_or_else(|| {
-                    OutboxFlushError::Permanent(format!(
-                        "{operation} acknowledgement has a non-string post_commit_warnings entry"
-                    ))
+        Some(serde_json::Value::Array(warnings)) => {
+            let warnings = warnings
+                .iter()
+                .map(|warning| {
+                    warning.as_str().ok_or_else(|| {
+                        OutboxFlushError::Permanent(format!(
+                            "{operation} acknowledgement has a non-string post_commit_warnings entry"
+                        ))
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+                .collect::<Result<Vec<_>, _>>()?;
+            printable_post_commit_warnings(&warnings)
+        }
         Some(_) => {
             return Err(OutboxFlushError::Permanent(format!(
                 "{operation} acknowledgement has non-array post_commit_warnings"
@@ -585,6 +1028,23 @@ async fn deliver_tell(
         }
     };
     Ok(post_commit_warnings)
+}
+
+/// Server-supplied warnings, neutralized for the terminal and bounded in both
+/// length and number so one acknowledgement cannot flood the worker's log.
+fn printable_post_commit_warnings(warnings: &[&str]) -> Vec<String> {
+    let mut printable: Vec<String> = warnings
+        .iter()
+        .take(MAX_POST_COMMIT_WARNINGS)
+        .map(|warning| sanitize_for_terminal(warning, POST_COMMIT_WARNING_CHARS))
+        .collect();
+    if warnings.len() > MAX_POST_COMMIT_WARNINGS {
+        printable.push(format!(
+            "{} further post-commit warnings were not shown",
+            warnings.len() - MAX_POST_COMMIT_WARNINGS
+        ));
+    }
+    printable
 }
 
 async fn flush_outbox(
@@ -663,12 +1123,11 @@ async fn cancel_trial_classified(
         .await
         .map_err(|error| CancelTrialError::Other(request_error(&operation, error)))?;
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|error| format!("unable to read cancel error response: {error}"));
-        let message = format_http_error(&operation, status, &body);
+        let HttpFailure {
+            status,
+            body,
+            message,
+        } = http_failure(&operation, response).await;
         let error_body = serde_json::from_str::<serde_json::Value>(&body).ok();
         let legacy_not_pending =
             format!("Trial {trial_id} is not pending (may be completed or unknown)");
@@ -684,7 +1143,7 @@ async fn cancel_trial_classified(
             CancelTrialError::Other(message)
         });
     }
-    let acknowledgement: serde_json::Value = response.json().await.map_err(|error| {
+    let acknowledgement = read_json_capped(response).await.map_err(|error| {
         CancelTrialError::Other(format!(
             "{operation} returned invalid acknowledgement JSON: {error}"
         ))
@@ -756,12 +1215,11 @@ async fn heartbeat_trial(
         .await
         .map_err(|error| HeartbeatError::Retryable(request_error(&operation, error)))?;
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|error| format!("unable to read heartbeat error response: {error}"));
-        let message = format_http_error(&operation, status, &body);
+        let HttpFailure {
+            status,
+            body,
+            message,
+        } = http_failure(&operation, response).await;
         let error_code = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
             .and_then(|value| {
@@ -782,7 +1240,7 @@ async fn heartbeat_trial(
             HeartbeatError::Rejected(message)
         });
     }
-    let body: serde_json::Value = response.json().await.map_err(|error| {
+    let body = read_json_capped(response).await.map_err(|error| {
         HeartbeatError::Rejected(format!(
             "{operation} returned invalid acknowledgement JSON: {error}"
         ))
@@ -1055,8 +1513,7 @@ async fn callback_trial_state(
     if !response.status().is_success() {
         return Err(http_error(&operation, response).await);
     }
-    let status: serde_json::Value = response
-        .json()
+    let status = read_json_capped(response)
         .await
         .map_err(|error| format!("{operation} returned invalid JSON: {error}"))?;
     if status.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
@@ -1076,7 +1533,8 @@ async fn callback_trial_state(
         Some("pending") => Ok(CallbackTrialState::Pending),
         Some("not_pending") => Ok(CallbackTrialState::NotPending),
         Some(state) => Err(format!(
-            "{operation} returned unsupported trial state '{state}'"
+            "{operation} returned unsupported trial state '{}'",
+            sanitize_for_terminal(state, 64)
         )),
         None => Err(format!("{operation} response is missing trial state")),
     }
@@ -1099,8 +1557,7 @@ async fn legacy_callback_trial_state(
     .await
     .map_err(|error| request_error(&operation, error))?;
     if response.status().is_success() {
-        let completed: serde_json::Value = response
-            .json()
+        let completed = read_json_capped(response)
             .await
             .map_err(|error| format!("{operation} returned invalid JSON: {error}"))?;
         return match completed
@@ -1226,15 +1683,11 @@ struct CappedRead {
     truncated: bool,
 }
 
-/// A short, single-line snippet of `text` suitable for a log message.
+/// A short, single-line snippet of `text` suitable for a log message. The
+/// command's output is not trusted either: it may echo server-chosen
+/// parameters, so control characters are escaped like any server text.
 fn log_snippet(text: &str) -> String {
-    let trimmed = text.trim();
-    let snippet: String = trimmed.chars().take(STDERR_SNIPPET_CHARS).collect();
-    if snippet.len() < trimmed.len() {
-        format!("{snippet}...")
-    } else {
-        snippet
-    }
+    sanitize_for_terminal(text.trim(), STDERR_SNIPPET_CHARS)
 }
 
 /// Read up to `MAX_CAPTURE_BYTES` from `reader`, discarding the rest so a
@@ -1511,11 +1964,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             port,
             dashboard,
             auth_token,
+            auth_token_file,
             read_token,
+            read_token_file,
             checkpoint_dir,
             cors_origins,
             allow_unauthenticated_reads,
             lease_seconds,
+            max_saved_checkpoints,
         } => {
             let study_config = load_config(&config)?;
             let load_from = study_config
@@ -1538,19 +1994,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| format!("Failed to create engine: {e}"))?
             };
 
-            let auth_token = configured_token(auth_token);
+            let auth_token = resolve_token(
+                auth_token,
+                auth_token_file.as_deref(),
+                "--auth-token-file",
+                std::env::var(API_TOKEN_ENV).ok(),
+            )?;
             if !is_local_host(&host) && auth_token.is_none() {
-                return Err(
-                    "--auth-token or HOLA_API_TOKEN is required when --host is not localhost"
-                        .into(),
-                );
+                return Err(format!(
+                    "an API token is required when --host is not localhost: set {API_TOKEN_ENV}, or pass --auth-token-file or --auth-token"
+                )
+                .into());
+            }
+            let read_token = resolve_token(
+                read_token,
+                read_token_file.as_deref(),
+                "--read-token-file",
+                std::env::var(READ_TOKEN_ENV).ok(),
+            )?;
+            if read_token.is_some() && auth_token.is_none() {
+                return Err(format!(
+                    "a read-only token ({READ_TOKEN_ENV}, --read-token-file, or --read-token) requires an API token for write endpoints: set {API_TOKEN_ENV} or pass --auth-token-file, or remove the read-only token"
+                )
+                .into());
             }
 
             let mut options = ServerOptions::new(port);
             options.host = host;
             options.dashboard_dir = dashboard;
             options.auth_token = auth_token;
-            options.read_auth_token = read_token.filter(|token| !token.is_empty());
+            options.read_auth_token = read_token;
             options.checkpoint_dir = checkpoint_dir
                 .or(config_checkpoint_dir)
                 .or_else(|| config.parent().map(|path| path.to_path_buf()))
@@ -1558,6 +2031,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             options.cors_allowed_origins = cors_origins;
             options.require_read_auth = !allow_unauthenticated_reads;
             options.lease_duration = Duration::from_secs(lease_seconds);
+            options.max_saved_checkpoints = max_saved_checkpoints;
 
             hola::server::serve_with_options(engine, options).await?;
         }
@@ -1566,18 +2040,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             exec,
             mode,
             token,
+            token_file,
+            allow_insecure_http,
             request_timeout,
             command_timeout,
             outbox_dir,
         } => {
             let exec_mode = matches!(mode, WorkerMode::Exec);
-            let token = configured_token(token);
+            let token = resolve_token(
+                token,
+                token_file.as_deref(),
+                "--token-file",
+                std::env::var(API_TOKEN_ENV).ok(),
+            )?;
 
             // Validate and normalize the server URL up front so a scheme-less
             // or typo'd value fails fast rather than entering the retry loop,
             // and so the joined "{server}/api/..." paths never produce a
             // double slash.
             let server = normalize_server_url(&server)?;
+
+            // Decide before any request is built whether the token may travel
+            // to this address at all.
+            let insecure_http = allow_insecure_http || insecure_http_allowed_by_env();
+            if let Some(warning) = check_token_transport(&server, token.is_some(), insecure_http)? {
+                eprintln!("{warning}");
+            }
 
             let mode_label = if exec_mode { "exec" } else { "callback" };
             eprintln!("Worker connecting to {server} ({mode_label} mode)...");
@@ -1633,7 +2121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                 };
-                let trial: serde_json::Value = match response.json().await {
+                let trial = match read_json_capped(response).await {
                     Ok(trial) => trial,
                     Err(error) => {
                         eprintln!("Ask returned invalid JSON: {error}. Retrying in 5s...");
@@ -1753,7 +2241,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .env("HOLA_TRIAL_ID", trial_id.to_string())
                         .env("HOLA_PARAMS", params.to_string());
                     if let Some(token) = &token {
-                        command.env("HOLA_API_TOKEN", token);
+                        command.env(API_TOKEN_ENV, token);
+                        if insecure_http {
+                            // The callback reports to the same server with the
+                            // same token; let it see the operator's decision.
+                            command.env(ALLOW_INSECURE_HTTP_ENV, "1");
+                        }
                     }
                     let command_run = run_command_with_heartbeat(
                         &client,
@@ -1881,7 +2374,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     fn test_directory(label: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
@@ -1890,38 +2382,59 @@ mod tests {
             .as_nanos();
         let path =
             std::env::temp_dir().join(format!("hola-cli-{label}-{}-{unique}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("test directory should be created");
+        // Private regardless of the umask: the outbox refuses a root that its
+        // group or other users can write to.
+        create_private_directory(&path).expect("test directory should be created");
         path
     }
 
     struct MockReply {
         status: Option<u16>,
-        body: &'static str,
+        body: String,
         delay: Duration,
+        /// Extra response header lines, each terminated by CRLF.
+        headers: String,
+        /// When false the body is delimited by closing the connection and no
+        /// Content-Length is declared.
+        declare_length: bool,
     }
 
     impl MockReply {
         fn close_connection() -> Self {
             Self {
                 status: None,
-                body: "",
-                delay: Duration::ZERO,
+                ..Self::response(200, "")
             }
         }
 
-        fn response(status: u16, body: &'static str) -> Self {
+        fn response(status: u16, body: impl Into<String>) -> Self {
             Self {
                 status: Some(status),
-                body,
+                body: body.into(),
                 delay: Duration::ZERO,
+                headers: String::new(),
+                declare_length: true,
             }
         }
 
         fn delayed(status: u16, body: &'static str, delay: Duration) -> Self {
             Self {
-                status: Some(status),
-                body,
                 delay,
+                ..Self::response(status, body)
+            }
+        }
+
+        fn redirect(status: u16, location: &str) -> Self {
+            Self {
+                headers: format!("Location: {location}\r\n"),
+                ..Self::response(status, "")
+            }
+        }
+
+        fn without_content_length(status: u16, body: impl Into<String>) -> Self {
+            Self {
+                declare_length: false,
+                ..Self::response(status, body)
             }
         }
     }
@@ -1982,16 +2495,22 @@ mod tests {
                 };
                 let reason = match status {
                     200 => "OK",
+                    307 => "Temporary Redirect",
                     404 => "Not Found",
                     409 => "Conflict",
                     503 => "Service Unavailable",
                     _ => "Test Status",
                 };
+                let length = if reply.declare_length {
+                    format!("Content-Length: {}\r\n", reply.body.len())
+                } else {
+                    String::new()
+                };
                 let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    reply.body.len(),
-                    reply.body
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{length}{}Connection: close\r\n\r\n{}",
+                    reply.headers, reply.body
                 );
+                // The client may stop reading an oversized body early.
                 let _ = stream.write_all(response.as_bytes());
             }
             requests
@@ -2882,5 +3401,582 @@ mod tests {
         std::thread::sleep(Duration::from_millis(600));
         assert!(!sentinel.exists(), "a timed-out descendant survived");
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    // ── Bearer token transport ──────────────────────────────────────────
+
+    #[test]
+    fn token_is_refused_over_plain_http_to_a_non_loopback_server() {
+        for server in [
+            "http://machine-a:8000",
+            "http://192.168.1.20:8000",
+            "http://[2001:db8::1]:8000",
+            "http://localhost.example.com:8000",
+        ] {
+            let error = check_token_transport(server, true, false)
+                .expect_err("a token must not cross the network in clear text by default");
+            assert!(error.contains(server), "{error}");
+            assert!(error.contains("--allow-insecure-http"), "{error}");
+            assert!(error.contains("HOLA_ALLOW_INSECURE_HTTP=1"), "{error}");
+            assert!(error.contains("https://"), "{error}");
+
+            let warning = check_token_transport(server, true, true)
+                .expect("the explicit override permits plain HTTP")
+                .expect("the override is reported so it is never silent");
+            assert!(warning.contains("unencrypted HTTP"), "{warning}");
+
+            assert_eq!(
+                check_token_transport(server, false, false),
+                Ok(None),
+                "without a token there is nothing to protect"
+            );
+        }
+    }
+
+    #[test]
+    fn token_is_allowed_over_loopback_http_and_any_https() {
+        for server in [
+            "http://localhost:8000",
+            "http://LOCALHOST:8000",
+            "http://127.0.0.1:8000",
+            "http://127.8.9.10:8000",
+            "http://[::1]:8000",
+            "http://[::ffff:127.0.0.1]:8000",
+            "https://machine-a:8443",
+            "https://hola.example.com/prefix",
+        ] {
+            assert_eq!(
+                check_token_transport(server, true, false),
+                Ok(None),
+                "{server} should not need the insecure override"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_accepts_the_insecure_http_override_flag() {
+        let cli = Cli::try_parse_from([
+            "hola",
+            "worker",
+            "--server",
+            "http://machine-a:8000",
+            "--exec",
+            "worker-command",
+            "--allow-insecure-http",
+        ])
+        .expect("override flag should parse");
+        match cli.command {
+            Commands::Worker {
+                allow_insecure_http,
+                ..
+            } => assert!(allow_insecure_http),
+            Commands::Serve { .. } => panic!("expected worker command"),
+        }
+    }
+
+    // ── Tokens without argv ─────────────────────────────────────────────
+
+    fn write_private_file(directory: &Path, name: &str, contents: &str) -> PathBuf {
+        let path = directory.join(name);
+        std::fs::write(&path, contents).expect("file should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("file should be private");
+        }
+        path
+    }
+
+    #[test]
+    fn token_file_ignores_one_trailing_newline_and_rejects_unusable_files() {
+        let directory = test_directory("token-file");
+        let write = |name: &str, contents: &str| write_private_file(&directory, name, contents);
+
+        for (name, contents) in [
+            ("lf", "s3cret\n"),
+            ("crlf", "s3cret\r\n"),
+            ("bare", "s3cret"),
+        ] {
+            assert_eq!(
+                read_token_file(&write(name, contents), "--token-file").as_deref(),
+                Ok("s3cret")
+            );
+        }
+        assert_eq!(
+            read_token_file(&write("blank-line", "s3cret\n\n"), "--token-file")
+                .expect_err("only one trailing newline is ignored"),
+            format!(
+                "--token-file: '{}' must hold a single-line token without control characters",
+                directory.join("blank-line").display()
+            )
+        );
+        for (name, contents) in [("empty", ""), ("newline-only", "\n")] {
+            let error = read_token_file(&write(name, contents), "--token-file")
+                .expect_err("an empty token file is a configuration error");
+            assert!(error.contains("is empty"), "{error}");
+        }
+        let oversized = "x".repeat(MAX_TOKEN_FILE_BYTES as usize + 1);
+        let error = read_token_file(&write("oversized", &oversized), "--token-file")
+            .expect_err("an oversized file is not a token");
+        assert!(error.contains("not a token file"), "{error}");
+        let error = read_token_file(&directory.join("missing"), "--auth-token-file")
+            .expect_err("a missing file is reported");
+        assert!(
+            error.starts_with("--auth-token-file: cannot open"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn token_sources_resolve_in_flag_file_environment_order() {
+        let directory = test_directory("token-order");
+        let file = write_private_file(&directory, "token", "from-file\n");
+        let env = || Some("from-env".to_string());
+
+        assert_eq!(
+            resolve_token(Some("from-flag".into()), Some(&file), "--token-file", env()),
+            Ok(Some("from-flag".to_string()))
+        );
+        assert_eq!(
+            resolve_token(None, Some(&file), "--token-file", env()),
+            Ok(Some("from-file".to_string()))
+        );
+        assert_eq!(
+            resolve_token(None, None, "--token-file", env()),
+            Ok(Some("from-env".to_string()))
+        );
+        assert_eq!(
+            resolve_token(None, None, "--token-file", Some(String::new())),
+            Ok(None)
+        );
+        assert_eq!(resolve_token(None, None, "--token-file", None), Ok(None));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn token_flags_and_token_files_are_mutually_exclusive() {
+        for arguments in [
+            vec![
+                "hola",
+                "worker",
+                "--server",
+                "http://127.0.0.1:8000",
+                "--exec",
+                "cmd",
+                "--token",
+                "a",
+                "--token-file",
+                "b",
+            ],
+            vec![
+                "hola",
+                "serve",
+                "study.yaml",
+                "--auth-token",
+                "a",
+                "--auth-token-file",
+                "b",
+            ],
+            vec![
+                "hola",
+                "serve",
+                "study.yaml",
+                "--read-token",
+                "a",
+                "--read-token-file",
+                "b",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(arguments).is_err(),
+                "a token and its file must not both be given"
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "hola",
+            "serve",
+            "study.yaml",
+            "--auth-token-file",
+            "write.token",
+            "--read-token-file",
+            "read.token",
+        ])
+        .expect("token files should parse");
+        match cli.command {
+            Commands::Serve {
+                auth_token,
+                auth_token_file,
+                read_token,
+                read_token_file,
+                ..
+            } => {
+                assert!(auth_token.is_none() && read_token.is_none());
+                assert_eq!(auth_token_file, Some(PathBuf::from("write.token")));
+                assert_eq!(read_token_file, Some(PathBuf::from("read.token")));
+            }
+            Commands::Worker { .. } => panic!("expected serve command"),
+        }
+    }
+
+    // ── Redirects ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn redirects_are_reported_and_never_followed() {
+        // The redirect target must never see a request, with or without the
+        // bearer token.
+        let target = std::net::TcpListener::bind("127.0.0.1:0").expect("target should bind");
+        target
+            .set_nonblocking(true)
+            .expect("target should be non-blocking");
+        let target_url = format!("http://{}/api/cancel", target.local_addr().unwrap());
+
+        let (server, server_thread) = mock_http_server(vec![
+            MockReply::redirect(307, &target_url),
+            MockReply::redirect(307, &target_url),
+            // HTTP forbids C0 controls in a header value, but not the C1 and
+            // bidirectional controls that UTF-8 can carry.
+            MockReply::redirect(307, "http://evil.example/\u{9b}31m\u{202e}gnp.exe"),
+        ]);
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+
+        let error = cancel_trial(&client, &server, Some("secret"), 3)
+            .await
+            .expect_err("a redirected mutation must fail");
+        assert!(error.contains("was redirected"), "{error}");
+        assert!(error.contains("HTTP 307 Temporary Redirect"), "{error}");
+        assert!(error.contains(&target_url), "{error}");
+        assert!(error.contains("does not follow redirects"), "{error}");
+
+        let record = PendingTell::new(&server, 3, serde_json::json!({"loss": 1.0}));
+        let tell_error = deliver_tell(&client, Some("secret"), &record)
+            .await
+            .expect_err("a redirected tell must fail");
+        assert!(
+            tell_error.is_permanent(),
+            "a redirect is a configuration error, not a transient failure"
+        );
+
+        let hostile = callback_trial_state(&client, &server, Some("secret"), 3)
+            .await
+            .expect_err("a redirected read must fail");
+        assert!(hostile.contains("was redirected"), "{hostile}");
+        assert!(
+            hostile.contains("\\u{009b}31m\\u{202e}gnp.exe"),
+            "the Location header is server-controlled: {hostile:?}"
+        );
+        assert!(!hostile.chars().any(|c| c.is_control() || c == '\u{202e}'));
+
+        server_thread.join().expect("mock server should finish");
+        match target.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("the redirect target received a connection: {other:?}"),
+        }
+    }
+
+    // ── Bounded response bodies ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn oversized_acknowledgements_are_rejected_before_and_while_reading() {
+        let oversized = format!(
+            r#"{{"status":"ok","trial_id":7,"padding":"{}"}}"#,
+            "x".repeat(MAX_RESPONSE_BODY_BYTES)
+        );
+        let (server, server_thread) = mock_http_server(vec![
+            MockReply::response(200, oversized.clone()),
+            MockReply::without_content_length(200, oversized),
+            MockReply::without_content_length(200, r#"{"status":"ok","trial_id":7}"#),
+        ]);
+        let client = build_http_client(Duration::from_secs(5)).expect("client should build");
+
+        let declared = cancel_trial(&client, &server, None, 7)
+            .await
+            .expect_err("a declared oversized body must be rejected");
+        assert!(
+            declared.contains("exceeds the 1048576-byte limit"),
+            "{declared}"
+        );
+        assert!(declared.contains("response body of"), "{declared}");
+
+        let streamed = cancel_trial(&client, &server, None, 7)
+            .await
+            .expect_err("an undeclared oversized body must be rejected while streaming");
+        assert!(
+            streamed.contains("exceeds the 1048576-byte limit"),
+            "{streamed}"
+        );
+
+        cancel_trial(&client, &server, None, 7)
+            .await
+            .expect("a small undeclared body is still accepted");
+        server_thread.join().expect("mock server should finish");
+    }
+
+    #[tokio::test]
+    async fn oversized_error_bodies_are_cut_instead_of_buffered() {
+        let (server, server_thread) = mock_http_server(vec![MockReply::without_content_length(
+            503,
+            "e".repeat(4 * MAX_ERROR_BODY_BYTES),
+        )]);
+        let client = build_http_client(Duration::from_secs(5)).expect("client should build");
+
+        let error = cancel_trial(&client, &server, None, 7)
+            .await
+            .expect_err("503 must fail");
+        assert!(error.contains("HTTP 503 Service Unavailable"), "{error}");
+        assert!(
+            error.len() < HTTP_ERROR_SNIPPET_CHARS + 256,
+            "the quoted body is bounded, got {} bytes",
+            error.len()
+        );
+        assert!(error.ends_with("..."), "a cut body is marked: {error}");
+        server_thread.join().expect("mock server should finish");
+    }
+
+    // ── Terminal-safe output ────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_for_terminal_escapes_controls_and_bounds_length() {
+        assert_eq!(
+            sanitize_for_terminal("plain text é ✓", 64),
+            "plain text é ✓"
+        );
+        assert_eq!(
+            sanitize_for_terminal("a\r\nb\tc\u{1b}[2J\u{7}\u{7f}\u{9b}", 64),
+            "a\\r\\nb\\tc\\u{001b}[2J\\u{0007}\\u{007f}\\u{009b}"
+        );
+        assert_eq!(
+            sanitize_for_terminal("x\u{202e}y\u{2028}z\u{2066}", 64),
+            "x\\u{202e}y\\u{2028}z\\u{2066}"
+        );
+        assert_eq!(sanitize_for_terminal("abcdef", 3), "abc...");
+        assert_eq!(sanitize_for_terminal("abc", 3), "abc");
+        assert_eq!(sanitize_for_terminal("", 3), "");
+    }
+
+    #[tokio::test]
+    async fn server_controlled_error_text_cannot_inject_terminal_controls() {
+        let (server, server_thread) = mock_http_server(vec![
+            MockReply::response(
+                409,
+                "{\"error\":\"denied\u{1b}[2J\"}\r\nTrial 7 completed successfully",
+            ),
+            MockReply::response(
+                200,
+                r#"{"status":"ok","trial_id":7,"state":"pending\u001b[31m\nCompleted trial 7"}"#,
+            ),
+        ]);
+        let client = build_http_client(Duration::from_secs(2)).expect("client should build");
+
+        let cancel_error = cancel_trial(&client, &server, None, 7)
+            .await
+            .expect_err("409 cancel must fail");
+        assert!(cancel_error.contains("\\u{001b}[2J"), "{cancel_error}");
+        assert!(cancel_error.contains("\\r\\nTrial 7"), "{cancel_error}");
+
+        let state_error = callback_trial_state(&client, &server, None, 7)
+            .await
+            .expect_err("an unknown state must fail");
+        assert!(
+            state_error.contains("unsupported trial state"),
+            "{state_error}"
+        );
+
+        for message in [cancel_error, state_error] {
+            assert!(
+                !message.chars().any(char::is_control),
+                "control characters reached the terminal: {message:?}"
+            );
+        }
+        server_thread.join().expect("mock server should finish");
+    }
+
+    #[test]
+    fn post_commit_warnings_are_neutralized_and_bounded() {
+        let long = "w".repeat(POST_COMMIT_WARNING_CHARS + 50);
+        let mut warnings = vec!["refit failed\r\n\u{1b}[1mCompleted trial 9", long.as_str()];
+        warnings.resize(MAX_POST_COMMIT_WARNINGS + 5, "another");
+
+        let printable = printable_post_commit_warnings(&warnings);
+        assert_eq!(printable.len(), MAX_POST_COMMIT_WARNINGS + 1);
+        assert_eq!(
+            printable[0],
+            "refit failed\\r\\n\\u{001b}[1mCompleted trial 9"
+        );
+        assert_eq!(printable[1].chars().count(), POST_COMMIT_WARNING_CHARS + 3);
+        assert_eq!(
+            printable.last().map(String::as_str),
+            Some("5 further post-commit warnings were not shown")
+        );
+        assert!(
+            printable
+                .iter()
+                .all(|warning| !warning.chars().any(char::is_control))
+        );
+        assert_eq!(
+            printable_post_commit_warnings(&["only one"]),
+            vec!["only one".to_string()]
+        );
+    }
+
+    // ── Outbox trust ────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn outbox_directories_and_records_are_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = test_directory("outbox-modes");
+        let root = parent.join("nested").join("outbox");
+        let server = "http://127.0.0.1:8000";
+        let outbox = TellOutbox::open(&root, server).expect("outbox should open");
+        let record = PendingTell::new(server, 5, serde_json::json!({"loss": 0.5}));
+        let path = outbox.persist(&record).expect("record should persist");
+
+        let mode = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .expect("entry should exist")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&outbox.directory), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outbox_refuses_directories_another_user_could_control() {
+        use std::os::unix::fs::PermissionsExt;
+        let server = "http://127.0.0.1:8000";
+        let hashed = format!("{:016x}", stable_server_hash(server));
+
+        // A symbolic link planted under the predictable server directory name.
+        let root = test_directory("outbox-symlink");
+        let elsewhere = test_directory("outbox-symlink-target");
+        std::os::unix::fs::symlink(&elsewhere, root.join(&hashed)).expect("symlink");
+        let error = TellOutbox::open(&root, server)
+            .err()
+            .expect("a symlinked server directory must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("is a symbolic link"), "{error}");
+        assert!(error.to_string().contains("--outbox-dir"), "{error}");
+
+        // The same for the root the operator named.
+        let linked_root = root.join("linked-root");
+        std::os::unix::fs::symlink(&elsewhere, &linked_root).expect("symlink");
+        let error = TellOutbox::open(&linked_root, server)
+            .err()
+            .expect("a symlinked root must be refused");
+        assert!(error.to_string().contains("is a symbolic link"), "{error}");
+
+        // A pre-existing directory that its group or anyone else can write to.
+        for mode in [0o777, 0o770, 0o702] {
+            let root = test_directory("outbox-writable");
+            let directory = root.join(&hashed);
+            std::fs::create_dir(&directory).expect("directory");
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+            let error = TellOutbox::open(&root, server)
+                .err()
+                .expect("a directory writable by others must be refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("writable by its group or by other users"),
+                "{error}"
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+
+        // A queue that was private when opened and loosened afterwards.
+        let reopened = test_directory("outbox-loosened");
+        let outbox = TellOutbox::open(&reopened, server).expect("outbox should open");
+        std::fs::set_permissions(&outbox.directory, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod");
+        assert!(outbox.pending().is_err(), "every use re-checks the queue");
+        let record = PendingTell::new(server, 1, serde_json::json!({"loss": 0.5}));
+        assert!(outbox.persist(&record).is_err());
+
+        for directory in [root, elsewhere, reopened] {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outbox_directory_ownership_policy() {
+        assert_eq!(directory_trust_problem(1000, 0o40700, 1000), None);
+        assert_eq!(directory_trust_problem(1000, 0o40755, 1000), None);
+        assert_eq!(
+            directory_trust_problem(0, 0o40755, 1000),
+            None,
+            "root can already act as any user"
+        );
+        let foreign = directory_trust_problem(1001, 0o40700, 1000)
+            .expect("another user's directory is not trusted");
+        assert!(foreign.contains("owned by uid 1001"), "{foreign}");
+        assert!(
+            directory_trust_problem(1000, 0o40700, 0).is_some(),
+            "root must not trust a queue an unprivileged user owns"
+        );
+        for mode in [0o40720, 0o40702, 0o41777] {
+            assert!(directory_trust_problem(1000, mode, 1000).is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn outbox_never_reads_records_through_links_or_special_files() {
+        let root = test_directory("outbox-record-link");
+        let server = "http://127.0.0.1:8000";
+        let outbox = TellOutbox::open(&root, server).expect("outbox should open");
+
+        // A well-formed record that lives outside the queue.
+        let outside = root.join("outside.json");
+        let forged = PendingTell::new(server, 9, serde_json::json!({"loss": -1.0}));
+        std::fs::write(&outside, serde_json::to_vec(&forged).unwrap()).expect("forged record");
+        let link = outbox.record_path(9);
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+
+        let error = outbox
+            .read_record(&link)
+            .expect_err("a symlinked record must not be read");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert!(outbox.pending().is_err(), "the queue reports the bad entry");
+        assert!(
+            outbox.persist(&forged).is_err(),
+            "a link is not mistaken for an equal existing record"
+        );
+        std::fs::remove_file(&link).expect("remove link");
+
+        // A directory under a record name is rejected rather than read.
+        std::fs::create_dir(outbox.record_path(10)).expect("directory");
+        let error = outbox
+            .read_record(&outbox.record_path(10))
+            .expect_err("a directory is not a record");
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn outbox_rejects_oversized_records() {
+        let root = test_directory("outbox-oversized");
+        let server = "http://127.0.0.1:8000";
+        let outbox = TellOutbox::open(&root, server).expect("outbox should open");
+        let path = outbox.record_path(4);
+        std::fs::write(&path, vec![b' '; MAX_OUTBOX_RECORD_BYTES as usize + 1])
+            .expect("oversized record");
+        let error = outbox
+            .read_record(&path)
+            .expect_err("an oversized record must be rejected");
+        assert!(
+            error.to_string().contains("exceeds the size limit"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

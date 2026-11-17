@@ -23,16 +23,26 @@ The port is configurable via `hola serve --port <PORT>`.
 ## Authentication
 
 By default, a local HOLA server does not require authentication.
-When the server is started with `--auth-token <TOKEN>`, all API
-endpoints require this header:
+When the server is started with an API token (the `HOLA_API_TOKEN`
+environment variable or `--auth-token-file`), all API endpoints require
+this header:
 
 ```http
 Authorization: Bearer <TOKEN>
 ```
 
-Operators may configure a separate `--read-token` for dashboards and
+Operators may configure a separate read-only token (`HOLA_READ_TOKEN` or
+`--read-token-file`) for dashboards and
 monitoring. That role can use GET endpoints, SSE, and metrics, but receives HTTP
 401 from ask, tell, cancel, heartbeat, objective updates, and checkpoint saves.
+
+The server speaks plain HTTP. A bearer token sent to it from another machine
+is readable on the network unless a TLS-terminating reverse proxy sits in
+front of it, so the `hola worker` and `Study.connect()` clients refuse to
+send a token to a non-loopback `http://` URL without an explicit override.
+They also do not follow redirects: the HOLA API does not use them, so a 3xx
+response is reported as an error. See
+[Multi-Machine Setup](cli-guide.md#multi-machine-setup).
 
 This includes mutation endpoints, read-only endpoints, and the
 `GET /api/events` SSE stream. Operators can deliberately leave reads
@@ -42,6 +52,15 @@ sensitive.
 The CLI requires an auth token when binding the server to a non-local
 host.
 
+A server without an auth token only answers requests addressed to
+`localhost` or a loopback IP address (`127.0.0.1`, `[::1]`). A request
+whose `Host` header names anything else receives HTTP 403 with the code
+`host_forbidden`. This stops a web page from reaching a local server
+through DNS rebinding, where the page's own domain is re-pointed at
+`127.0.0.1`. To serve HOLA under another host name, for example through
+a reverse proxy, configure an auth token; the server then accepts any
+`Host`.
+
 ## Error Format
 
 All error responses return a stable machine-readable `code` plus a
@@ -50,6 +69,35 @@ human-readable `error` message.
 ```json
 {"code": "tell_failed", "error": "Trial 42 has already been completed with different metrics"}
 ```
+
+## Limits
+
+The server bounds what one client can make it hold or compute. An
+ordinary study stays far below every limit.
+
+| Limit | Value | When exceeded |
+|-------|-------|---------------|
+| Request body | 64 KiB | 413 `payload_too_large` |
+| Request duration (all endpoints except `/api/events`) | 30 s | 408 `request_timeout` |
+| Time to send a complete request head, and idle time between requests on one connection | 120 s | the connection is closed |
+| Request head size | 64 KiB | the connection is closed |
+| Open connections | 1024 | new connections are closed immediately |
+| Open `/api/events` streams | 64 | 503 `too_many_event_streams` |
+| Ranked reads running at once (`top_k`, `pareto_front`, `trials`, `trial/{id}`) | 4 | the request waits for a slot, up to the request timeout |
+| Checkpoint saves running at once | 1 | 409 `checkpoint_in_progress` |
+| Files kept by `POST /api/checkpoint/save` | 32 (`--max-saved-checkpoints`) | 409 `checkpoint_quota_exceeded` |
+| Pending trials | 10,000 | 400 `ask_failed` |
+
+A ranked read or a checkpoint save that has started runs to completion
+even if its request times out or the client disconnects, and keeps its
+slot until then.
+
+The number of completed trials the server retains is not limited by
+default. Each one keeps its reported metrics (at most 64 KiB), and
+ranking cost grows with the retained history. Set `max_trials` to stop
+allocating new trials at a budget; set `max_leaderboard_size` to bound
+how many completed trials stay in memory. See
+[Operations](operations.md#resource-limits).
 
 ---
 
@@ -652,11 +700,28 @@ server-side path. The returned `path` identifies the generated file.
 {"code": "invalid_request", "error": "Failed to deserialize the JSON body..."}
 ```
 
+**Error (409)**
+
+Only one save runs at a time, and the server keeps a bounded number of
+saved files. It never deletes a saved checkpoint itself, so an operator
+must remove or archive older files once the limit is reached.
+
+```json
+{"code": "checkpoint_in_progress", "error": "another checkpoint save is still running; retry when it completes"}
+```
+
+```json
+{"code": "checkpoint_quota_exceeded", "error": "the checkpoint directory already holds 32 saved checkpoints (limit 32); remove or archive older files, then retry"}
+```
+
 **Error (500)**
 
 ```json
 {"code": "checkpoint_save_failed", "error": "failed to save checkpoint"}
 ```
+
+A save also fails with this code when the checkpoint would exceed the
+512 MiB that loading accepts. Nothing is written in that case.
 
 **Example**
 
@@ -779,6 +844,15 @@ perform the cursor-safe full REST resynchronization described above.
 
 ```json
 {"type": "ObjectivesChanged"}
+```
+
+**Error (503)**
+
+The server holds at most 64 event streams open. A further subscriber is
+refused until one disconnects.
+
+```json
+{"code": "too_many_event_streams", "error": "the server already has 64 open event streams; close one and retry"}
 ```
 
 **Example**

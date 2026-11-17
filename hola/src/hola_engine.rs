@@ -25,12 +25,13 @@
 use opt_engine::leaderboard::{Leaderboard, Trial, is_feasible_multi, non_dominated_front_indices};
 use opt_engine::persistence::{
     AutoCheckpointConfig, Checkpoint, LeaderboardCheckpoint, ObservationKind, atomic_write_json,
-    check_format_version_bytes, read_checkpoint_capped,
+    check_format_version_bytes, create_private_dir_all, read_checkpoint_capped,
 };
 use opt_engine::scales::{LinearScale, Log10Scale, LogScale, Scale};
 use opt_engine::spaces::{CategoricalSpace, ContinuousSpace, DiscreteSpace};
 use opt_engine::strategies::{
-    DEFAULT_GMM_COMPONENTS, GmmRefitConfig, GmmStrategy, RandomStrategy, SobolStrategy,
+    DEFAULT_GMM_COMPONENTS, GmmRefitConfig, GmmStrategy, MAX_GMM_DIMS, RandomStrategy,
+    SobolStrategy,
 };
 use opt_engine::traits::{RefitConfig, SampleSpace, StandardizedSpace, Strategy};
 use serde::{Deserialize, Serialize};
@@ -3567,6 +3568,17 @@ impl HolaEngine {
             }
         }
 
+        // The GMM keeps a dense `dim x dim` covariance per component, so a short
+        // configuration (or the configuration embedded in a checkpoint) could
+        // otherwise request quadratic memory and cubic work. Reject it before
+        // the prior is allocated.
+        if dim > MAX_GMM_DIMS && matches!(strategy_type, "gmm" | "auto") {
+            return Err(format!(
+                "the '{strategy_type}' strategy supports at most {MAX_GMM_DIMS} dimensions \
+                 (this space has {dim}); use 'random' for higher-dimensional spaces."
+            ));
+        }
+
         let refit_interval = strategy_cfg.map(|s| s.refit_interval).unwrap_or(20);
         let max_refit_samples = strategy_cfg
             .map(|strategy| strategy.max_refit_samples)
@@ -3688,7 +3700,7 @@ impl HolaEngine {
         });
 
         let auto_checkpoint = if let Some(c) = config.checkpoint.as_ref() {
-            std::fs::create_dir_all(&c.directory).map_err(|error| {
+            create_private_dir_all(std::path::Path::new(&c.directory)).map_err(|error| {
                 format!(
                     "failed to create checkpoint directory '{}': {error}",
                     c.directory
@@ -4444,6 +4456,65 @@ impl HolaEngine {
             .top_k_completed(k, include_infeasible, &state.objectives)
     }
 
+    /// Ranked reads for the HTTP server.
+    ///
+    /// Ranking and cloning the retained history is CPU-bound and proportional
+    /// to its size. These variants take the state lock synchronously so the
+    /// server can run them on the blocking pool, under its own concurrency
+    /// limit, instead of on the async workers that serve every other request.
+    /// They must not be called from an async context.
+    #[cfg(feature = "server")]
+    pub(crate) fn top_k_blocking(&self, k: usize, include_infeasible: bool) -> Vec<CompletedTrial> {
+        let state = self.state.blocking_read();
+        state
+            .leaderboard
+            .top_k_completed(k, include_infeasible, &state.objectives)
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn pareto_front_blocking(
+        &self,
+        front: usize,
+        include_infeasible: bool,
+    ) -> Vec<CompletedTrial> {
+        let state = self.state.blocking_read();
+        state
+            .leaderboard
+            .pareto_front_completed(front, include_infeasible, &state.objectives)
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn completed_trial_blocking(
+        &self,
+        trial_id: u64,
+        include_infeasible: bool,
+    ) -> Option<CompletedTrial> {
+        let state = self.state.blocking_read();
+        state
+            .leaderboard
+            .get_completed(trial_id, include_infeasible, &state.objectives)
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn trials_blocking(
+        &self,
+        sorted_by: &str,
+        include_infeasible: bool,
+    ) -> Vec<CompletedTrial> {
+        let state = self.state.blocking_read();
+        state
+            .leaderboard
+            .completed_trials(sorted_by, include_infeasible, &state.objectives)
+    }
+
+    /// Directory that receives automatic checkpoints, when configured.
+    #[cfg(feature = "server")]
+    pub(crate) fn auto_checkpoint_directory(&self) -> Option<&std::path::Path> {
+        self.auto_checkpoint
+            .as_ref()
+            .map(|config| config.directory.as_path())
+    }
+
     /// Get the number of completed trials.
     pub async fn trial_count(&self) -> usize {
         self.state.read().await.leaderboard.completed_count()
@@ -5112,7 +5183,7 @@ impl HolaEngine {
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
             {
-                std::fs::create_dir_all(parent)?;
+                create_private_dir_all(parent)?;
             }
 
             let (checkpoint_json, created_at) = match snapshot.leaderboard {
@@ -6524,6 +6595,27 @@ mod tests {
         assert!(
             HolaEngine::from_config(study(MAX_SOBOL_DIMS + 1, "random")).is_ok(),
             "random on a >256-dim space must be accepted"
+        );
+
+        // The GMM keeps dense dim x dim covariances. A space above its limit is
+        // rejected before that matrix is allocated; without the check, this
+        // 200,000-dimension request would need a 320 GB prior.
+        for ty in ["auto", "gmm"] {
+            for dim in [MAX_GMM_DIMS + 1, 200_000] {
+                let err = HolaEngine::from_config(study(dim, ty))
+                    .err()
+                    .expect("a GMM above its dimension limit must be rejected");
+                assert!(
+                    err.contains(&format!(
+                        "the '{ty}' strategy supports at most {MAX_GMM_DIMS} dimensions"
+                    )) && err.contains(&format!("this space has {dim}")),
+                    "unexpected error for {ty}: {err}"
+                );
+            }
+        }
+        assert!(
+            HolaEngine::from_config(study(MAX_GMM_DIMS + 1, "random")).is_ok(),
+            "random keeps no covariance and is accepted above the GMM limit"
         );
     }
 

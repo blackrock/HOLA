@@ -17,11 +17,15 @@ response, bad/invalid config error exits, custom port binding, worker
 trial completion, and HOLA_PARAMS environment variable passing.
 """
 
+import json
 import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
+import pytest
 from conftest import _wait_for_server, http_json, write_yaml_config
 
 # ==========================================================================
@@ -565,6 +569,169 @@ def test_worker_exec_invalid_json_cancels(cli_binary, tmp_path):
                 "Invalid-JSON exec output should cancel trials, "
                 f"but {body['trial_count']} were completed"
             )
+        finally:
+            worker.kill()
+            worker.wait(timeout=5)
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+
+
+# ==========================================================================
+# Token handling
+# ==========================================================================
+
+
+def _token_env(**overrides):
+    """The caller's environment without any inherited HOLA credentials."""
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in {"HOLA_API_TOKEN", "HOLA_READ_TOKEN", "HOLA_ALLOW_INSECURE_HTTP"}
+    }
+    env.update(overrides)
+    return env
+
+
+def _authorized_request(url, token=None, method="GET"):
+    request = urllib.request.Request(url, data=b"" if method == "POST" else None, method=method)
+    if token is not None:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        return error.code, {}
+
+
+def test_worker_refuses_to_send_a_token_over_plain_http_to_another_host(cli_binary):
+    result = subprocess.run(
+        [cli_binary, "worker", "--server", "http://machine-a.invalid:8000", "--exec", "exit 0"],
+        env=_token_env(HOLA_API_TOKEN="test-only-token"),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert "unencrypted HTTP" in result.stderr
+    assert "--allow-insecure-http" in result.stderr
+    assert "HOLA_ALLOW_INSECURE_HTTP=1" in result.stderr
+    assert "test-only-token" not in result.stderr
+
+
+@pytest.mark.parametrize("override", ["flag", "environment"])
+def test_worker_insecure_http_override_is_explicit_and_reported(cli_binary, override):
+    command = [
+        cli_binary,
+        "worker",
+        "--server",
+        "http://machine-a.invalid:8000",
+        "--exec",
+        "exit 0",
+    ]
+    env = _token_env(HOLA_API_TOKEN="test-only-token")
+    if override == "flag":
+        command.append("--allow-insecure-http")
+    else:
+        env["HOLA_ALLOW_INSECURE_HTTP"] = "1"
+
+    # With the override the worker goes on to its retry loop against the
+    # unreachable host instead of exiting, so it is still running at the timeout.
+    with pytest.raises(subprocess.TimeoutExpired) as running:
+        subprocess.run(command, env=env, capture_output=True, timeout=3)
+    stderr = (running.value.stderr or b"").decode("utf-8", errors="replace")
+    assert "warning: sending the bearer token" in stderr
+    assert "test-only-token" not in stderr
+
+
+def test_serve_rejects_a_read_token_without_a_write_token(cli_binary, tmp_path):
+    config_path = write_yaml_config(tmp_path)
+    result = subprocess.run(
+        [cli_binary, "serve", str(config_path), "--port", str(_find_free_port())],
+        env=_token_env(HOLA_READ_TOKEN="read-secret"),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert "HOLA_READ_TOKEN" in result.stderr
+    assert "read-secret" not in result.stderr
+
+
+def test_tokens_from_files_and_environment_never_need_argv(cli_binary, tmp_path):
+    port = _find_free_port()
+    config_path = write_yaml_config(tmp_path)
+    url = f"http://localhost:{port}"
+    token_file = tmp_path / "write.token"
+    token_file.write_text("write-secret\n")
+    token_file.chmod(0o600)
+
+    server = subprocess.Popen(
+        [
+            cli_binary,
+            "serve",
+            str(config_path),
+            "--port",
+            str(port),
+            "--auth-token-file",
+            str(token_file),
+        ],
+        env=_token_env(HOLA_READ_TOKEN="read-secret"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        ready = False
+        while not ready and time.monotonic() < deadline:
+            try:
+                ready = _authorized_request(f"{url}/healthz")[0] == 200
+            except OSError:
+                time.sleep(0.1)
+        assert ready, "Server did not start"
+
+        # The file's trailing newline is not part of the write token, and the
+        # read token from the environment never authorizes a mutation.
+        assert _authorized_request(f"{url}/api/space")[0] == 401
+        assert _authorized_request(f"{url}/api/space", "read-secret")[0] == 200
+        assert _authorized_request(f"{url}/api/ask", "read-secret", "POST")[0] == 401
+        status, trial = _authorized_request(f"{url}/api/ask", "write-secret", "POST")
+        assert status == 200
+        assert "trial_id" in trial
+
+        exec_cmd = _python_command(
+            tmp_path,
+            "constant_metrics.py",
+            "import json\nprint(json.dumps({'loss': 0.5}))\n",
+        )
+        worker = subprocess.Popen(
+            [
+                cli_binary,
+                "worker",
+                "--server",
+                url,
+                "--mode",
+                "exec",
+                "--exec",
+                exec_cmd,
+                "--token-file",
+                str(token_file),
+                "--outbox-dir",
+                str(tmp_path / "outbox"),
+            ],
+            env=_token_env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 20
+            completed = 0
+            while time.monotonic() < deadline and completed == 0:
+                time.sleep(0.2)
+                completed = _authorized_request(f"{url}/api/trial_count", "read-secret")[1].get(
+                    "trial_count", 0
+                )
+            assert completed > 0, "a worker given only --token-file completed no trial"
         finally:
             worker.kill()
             worker.wait(timeout=5)

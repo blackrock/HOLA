@@ -48,11 +48,15 @@ use axum::{
     },
     routing::{get, patch, post},
 };
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::server::graceful::GracefulShutdown;
+use hyper_util::service::TowerToHyperService;
+use opt_engine::persistence::create_private_dir_all;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::error::Error;
-use std::future::{Future, IntoFuture};
+use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -62,7 +66,7 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Semaphore, broadcast, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, oneshot, watch};
 use tokio_stream::wrappers::{BroadcastStream, WatchStream};
 use tokio_stream::{Stream, StreamExt};
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -113,6 +117,17 @@ pub struct ServerState {
     /// Once a tell/objective mutation has started, it is detached so committed
     /// post-processing cannot be cancelled with the HTTP response future.
     mutation_task_slots: Arc<Semaphore>,
+    /// Bounds concurrent `/api/events` subscribers. Each one holds a
+    /// connection, a broadcast receiver, and a keep-alive timer indefinitely.
+    event_stream_slots: Arc<Semaphore>,
+    /// Bounds ranked reads running on the blocking pool. The permit travels
+    /// into the blocking task, so a request that times out or disconnects
+    /// keeps its slot until the work it started has actually finished.
+    ranked_read_slots: Arc<Semaphore>,
+    /// At most one checkpoint save runs at a time. Like the read slots, the
+    /// permit is owned by the detached save task.
+    checkpoint_save_slot: Arc<Semaphore>,
+    max_saved_checkpoints: usize,
     http_requests_total: AtomicU64,
     http_failures_total: AtomicU64,
     http_latency_micros_total: AtomicU64,
@@ -123,6 +138,25 @@ pub struct ServerState {
 
 const EVENT_HISTORY_CAPACITY: usize = 256;
 const MAX_DETACHED_MUTATIONS: usize = 256;
+/// Concurrent `/api/events` streams. Further subscribers receive 503 until one
+/// disconnects.
+const MAX_EVENT_STREAMS: usize = 64;
+/// Ranked reads (`top_k`, `trials`, `pareto_front`, one trial) allowed on the
+/// blocking pool at once. Further reads wait for a slot within the request
+/// timeout.
+const MAX_CONCURRENT_RANKED_READS: usize = 4;
+/// Open connections served at once. Further connections are closed as soon as
+/// they are accepted, so a flood cannot exhaust file descriptors or tasks.
+const MAX_CONNECTIONS: usize = 1024;
+/// Time a client may take to deliver a complete request head. hyper restarts
+/// this timer while a keep-alive connection waits for its next request, so it
+/// also bounds idle connections. It exceeds common client pool idle timeouts
+/// (90 s) so well-behaved clients close first.
+const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// Bytes buffered per connection while reading a request head.
+const MAX_REQUEST_HEAD_BYTES: usize = 64 * 1024;
+/// Default for [`ServerOptions::max_saved_checkpoints`].
+pub const DEFAULT_MAX_SAVED_CHECKPOINTS: usize = 32;
 
 #[derive(Clone, Debug)]
 struct SequencedEngineEvent {
@@ -134,6 +168,8 @@ struct CloseOnShutdown<S> {
     inner: S,
     shutdown: WatchStream<bool>,
     _shutdown_guard: watch::Sender<bool>,
+    /// Returned to `event_stream_slots` when the response body is dropped.
+    _stream_permit: OwnedSemaphorePermit,
 }
 
 impl<S: Stream + Unpin> Stream for CloseOnShutdown<S> {
@@ -206,6 +242,11 @@ pub struct ServerOptions {
     pub lease_duration: Duration,
     /// Maximum time to drain in-flight requests after a shutdown signal.
     pub shutdown_timeout: Duration,
+    /// Number of files `POST /api/checkpoint/save` may leave in
+    /// `checkpoint_dir`. Once reached, further saves are refused until an
+    /// operator removes or archives older files; the server never deletes a
+    /// saved checkpoint itself.
+    pub max_saved_checkpoints: usize,
 }
 
 impl ServerOptions {
@@ -222,6 +263,7 @@ impl ServerOptions {
             request_timeout: Duration::from_secs(30),
             lease_duration: Duration::from_secs(2 * 60 * 60),
             shutdown_timeout: Duration::from_secs(10),
+            max_saved_checkpoints: DEFAULT_MAX_SAVED_CHECKPOINTS,
         }
     }
 }
@@ -315,6 +357,79 @@ fn forbidden_origin() -> (StatusCode, Json<ErrorResponse>) {
             error: "Request origin is not allowed".to_string(),
         }),
     )
+}
+
+fn forbidden_host() -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse {
+            code: "host_forbidden",
+            error: "This server has no auth token, so it only answers requests addressed to \
+                    localhost or a loopback IP address. Configure an auth token to serve it \
+                    under another host name."
+                .to_string(),
+        }),
+    )
+}
+
+/// Host part of an HTTP authority: `host`, `host:port`, `[v6]`, or `[v6]:port`.
+fn authority_host(authority: &str) -> Option<&str> {
+    let is_port = |port: &str| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit());
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        return (tail.is_empty() || tail.strip_prefix(':').is_some_and(is_port)).then_some(host);
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) => (is_port(port) && !host.contains(':')).then_some(host),
+        None => Some(authority),
+    }
+}
+
+/// Whether an authority names this machine's loopback interface.
+fn is_loopback_authority(authority: &str) -> bool {
+    authority_host(authority).is_some_and(|host| {
+        let host = host.strip_suffix('.').unwrap_or(host);
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
+}
+
+/// Refuse requests addressed to an unexpected host name when no token protects
+/// the API.
+///
+/// A server without a token can only be bound to loopback, and relies on the
+/// browser's same-origin policy to keep web pages away from it. DNS rebinding
+/// defeats that: a page served from `attacker.example` re-resolves its own
+/// name to 127.0.0.1 and then talks to this server as a same-origin peer. The
+/// browser still sends the attacker's name as `Host` (and as `Origin`, which
+/// therefore matches), so the name the request was addressed to is the one
+/// thing that tells the two cases apart. Clients that send no `Host` at all
+/// are not browsers and are unaffected.
+///
+/// With a token configured the check is unnecessary (a rebinding page has no
+/// token) and would break reverse proxies that forward a public host name.
+async fn reject_unexpected_host(
+    State(state): State<Arc<ServerState>>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    if state.auth_token.is_none() {
+        let headers_allowed = request
+            .headers()
+            .get_all(HOST)
+            .iter()
+            .all(|value| value.to_str().is_ok_and(is_loopback_authority));
+        let target_allowed = request
+            .uri()
+            .authority()
+            .is_none_or(|authority| is_loopback_authority(authority.as_str()));
+        if !(headers_allowed && target_allowed) {
+            return forbidden_host().into_response();
+        }
+    }
+    next.run(request).await
 }
 
 fn request_id(headers: &HeaderMap) -> &str {
@@ -694,6 +809,50 @@ async fn handle_heartbeat(
     }
 }
 
+/// Run a ranked read on the blocking pool under the read concurrency limit.
+///
+/// Ranking, cloning, and serializing the retained history is CPU-bound work
+/// proportional to its size, and a request timeout cannot interrupt it. Doing
+/// it on the async workers would let a few such requests stall every other
+/// request, including tells and health probes. The slot is released only when
+/// the blocking work ends, not when the request future is dropped.
+async fn ranked_read<T, F>(
+    state: &Arc<ServerState>,
+    read: F,
+) -> Result<T, (StatusCode, Json<ErrorResponse>)>
+where
+    F: FnOnce(&HolaEngine) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = Arc::clone(&state.ranked_read_slots)
+        .acquire_owned()
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    code: "read_queue_unavailable",
+                    error: error.to_string(),
+                }),
+            )
+        })?;
+    let engine = state.engine.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read(&engine)
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                code: "read_task_failed",
+                error: format!("read task failed: {error}"),
+            }),
+        )
+    })
+}
+
 async fn handle_top_k(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -701,8 +860,11 @@ async fn handle_top_k(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     authorize_read(&state, &headers)?;
     let include_infeasible = q.include_infeasible.unwrap_or(false);
-    let trials = state.engine.top_k(q.k, include_infeasible).await;
-    Ok(Json(serde_json::to_value(&trials).unwrap_or_default()))
+    let trials = ranked_read(&state, move |engine| {
+        serde_json::to_value(engine.top_k_blocking(q.k, include_infeasible)).unwrap_or_default()
+    })
+    .await?;
+    Ok(Json(trials))
 }
 
 async fn handle_pareto_front(
@@ -713,8 +875,12 @@ async fn handle_pareto_front(
     authorize_read(&state, &headers)?;
     let front = q.front.unwrap_or(0);
     let include_infeasible = q.include_infeasible.unwrap_or(false);
-    let trials = state.engine.pareto_front(front, include_infeasible).await;
-    Ok(Json(serde_json::to_value(&trials).unwrap_or_default()))
+    let trials = ranked_read(&state, move |engine| {
+        serde_json::to_value(engine.pareto_front_blocking(front, include_infeasible))
+            .unwrap_or_default()
+    })
+    .await?;
+    Ok(Json(trials))
 }
 
 async fn handle_trials(
@@ -723,10 +889,14 @@ async fn handle_trials(
     Query(q): Query<TrialsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     authorize_read(&state, &headers)?;
-    let sorted_by = q.sorted_by.as_deref().unwrap_or("index");
+    let sorted_by = q.sorted_by.unwrap_or_else(|| "index".to_string());
     let include_infeasible = q.include_infeasible.unwrap_or(true);
-    let trials = state.engine.trials(sorted_by, include_infeasible).await;
-    Ok(Json(serde_json::to_value(&trials).unwrap_or_default()))
+    let trials = ranked_read(&state, move |engine| {
+        serde_json::to_value(engine.trials_blocking(&sorted_by, include_infeasible))
+            .unwrap_or_default()
+    })
+    .await?;
+    Ok(Json(trials))
 }
 
 async fn handle_trial(
@@ -737,12 +907,14 @@ async fn handle_trial(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     authorize_read(&state, &headers)?;
     let include_infeasible = q.include_infeasible.unwrap_or(true);
-    match state
-        .engine
-        .completed_trial(trial_id, include_infeasible)
-        .await
-    {
-        Some(trial) => Ok(Json(serde_json::to_value(&trial).unwrap_or_default())),
+    let trial = ranked_read(&state, move |engine| {
+        engine
+            .completed_trial_blocking(trial_id, include_infeasible)
+            .map(|trial| serde_json::to_value(&trial).unwrap_or_default())
+    })
+    .await?;
+    match trial {
+        Some(trial) => Ok(Json(trial)),
         None => Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -965,58 +1137,146 @@ async fn handle_event_cursor(
     })))
 }
 
+/// Whether `name` is a file this server generated for `/api/checkpoint/save`
+/// (`checkpoint_<milliseconds>_<sequence>.json`). Automatic checkpoints use a
+/// single numeric part and are rotated by the engine instead.
+fn is_saved_checkpoint_name(name: &str) -> bool {
+    let is_number = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    name.strip_prefix("checkpoint_")
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .and_then(|stem| stem.split_once('_'))
+        .is_some_and(|(timestamp, sequence)| is_number(timestamp) && is_number(sequence))
+}
+
+/// Create the checkpoint directory if needed and count the saved checkpoints
+/// it already holds.
+fn count_saved_checkpoints(directory: &Path) -> std::io::Result<usize> {
+    create_private_dir_all(directory)?;
+    let mut count = 0;
+    for entry in std::fs::read_dir(nonempty_path(directory))? {
+        if entry?
+            .file_name()
+            .to_str()
+            .is_some_and(is_saved_checkpoint_name)
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 async fn handle_checkpoint_save(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
     Json(req): Json<SaveCheckpointRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     authorize_mutation(&state, &headers)?;
-    let path = generated_checkpoint_path(&state);
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            // Log the underlying error (which can contain filesystem paths)
-            // only server-side; return a generic message so paths do not leak
-            // to clients.
-            state
-                .checkpoint_failures_total
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::error!(
-                request_id = request_id(&headers),
-                error_code = "checkpoint_save_failed",
-                error = %e,
-                "failed to create checkpoint directory"
-            );
-            return Err(checkpoint_save_failed());
+    // A save clones the full study state and writes it on the blocking pool,
+    // where neither the request timeout nor a disconnect can stop it. Allow
+    // one at a time and let the detached task own the slot, so repeated or
+    // abandoned requests cannot pile up clones, blocking threads, and files.
+    let permit = Arc::clone(&state.checkpoint_save_slot)
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    code: "checkpoint_in_progress",
+                    error: "another checkpoint save is still running; retry when it completes"
+                        .to_string(),
+                }),
+            )
+        })?;
+    let request_id = request_id(&headers).to_owned();
+    let task = tokio::spawn(
+        async move {
+            let _permit = permit;
+            save_checkpoint(state, req.description, request_id).await
         }
+        .instrument(tracing::Span::current()),
+    );
+    task.await.map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                code: "checkpoint_task_failed",
+                error: format!("checkpoint task failed: {error}"),
+            }),
+        )
+    })?
+}
+
+async fn save_checkpoint(
+    state: Arc<ServerState>,
+    description: Option<String>,
+    request_id: String,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let fail = |error: &dyn std::fmt::Display, message: &'static str| {
+        // Log the underlying error (which can contain filesystem paths) only
+        // server-side; return a generic message so paths do not leak to
+        // clients.
+        state
+            .checkpoint_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::error!(
+            request_id = request_id,
+            error_code = "checkpoint_save_failed",
+            error = %error,
+            "{message}"
+        );
+        checkpoint_save_failed()
+    };
+
+    let directory = state.checkpoint_dir.clone();
+    let existing = match tokio::task::spawn_blocking(move || count_saved_checkpoints(&directory))
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|result| result)
+    {
+        Ok(existing) => existing,
+        Err(error) => return Err(fail(&error, "failed to prepare checkpoint directory")),
+    };
+    let limit = state.max_saved_checkpoints;
+    if existing >= limit {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                code: "checkpoint_quota_exceeded",
+                error: format!(
+                    "the checkpoint directory already holds {existing} saved checkpoints \
+                     (limit {limit}); remove or archive older files, then retry"
+                ),
+            }),
+        ));
     }
 
+    let path = generated_checkpoint_path(&state);
     match state
         .engine
-        .save_full_checkpoint_with_metadata(&path, req.description.as_deref())
+        .save_full_checkpoint_with_metadata(&path, description.as_deref())
         .await
     {
-        Ok(saved) => Ok(Json(serde_json::json!({
-            "status": "ok",
-            "checkpoint_type": "full",
-            // Return the resolved checkpoint path so clients can load it
-            // back (e.g. `Study.load(path)`); the directory is operator-
-            // configured and traversal is blocked by resolve_checkpoint_path.
-            "path": path.to_string_lossy(),
-            "trials_saved": saved.n_trials,
-            "created_at": saved.created_at,
-        }))),
-        Err(e) => {
-            state
-                .checkpoint_failures_total
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::error!(
-                request_id = request_id(&headers),
-                error_code = "checkpoint_save_failed",
-                error = %e,
-                "failed to save checkpoint"
+        Ok(saved) => {
+            // The request that asked for this file may already have timed
+            // out; the log is then the only record of where it went.
+            tracing::info!(
+                request_id = request_id,
+                path = %path.display(),
+                trials_saved = saved.n_trials,
+                "checkpoint saved"
             );
-            Err(checkpoint_save_failed())
+            Ok(Json(serde_json::json!({
+                "status": "ok",
+                "checkpoint_type": "full",
+                // Return the resolved checkpoint path so clients can load it
+                // back (e.g. `Study.load(path)`); the directory is operator-
+                // configured and the file name is generated by the server.
+                "path": path.to_string_lossy(),
+                "trials_saved": saved.n_trials,
+                "created_at": saved.created_at,
+            })))
         }
+        Err(error) => Err(fail(&error, "failed to save checkpoint")),
     }
 }
 
@@ -1038,6 +1298,20 @@ async fn handle_events(
     (StatusCode, Json<ErrorResponse>),
 > {
     authorize_read(&state, &headers)?;
+    let stream_permit = Arc::clone(&state.event_stream_slots)
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    code: "too_many_event_streams",
+                    error: format!(
+                        "the server already has {MAX_EVENT_STREAMS} open event streams; \
+                         close one and retry"
+                    ),
+                }),
+            )
+        })?;
     let rx = state.events_tx.subscribe();
     let shutdown = state.shutdown.subscribe();
     let requested_id = headers
@@ -1097,6 +1371,7 @@ async fn handle_events(
         inner: tokio_stream::iter(initial).chain(live),
         shutdown: WatchStream::new(shutdown),
         _shutdown_guard: state.shutdown.clone(),
+        _stream_permit: stream_permit,
     };
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -1192,7 +1467,10 @@ fn create_router_with_options_and_shutdown(
     if options.read_auth_token.is_some() && options.auth_token.is_none() {
         return Err("read_auth_token requires an auth_token for mutation endpoints".into());
     }
-    std::fs::create_dir_all(&options.checkpoint_dir).map_err(|error| {
+    if options.max_saved_checkpoints == 0 {
+        return Err("max_saved_checkpoints must be at least 1".into());
+    }
+    create_private_dir_all(&options.checkpoint_dir).map_err(|error| {
         format!(
             "failed to create checkpoint directory '{}': {error}",
             options.checkpoint_dir.display()
@@ -1213,6 +1491,10 @@ fn create_router_with_options_and_shutdown(
         lease_duration: options.lease_duration,
         tell_lock: Arc::new(tokio::sync::Mutex::new(())),
         mutation_task_slots: Arc::new(Semaphore::new(MAX_DETACHED_MUTATIONS)),
+        event_stream_slots: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
+        ranked_read_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_RANKED_READS)),
+        checkpoint_save_slot: Arc::new(Semaphore::new(1)),
+        max_saved_checkpoints: options.max_saved_checkpoints,
         http_requests_total: AtomicU64::new(0),
         http_failures_total: AtomicU64::new(0),
         http_latency_micros_total: AtomicU64::new(0),
@@ -1221,6 +1503,7 @@ fn create_router_with_options_and_shutdown(
         events_published_total: AtomicU64::new(0),
     });
     let metrics_state = Arc::clone(&state);
+    let host_state = Arc::clone(&state);
 
     let cors = build_cors(&options.cors_allowed_origins)?;
 
@@ -1256,6 +1539,10 @@ fn create_router_with_options_and_shutdown(
         .merge(api)
         // SSE is deliberately outside the ordinary request timeout.
         .route("/api/events", get(handle_events))
+        .layer(middleware::from_fn_with_state(
+            host_state,
+            reject_unexpected_host,
+        ))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &axum::http::Request<_>| {
@@ -1264,10 +1551,12 @@ fn create_router_with_options_and_shutdown(
                         .get("x-request-id")
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or("missing");
+                    // Log the path only. A query string can carry a
+                    // credential that a client put there by mistake.
                     tracing::info_span!(
                         "http_request",
                         method = %request.method(),
-                        uri = %request.uri(),
+                        uri = %request.uri().path(),
                         request_id = %request_id,
                     )
                 })
@@ -1305,12 +1594,99 @@ pub fn create_router_with_dashboard_and_options(
     engine: HolaEngine,
     options: ServerOptions,
 ) -> Result<Router, Box<dyn Error>> {
-    let dashboard_dir = options.dashboard_dir.clone();
-    let router = create_router_with_options(engine, options)?;
-    Ok(match dashboard_dir {
-        Some(dir) => router.fallback_service(ServeDir::new(dir)),
+    let (router, _) = create_router_with_dashboard_and_shutdown(engine, &options)?;
+    Ok(router)
+}
+
+fn create_router_with_dashboard_and_shutdown(
+    engine: HolaEngine,
+    options: &ServerOptions,
+) -> Result<(Router, watch::Sender<bool>), Box<dyn Error>> {
+    if let Some(dashboard_dir) = &options.dashboard_dir {
+        // Checked before the router creates the checkpoint directory, so a
+        // rejected configuration leaves nothing behind in the dashboard.
+        let checkpoint_dirs = std::iter::once(options.checkpoint_dir.as_path())
+            .chain(engine.auto_checkpoint_directory());
+        ensure_dashboard_excludes_checkpoints(dashboard_dir, checkpoint_dirs)?;
+    }
+    let (router, shutdown) = create_router_with_options_and_shutdown(engine, options.clone())?;
+    let router = match &options.dashboard_dir {
+        Some(dashboard_dir) => router.fallback_service(ServeDir::new(dashboard_dir)),
         None => router,
-    })
+    };
+    Ok((router, shutdown))
+}
+
+/// The current directory for an empty path, as the filesystem treats it.
+fn nonempty_path(path: &Path) -> &Path {
+    if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    }
+}
+
+/// Resolve symlinks in the part of `path` that exists and keep the rest.
+///
+/// A checkpoint directory that has not been created yet still has a known
+/// final location once its existing ancestors are resolved.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(resolved) = existing.canonicalize() {
+            return missing
+                .iter()
+                .rev()
+                .fold(resolved, |path, part| path.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Refuse a dashboard directory that contains a checkpoint directory.
+///
+/// Every file below the dashboard directory is served to anyone who can reach
+/// the server, without the read token, because the UI must load before a token
+/// can be entered. A checkpoint directory at or below it would publish full
+/// study state past read authentication.
+fn ensure_dashboard_excludes_checkpoints<'a>(
+    dashboard_dir: &Path,
+    checkpoint_dirs: impl Iterator<Item = &'a Path>,
+) -> Result<(), Box<dyn Error>> {
+    let dashboard = nonempty_path(dashboard_dir)
+        .canonicalize()
+        .map_err(|error| {
+            format!(
+                "dashboard directory '{}' is not accessible: {error}",
+                dashboard_dir.display()
+            )
+        })?;
+    let dashboard_as_written = std::path::absolute(nonempty_path(dashboard_dir))?;
+    for checkpoint_dir in checkpoint_dirs {
+        // Compare both the written and the resolved locations: a checkpoint
+        // path written beneath the dashboard directory is reachable through
+        // it even when a symlink makes it resolve elsewhere.
+        let as_written = std::path::absolute(nonempty_path(checkpoint_dir))?;
+        let resolved = resolve_existing_prefix(&as_written);
+        if resolved.starts_with(&dashboard) || as_written.starts_with(&dashboard_as_written) {
+            return Err(format!(
+                "the dashboard directory '{}' contains the checkpoint directory '{}'. Files \
+                 under the dashboard directory are served without authentication, so \
+                 checkpoints must be kept outside it.",
+                dashboard_dir.display(),
+                checkpoint_dir.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Start the server on the given port. Blocks until the server is shut down.
@@ -1410,11 +1786,7 @@ async fn prepare_server(
         )
         .into());
     }
-    let (router, sse_shutdown) = create_router_with_options_and_shutdown(engine, options.clone())?;
-    let router = match &options.dashboard_dir {
-        Some(dir) => router.fallback_service(ServeDir::new(dir)),
-        None => router,
-    };
+    let (router, sse_shutdown) = create_router_with_dashboard_and_shutdown(engine, options)?;
     let listener = tokio::net::TcpListener::bind((options.host.as_str(), options.port)).await?;
     tracing::info!(
         host = options.host,
@@ -1425,6 +1797,11 @@ async fn prepare_server(
     Ok((listener, router, sse_shutdown))
 }
 
+/// Accept and serve connections until `shutdown` resolves, then drain.
+///
+/// This replaces `axum::serve`, which configures no timer on its connections:
+/// a client could then open a socket, never finish a request head, and hold
+/// the connection forever, and nothing limited how many it could open.
 async fn serve_listener_with_shutdown<F>(
     listener: tokio::net::TcpListener,
     router: Router,
@@ -1434,35 +1811,118 @@ async fn serve_listener_with_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let (started_tx, started_rx) = oneshot::channel();
-    let shutdown = async move {
-        shutdown.await;
-        let _ = started_tx.send(());
-    };
-    let server = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .into_future();
-    tokio::pin!(server);
+    serve_listener_with_limits(
+        listener,
+        router,
+        shutdown,
+        drain_timeout,
+        ConnectionLimits {
+            head_timeout: REQUEST_HEAD_TIMEOUT,
+            max_connections: MAX_CONNECTIONS,
+        },
+    )
+    .await
+}
 
-    tokio::select! {
-        result = &mut server => result,
-        _ = started_rx => {
-            tracing::info!(
-                timeout_seconds = drain_timeout.as_secs_f64(),
-                "shutdown signal received; draining in-flight requests"
-            );
-            match tokio::time::timeout(drain_timeout, &mut server).await {
-                Ok(result) => result,
-                Err(_) => {
-                    tracing::warn!(
-                        timeout_seconds = drain_timeout.as_secs_f64(),
-                        "graceful shutdown deadline reached; closing remaining connections"
-                    );
-                    Ok(())
-                }
+#[derive(Clone, Copy)]
+struct ConnectionLimits {
+    head_timeout: Duration,
+    max_connections: usize,
+}
+
+async fn serve_listener_with_limits<F>(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    shutdown: F,
+    drain_timeout: Duration,
+    limits: ConnectionLimits,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(TokioTimer::new())
+        .header_read_timeout(limits.head_timeout)
+        .max_buf_size(MAX_REQUEST_HEAD_BYTES);
+    let graceful = GracefulShutdown::new();
+    let connection_slots = Arc::new(Semaphore::new(limits.max_connections));
+    let mut connections = tokio::task::JoinSet::new();
+    let mut refused: u64 = 0;
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            () = &mut shutdown => break,
+            // Reap finished connection tasks so the set tracks only live ones.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            accepted = listener.accept() => {
+                let stream = match accepted {
+                    Ok((stream, _peer)) => stream,
+                    Err(error) => {
+                        if !is_connection_error(&error) {
+                            // Typically file-descriptor exhaustion. Back off
+                            // instead of spinning on the same failure.
+                            tracing::error!(error = %error, "failed to accept a connection");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        continue;
+                    }
+                };
+                let Ok(permit) = Arc::clone(&connection_slots).try_acquire_owned() else {
+                    // Closing immediately keeps the listener responsive and
+                    // the process within its limits; idle connections free
+                    // their slots when the request-head timer expires.
+                    refused += 1;
+                    if refused.is_power_of_two() {
+                        tracing::warn!(
+                            limit = limits.max_connections,
+                            refused,
+                            "connection limit reached; closing new connections"
+                        );
+                    }
+                    continue;
+                };
+                let service = TowerToHyperService::new(router.clone());
+                let connection = graceful.watch(http.serve_connection(TokioIo::new(stream), service));
+                connections.spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = connection.await {
+                        tracing::debug!(error = %error, "connection closed with an error");
+                    }
+                });
             }
         }
     }
+
+    // Stop accepting, then let in-flight requests finish.
+    drop(listener);
+    tracing::info!(
+        timeout_seconds = drain_timeout.as_secs_f64(),
+        "shutdown signal received; draining in-flight requests"
+    );
+    if tokio::time::timeout(drain_timeout, graceful.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            timeout_seconds = drain_timeout.as_secs_f64(),
+            "graceful shutdown deadline reached; closing remaining connections"
+        );
+    }
+    // Dropping the set aborts whatever is still running, which closes its
+    // socket; nothing outlives this function.
+    connections.shutdown().await;
+    Ok(())
+}
+
+/// Accept errors that concern one peer rather than the listener.
+fn is_connection_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -1626,6 +2086,568 @@ mod tests {
             .expect("server should close cleanly at its drain deadline");
     }
 
+    fn test_engine() -> HolaEngine {
+        HolaEngine::from_config(StudyConfig {
+            space: BTreeMap::from([(
+                "x".to_string(),
+                ParamConfig::Real {
+                    min: 0.0,
+                    max: 1.0,
+                    scale: "linear".to_string(),
+                },
+            )]),
+            objectives: vec![ObjectiveConfig {
+                field: "loss".to_string(),
+                obj_type: "minimize".to_string(),
+                target: None,
+                limit: None,
+                priority: 1.0,
+                group: None,
+            }],
+            strategy: None,
+            checkpoint: None,
+            max_trials: None,
+            max_leaderboard_size: None,
+        })
+        .unwrap()
+    }
+
+    fn test_state(engine: HolaEngine, checkpoint_dir: &Path) -> Arc<ServerState> {
+        Arc::new(ServerState {
+            engine,
+            events_tx: broadcast::channel(256).0,
+            shutdown: watch::channel(false).0,
+            event_journal: StdMutex::new(EventJournal::new()),
+            auth_token: None,
+            read_auth_token: None,
+            require_read_auth: true,
+            cors_allowed_origins: Vec::new(),
+            checkpoint_dir: checkpoint_dir.to_path_buf(),
+            lease_duration: Duration::from_secs(60),
+            tell_lock: Arc::new(tokio::sync::Mutex::new(())),
+            mutation_task_slots: Arc::new(Semaphore::new(MAX_DETACHED_MUTATIONS)),
+            event_stream_slots: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
+            ranked_read_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_RANKED_READS)),
+            checkpoint_save_slot: Arc::new(Semaphore::new(1)),
+            max_saved_checkpoints: DEFAULT_MAX_SAVED_CHECKPOINTS,
+            http_requests_total: AtomicU64::new(0),
+            http_failures_total: AtomicU64::new(0),
+            http_latency_micros_total: AtomicU64::new(0),
+            checkpoint_failures_total: AtomicU64::new(0),
+            checkpoint_file_sequence: AtomicU64::new(0),
+            events_published_total: AtomicU64::new(0),
+        })
+    }
+
+    /// Send one in-process request and return its status and JSON body.
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, serde_json::Value) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let mut request = axum::http::Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let body = if method == "GET" {
+            axum::body::Body::empty()
+        } else {
+            request = request.header("content-type", "application/json");
+            axum::body::Body::from("{}")
+        };
+        let response = app
+            .clone()
+            .oneshot(request.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    #[test]
+    fn loopback_authorities_are_recognized_exactly() {
+        for authority in [
+            "localhost",
+            "localhost:8000",
+            "LOCALHOST:8000",
+            "localhost.:8000",
+            "127.0.0.1",
+            "127.0.0.1:8000",
+            "127.8.9.10:1",
+            "[::1]",
+            "[::1]:8000",
+        ] {
+            assert!(is_loopback_authority(authority), "{authority}");
+        }
+        for authority in [
+            "",
+            "attacker.example",
+            "attacker.example:8000",
+            "localhost.attacker.example",
+            "127.0.0.1.attacker.example:8000",
+            "notlocalhost",
+            "192.168.1.5:8000",
+            "0.0.0.0:8000",
+            "[::ffff:127.0.0.1]:8000",
+            "::1",
+            "localhost:",
+            "localhost:80a",
+            "[::1]x",
+            "user@localhost",
+        ] {
+            assert!(!is_loopback_authority(authority), "{authority}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tokenless_server_rejects_rebound_hosts_before_reads_or_mutations() {
+        let engine = test_engine();
+        let checkpoint_dir = tempfile::tempdir().unwrap();
+        let mut options = ServerOptions::new(0);
+        options.checkpoint_dir = checkpoint_dir.path().to_path_buf();
+        let (app, _shutdown) =
+            create_router_with_options_and_shutdown(engine.clone(), options).unwrap();
+
+        // After DNS rebinding the browser addresses the loopback server by the
+        // attacker's name, so Host and Origin agree with each other.
+        let rebound = [
+            ("host", "attacker.example:8000"),
+            ("origin", "http://attacker.example:8000"),
+        ];
+        for (method, uri) in [
+            ("POST", "/api/ask"),
+            ("POST", "/api/checkpoint/save"),
+            ("GET", "/api/trials"),
+            ("GET", "/api/space"),
+            ("GET", "/api/events"),
+            ("GET", "/api/metrics"),
+        ] {
+            let (status, body) = send(&app, method, uri, &rebound).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+            assert_eq!(body["code"], "host_forbidden", "{method} {uri}");
+        }
+        // Same-origin GETs carry no Origin header at all.
+        let (status, body) =
+            send(&app, "GET", "/api/trials", &[("host", "attacker.example")]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], "host_forbidden");
+        assert_eq!(engine.pending_count().await, 0, "no trial may be allocated");
+        assert!(
+            std::fs::read_dir(checkpoint_dir.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "no checkpoint may be written"
+        );
+
+        for host in ["localhost:8000", "127.0.0.1:8000", "[::1]:8000"] {
+            let origin = format!("http://{host}");
+            let headers = [("host", host), ("origin", origin.as_str())];
+            let (status, _) = send(&app, "GET", "/api/trial_count", &headers).await;
+            assert_eq!(status, StatusCode::OK, "{host}");
+        }
+        // Non-browser clients that send no Host are unaffected.
+        let (status, _) = send(&app, "POST", "/api/ask", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn token_protected_server_accepts_a_proxied_host_name() {
+        let checkpoint_dir = tempfile::tempdir().unwrap();
+        let mut options = ServerOptions::new(0);
+        options.checkpoint_dir = checkpoint_dir.path().to_path_buf();
+        options.auth_token = Some("secret".to_string());
+        let (app, _shutdown) =
+            create_router_with_options_and_shutdown(test_engine(), options).unwrap();
+
+        let proxied = [
+            ("host", "optimizer.example.com"),
+            ("authorization", "Bearer secret"),
+        ];
+        let (status, _) = send(&app, "POST", "/api/ask", &proxied).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/api/ask",
+            &[("host", "optimizer.example.com")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["code"], "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn event_streams_are_limited_and_release_their_slot_on_disconnect() {
+        use tower::ServiceExt;
+
+        let checkpoint_dir = tempfile::tempdir().unwrap();
+        let mut options = ServerOptions::new(0);
+        options.checkpoint_dir = checkpoint_dir.path().to_path_buf();
+        let (app, _shutdown) =
+            create_router_with_options_and_shutdown(test_engine(), options).unwrap();
+        let open_stream = || {
+            let request = axum::http::Request::builder()
+                .uri("/api/events")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            app.clone().oneshot(request)
+        };
+
+        let mut streams = Vec::new();
+        for _ in 0..MAX_EVENT_STREAMS {
+            let response = open_stream().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            streams.push(response);
+        }
+        let (status, body) = send(&app, "GET", "/api/events", &[]).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "too_many_event_streams");
+        // Ordinary requests are unaffected by the stream limit.
+        let (status, _) = send(&app, "GET", "/api/trial_count", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        streams.pop();
+        let response = open_stream().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_saves_stop_at_the_quota_without_deleting_files() {
+        let checkpoint_dir = tempfile::tempdir().unwrap();
+        let mut options = ServerOptions::new(0);
+        options.checkpoint_dir = checkpoint_dir.path().to_path_buf();
+        options.max_saved_checkpoints = 2;
+        let (app, _shutdown) =
+            create_router_with_options_and_shutdown(test_engine(), options).unwrap();
+        // Files the server did not generate through this endpoint do not count.
+        std::fs::write(checkpoint_dir.path().join("checkpoint_000050.json"), "{}").unwrap();
+        std::fs::write(checkpoint_dir.path().join("notes.txt"), "").unwrap();
+
+        let mut saved = Vec::new();
+        for _ in 0..2 {
+            let (status, body) = send(&app, "POST", "/api/checkpoint/save", &[]).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            saved.push(PathBuf::from(body["path"].as_str().unwrap()));
+        }
+        let (status, body) = send(&app, "POST", "/api/checkpoint/save", &[]).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "checkpoint_quota_exceeded");
+        assert!(
+            saved.iter().all(|path| path.is_file()),
+            "nothing is rotated out"
+        );
+        assert_eq!(std::fs::read_dir(checkpoint_dir.path()).unwrap().count(), 4);
+
+        std::fs::remove_file(&saved[0]).unwrap();
+        let (status, _) = send(&app, "POST", "/api/checkpoint/save", &[]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mut zero = ServerOptions::new(0);
+        zero.checkpoint_dir = checkpoint_dir.path().to_path_buf();
+        zero.max_saved_checkpoints = 0;
+        assert!(create_router_with_options(test_engine(), zero).is_err());
+    }
+
+    #[test]
+    fn only_server_generated_names_count_as_saved_checkpoints() {
+        assert!(is_saved_checkpoint_name(
+            "checkpoint_1794873278799_000003.json"
+        ));
+        for name in [
+            "checkpoint_000050.json",
+            "checkpoint_1794873278799_000003.json.tmp",
+            ".checkpoint_1794873278799_000003.json.tmp.1.2",
+            "checkpoint__000003.json",
+            "checkpoint_17_x.json",
+            "other_17_3.json",
+        ] {
+            assert!(!is_saved_checkpoint_name(name), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_checkpoint_save_is_refused_while_one_is_running() {
+        let checkpoint_dir = tempfile::tempdir().unwrap();
+        let state = test_state(test_engine(), checkpoint_dir.path());
+        let save = |state: Arc<ServerState>| {
+            handle_checkpoint_save(
+                State(state),
+                HeaderMap::new(),
+                Json(SaveCheckpointRequest { description: None }),
+            )
+        };
+
+        // Stand in for a save whose blocking write is still in progress after
+        // its request timed out: the detached task owns the only slot.
+        let running = Arc::clone(&state.checkpoint_save_slot)
+            .try_acquire_owned()
+            .unwrap();
+        let (status, Json(error)) = save(Arc::clone(&state)).await.unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error.code, "checkpoint_in_progress");
+        assert!(
+            std::fs::read_dir(checkpoint_dir.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+
+        drop(running);
+        let _saved = save(Arc::clone(&state))
+            .await
+            .expect("the slot is free again");
+        assert_eq!(state.checkpoint_save_slot.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_ranked_read_keeps_its_slot_until_its_blocking_work_ends() {
+        let checkpoint_dir = tempfile::tempdir().unwrap();
+        let state = test_state(test_engine(), checkpoint_dir.path());
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+
+        let request_state = Arc::clone(&state);
+        let request = tokio::spawn(async move {
+            ranked_read(&request_state, move |_engine| {
+                let _ = blocked.recv();
+            })
+            .await
+        });
+        let in_use = |state: &ServerState| {
+            MAX_CONCURRENT_RANKED_READS - state.ranked_read_slots.available_permits()
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while in_use(&state) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the read should start");
+
+        // A request timeout or disconnect drops the handler future, but the
+        // blocking work it started cannot be interrupted.
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            in_use(&state),
+            1,
+            "an abandoned read still occupies its slot"
+        );
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while in_use(&state) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the slot should be released when the work ends");
+    }
+
+    #[tokio::test]
+    async fn dashboard_directory_must_not_contain_a_checkpoint_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let dashboard = root.path().join("dashboard");
+        let outside = root.path().join("checkpoints");
+        std::fs::create_dir_all(dashboard.join("nested")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let router = |checkpoint_dir: &Path, engine: HolaEngine| {
+            let mut options = ServerOptions::new(0);
+            options.dashboard_dir = Some(dashboard.clone());
+            options.checkpoint_dir = checkpoint_dir.to_path_buf();
+            create_router_with_dashboard_and_options(engine, options)
+        };
+
+        assert!(router(&outside, test_engine()).is_ok());
+        // The dashboard may live inside the checkpoint directory's parent.
+        assert!(router(root.path(), test_engine()).is_ok());
+        for exposed in [
+            dashboard.clone(),
+            dashboard.join("nested"),
+            dashboard.join("new"),
+        ] {
+            let error = router(&exposed, test_engine()).unwrap_err().to_string();
+            assert!(
+                error.contains("contains the checkpoint directory"),
+                "{error}"
+            );
+        }
+        assert!(
+            !dashboard.join("new").exists(),
+            "a rejected configuration must not create its checkpoint directory"
+        );
+
+        // Automatic checkpoints configured in the study are covered as well.
+        let mut config = test_engine().study_config().await;
+        config.checkpoint = Some(crate::hola_engine::CheckpointConfig {
+            directory: dashboard.join("auto").to_string_lossy().into_owned(),
+            interval: 10,
+            max_checkpoints: None,
+            load_from: None,
+        });
+        let engine = HolaEngine::from_config(config).unwrap();
+        let error = router(&outside, engine).unwrap_err().to_string();
+        assert!(
+            error.contains("contains the checkpoint directory"),
+            "{error}"
+        );
+
+        #[cfg(unix)]
+        {
+            // Written beneath the dashboard, resolving elsewhere: still served.
+            std::os::unix::fs::symlink(&outside, dashboard.join("link")).unwrap();
+            let error = router(&dashboard.join("link"), test_engine())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("contains the checkpoint directory"),
+                "{error}"
+            );
+
+            // Written elsewhere, resolving beneath the dashboard through a
+            // symlinked parent, and not created yet.
+            std::os::unix::fs::symlink(&dashboard, root.path().join("alias")).unwrap();
+            let error = router(&root.path().join("alias").join("later"), test_engine())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("contains the checkpoint directory"),
+                "{error}"
+            );
+            assert!(!dashboard.join("later").exists());
+        }
+    }
+
+    /// Serve a health-only router with small connection limits.
+    async fn limited_server(
+        limits: ConnectionLimits,
+    ) -> (
+        std::net::SocketAddr,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let app = Router::new().route("/healthz", get(handle_health));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_listener_with_limits(
+            listener,
+            app,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_secs(2),
+            limits,
+        ));
+        (address, shutdown_tx, server)
+    }
+
+    /// Read until the peer closes the socket; a reset counts as closed.
+    async fn read_until_closed(client: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match client.read(&mut chunk).await {
+                Ok(0) | Err(_) => return received,
+                Ok(read) => received.extend_from_slice(&chunk[..read]),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_request_heads_and_idle_connections_are_closed() {
+        let (address, shutdown, server) = limited_server(ConnectionLimits {
+            head_timeout: Duration::from_millis(200),
+            max_connections: 8,
+        })
+        .await;
+
+        // A request head that never completes.
+        let mut stalled = tokio::net::TcpStream::connect(address).await.unwrap();
+        stalled
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+        // A connection that sends nothing at all.
+        let mut silent = tokio::net::TcpStream::connect(address).await.unwrap();
+        // A keep-alive connection that goes idle after one complete request.
+        let mut idle = tokio::net::TcpStream::connect(address).await.unwrap();
+        idle.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        let (stalled, silent, idle) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                read_until_closed(&mut stalled),
+                read_until_closed(&mut silent),
+                read_until_closed(&mut idle),
+            )
+        })
+        .await
+        .expect("the server should close every connection at its head timeout");
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(
+            stalled.is_empty() || stalled.starts_with(b"HTTP/1.1 408"),
+            "{}",
+            String::from_utf8_lossy(&stalled)
+        );
+        assert!(silent.is_empty() || silent.starts_with(b"HTTP/1.1 408"));
+        assert!(
+            idle.starts_with(b"HTTP/1.1 200 OK"),
+            "the complete request is served"
+        );
+
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn connections_beyond_the_limit_are_closed_until_a_slot_frees() {
+        let (address, shutdown, server) = limited_server(ConnectionLimits {
+            head_timeout: Duration::from_secs(30),
+            max_connections: 2,
+        })
+        .await;
+        let request = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+        // Two connections that hold their slots by staying silent.
+        let first = tokio::net::TcpStream::connect(address).await.unwrap();
+        let second = tokio::net::TcpStream::connect(address).await.unwrap();
+        // The listener accepts in order, so by the time a third connection is
+        // refused the first two own both slots.
+        let mut third = tokio::net::TcpStream::connect(address).await.unwrap();
+        let _ = third.write_all(request).await;
+        let refused = tokio::time::timeout(Duration::from_secs(5), read_until_closed(&mut third))
+            .await
+            .expect("a connection over the limit should be closed promptly");
+        assert!(refused.is_empty(), "{}", String::from_utf8_lossy(&refused));
+
+        drop(first);
+        let served = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+                let _ = client.write_all(request).await;
+                let response = read_until_closed(&mut client).await;
+                if response.starts_with(b"HTTP/1.1 200 OK") {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        served.expect("a freed slot should admit a new connection");
+
+        drop(second);
+        shutdown.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn cancelled_http_tell_future_does_not_cancel_commit_or_duplicate_event() {
         let engine = HolaEngine::from_config(StudyConfig {
@@ -1667,6 +2689,10 @@ mod tests {
             lease_duration: Duration::from_secs(60),
             tell_lock: Arc::new(tokio::sync::Mutex::new(())),
             mutation_task_slots: Arc::new(Semaphore::new(MAX_DETACHED_MUTATIONS)),
+            event_stream_slots: Arc::new(Semaphore::new(MAX_EVENT_STREAMS)),
+            ranked_read_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_RANKED_READS)),
+            checkpoint_save_slot: Arc::new(Semaphore::new(1)),
+            max_saved_checkpoints: DEFAULT_MAX_SAVED_CHECKPOINTS,
             http_requests_total: AtomicU64::new(0),
             http_failures_total: AtomicU64::new(0),
             http_latency_micros_total: AtomicU64::new(0),
