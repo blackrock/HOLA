@@ -44,8 +44,13 @@ dashboard can connect from any language or machine.
 ## Quick Start
 
 ```bash
-pip install hola-opt --extra-index-url https://blackrock.github.io/HOLA/simple/
+pip install --require-hashes -r https://raw.githubusercontent.com/blackrock/HOLA/main/install/hola-opt-requirements.txt
 ```
+
+`hola-opt` is not published on PyPI. Install only with the command
+above, which verifies every wheel against a pinned SHA-256 digest, and
+never add this project's index to an install with `--extra-index-url`.
+See [Installation](getting-started.md#installation) for details.
 
 ```python
 from hola_opt import Study, Space, Real, Integer, Categorical, Minimize
