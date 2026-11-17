@@ -761,17 +761,94 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
     )
 }
 
+/// Buffered checkpoint file writer that refuses to write more bytes than the
+/// loader accepts.
+///
+/// Without this bound a study with a large retained history could save a
+/// checkpoint that [`read_checkpoint_capped`] then rejects, which is only
+/// discovered when the checkpoint is needed.
+pub struct CheckpointWriter {
+    inner: BufWriter<File>,
+    remaining: u64,
+    limit: u64,
+}
+
+impl Write for CheckpointWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let len = buf.len() as u64;
+        if len > self.remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                format!(
+                    "checkpoint exceeds the {}-byte limit accepted when loading",
+                    self.limit
+                ),
+            ));
+        }
+        let written = self.inner.write(buf)?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Create a new file that only its owner can read or write.
+///
+/// Checkpoints hold the full study state. On Unix the mode is 0600 regardless
+/// of the process umask; on other platforms the file inherits the access
+/// control of its directory.
+fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Create a checkpoint directory and any missing parents, readable only by
+/// their owner on Unix (mode 0700).
+///
+/// Directories that already exist keep their permissions, so an operator who
+/// wants to share checkpoints can prepare the directory beforehand.
+pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 /// Write JSON to a file atomically: write to a unique temp file, fsync, rename,
 /// then fsync the parent directory. Prevents data loss if the process crashes
 /// mid-write, and cleans up the temp file on every error path.
+///
+/// The file is created private to its owner, and the write fails with
+/// [`io::ErrorKind::FileTooLarge`] rather than produce a file larger than
+/// [`MAX_CHECKPOINT_BYTES`], which could not be loaded again.
 pub fn atomic_write_json<F>(path: &Path, write_fn: F) -> io::Result<()>
 where
-    F: FnOnce(&mut BufWriter<File>) -> Result<(), serde_json::Error>,
+    F: FnOnce(&mut CheckpointWriter) -> Result<(), serde_json::Error>,
+{
+    atomic_write_json_capped(path, MAX_CHECKPOINT_BYTES, write_fn)
+}
+
+fn atomic_write_json_capped<F>(path: &Path, limit: u64, write_fn: F) -> io::Result<()>
+where
+    F: FnOnce(&mut CheckpointWriter) -> Result<(), serde_json::Error>,
 {
     let (tmp, file) = (0..100)
         .find_map(|_| {
             let tmp = unique_temp_path(path);
-            match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            match create_private_file(&tmp) {
                 Ok(file) => Some(Ok((tmp, file))),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
                 Err(error) => Some(Err(error)),
@@ -788,9 +865,15 @@ where
     // After the temp file exists, remove it on any error so a failed write never
     // leaks a leftover temp.
     let result = (|| {
-        let mut writer = BufWriter::new(file);
-        write_fn(&mut writer).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let file = writer.into_inner().map_err(|e| e.into_error())?;
+        let mut writer = CheckpointWriter {
+            inner: BufWriter::new(file),
+            remaining: limit,
+            limit,
+        };
+        // `io::Error::from` keeps the kind of an underlying I/O failure (disk
+        // full, size limit) and reports serialization failures as InvalidData.
+        write_fn(&mut writer).map_err(io::Error::from)?;
+        let file = writer.inner.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
         replace_file(&tmp, path)
     })();
@@ -1411,6 +1494,61 @@ mod tests {
             leftovers.is_empty(),
             "no temp files should remain: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn test_atomic_write_refuses_to_exceed_the_loader_limit() {
+        // A checkpoint the loader would reject must fail at write time, leave
+        // no partial or temporary file, and keep the previous checkpoint.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capped.json");
+        atomic_write_json_capped(&path, 64, |w| serde_json::to_writer(w, &"previous")).unwrap();
+
+        let payload = "x".repeat(4096);
+        let error = atomic_write_json_capped(&path, 64, |w| serde_json::to_writer(w, &payload))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
+        assert!(error.to_string().contains("64-byte limit"), "{error}");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "\"previous\"");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["capped.json"]);
+
+        // A payload of exactly the limit is still accepted.
+        let exact = "y".repeat(62);
+        atomic_write_json_capped(&path, 64, |w| serde_json::to_writer(w, &exact)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_checkpoint_files_and_new_directories_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let nested = shared.join("a").join("b");
+        create_private_dir_all(&nested).unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&nested), 0o700);
+        assert_eq!(mode(&shared.join("a")), 0o700);
+        // A directory that already existed keeps the access its owner chose.
+        assert_eq!(mode(&shared), 0o755);
+        create_private_dir_all(&nested).unwrap();
+
+        let path = nested.join("checkpoint.json");
+        atomic_write_json(&path, |w| serde_json::to_writer(w, &1)).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        // Replacing an existing checkpoint keeps it private.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write_json(&path, |w| serde_json::to_writer(w, &2)).unwrap();
+        assert_eq!(mode(&path), 0o600);
     }
 
     #[test]

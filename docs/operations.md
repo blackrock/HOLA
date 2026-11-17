@@ -25,6 +25,18 @@ Terminate TLS at a trusted reverse proxy when traffic leaves the host. Do not
 use `--allow-unauthenticated-reads` when parameters, metrics, or study progress
 are sensitive.
 
+A server started without a token binds to loopback and only answers requests
+whose `Host` header names `localhost` or a loopback IP address. Other host
+names receive HTTP 403 (`host_forbidden`), which keeps web pages from reaching
+a local server through DNS rebinding. A reverse proxy that forwards its public
+host name therefore needs a token-protected server.
+
+Files under `--dashboard` are served to anyone who can reach the server,
+without a token, because the UI has to load before a token can be entered. The
+server refuses to start when that directory contains `--checkpoint-dir` or the
+study's automatic checkpoint directory. Keep only the dashboard's own files in
+it.
+
 ## Health and readiness
 
 The unauthenticated probe endpoints do not expose study data:
@@ -106,6 +118,52 @@ study configuration. Pending IDs remain valid, so late workers can report their
 results without ID reuse. A checkpoint with an unsupported format, incompatible
 study configuration, or inconsistent counts is rejected before live state
 changes.
+
+Only one save runs at a time; a second request receives HTTP 409
+(`checkpoint_in_progress`). A save that has started finishes even if the
+request times out, and the server log then records the `path` it wrote. The
+server keeps at most 32 saved files (`--max-saved-checkpoints`) and never
+deletes one itself: when the limit is reached, further saves receive HTTP 409
+(`checkpoint_quota_exceeded`) until you archive or remove older
+`checkpoint_<time>_<sequence>.json` files. Automatic checkpoints configured in
+the study are rotated separately by `max_checkpoints`.
+
+Checkpoints contain the full study state. On Linux and macOS, HOLA creates
+checkpoint files readable and writable only by the server's user (mode 0600),
+and creates missing checkpoint directories with mode 0700. A directory that
+already exists keeps its permissions, so to share checkpoints with a group,
+create the directory yourself and adjust the files you want to share. On
+Windows the files inherit the access control of their directory.
+
+A checkpoint larger than 512 MiB cannot be loaded, so a save that would exceed
+that size fails without writing anything. Bound the retained history with
+`max_leaderboard_size` if a study approaches it.
+
+## Resource limits
+
+The server bounds what a client can make it hold or compute; the
+[REST API reference](rest-api.md#limits) lists every limit. The ones that
+matter for capacity planning:
+
+- **Connections.** At most 1024 connections are open at once; further ones are
+  closed as they arrive. A client has 120 seconds to send a complete request
+  head, and an idle keep-alive connection is closed after the same time. Put a
+  reverse proxy in front of the server when it faces a network you do not
+  control: the proxy should terminate TLS, limit connections per client, and
+  keep its upstream keep-alive timeout below 120 seconds.
+- **Event streams.** At most 64 `/api/events` streams are open at once. Each
+  dashboard tab uses one.
+- **Ranked reads.** `top_k`, `pareto_front`, `trials`, and single-trial reads
+  rank the retained history. Four run at a time on a separate thread pool, so
+  large reads queue behind each other instead of delaying tells and probes.
+- **Retained history.** The server keeps every completed trial and its
+  reported metrics unless the study sets `max_leaderboard_size`. Memory,
+  ranking time, and checkpoint size all grow with that history, and any client
+  holding the write token can add to it. Set `max_trials` to stop at a budget
+  and `max_leaderboard_size` to cap what is retained.
+- **Dimensions.** The `gmm` and `auto` strategies accept at most 1024
+  parameters, because each mixture component stores a dense covariance matrix.
+  Use `random` for larger spaces.
 
 ## Graceful shutdown
 

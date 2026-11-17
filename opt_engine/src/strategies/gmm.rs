@@ -48,6 +48,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 const WEIGHT_SUM_TOLERANCE: f64 = 1e-9;
+
+/// Largest dimensionality a Gaussian component may have.
+///
+/// Every component stores a dense `dim x dim` covariance matrix and factorizes
+/// it, so memory grows quadratically and work cubically with the dimension. A
+/// short configuration or checkpoint could otherwise request an allocation far
+/// larger than the document that describes it. 1024 dimensions (8 MiB per
+/// matrix) is well beyond what a full-covariance mixture can be fitted to with
+/// realistic trial budgets.
+pub const MAX_GMM_DIMS: usize = 1024;
+
+/// Reject a dimensionality whose dense covariance must not be allocated.
+fn check_gmm_dimension(dim: usize) -> Result<(), GmmError> {
+    if dim > MAX_GMM_DIMS {
+        return Err(GmmError::InvalidCount {
+            parameter: "GMM dimensions",
+            value: dim,
+            maximum: Some(MAX_GMM_DIMS),
+        });
+    }
+    Ok(())
+}
 const COVARIANCE_SYMMETRY_TOLERANCE: f64 = 1e-12;
 /// `sobol_burley` supports 256 dimensions and 2^16 points per scrambled
 /// sequence. Logical dimensions and later samples are assigned deterministic
@@ -427,6 +449,8 @@ impl GaussianComponent {
                 context: "Gaussian mean",
             });
         }
+        // Before the O(dim^2) validation passes and the O(dim^3) factorization.
+        check_gmm_dimension(dim)?;
         for (index, &value) in mean.iter().enumerate() {
             if !value.is_finite() {
                 return Err(GmmError::NonFiniteValue {
@@ -516,6 +540,7 @@ impl GaussianComponent {
             });
         }
         let dim = mean.len();
+        check_gmm_dimension(dim)?;
         let covariance = DMatrix::identity(dim, dim) * variance;
         Self::new(mean, covariance)
     }
@@ -541,6 +566,7 @@ impl GaussianComponent {
                 });
             }
         }
+        check_gmm_dimension(dim)?;
         let covariance = DMatrix::from_diagonal(&variances);
         Self::new(mean, covariance)
     }
@@ -797,6 +823,7 @@ impl GmmParams {
                 context: "uniform prior",
             });
         }
+        check_gmm_dimension(dim)?;
         let mean = DVector::from_element(dim, 0.5);
         Self::single(GaussianComponent::isotropic(mean, variance)?)
     }
@@ -907,6 +934,7 @@ impl GmmParams {
                 context: "GMM samples",
             });
         }
+        check_gmm_dimension(dim)?;
         for (sample_index, sample) in samples.iter().enumerate() {
             if sample.len() != dim {
                 return Err(GmmError::RaggedSample {
@@ -1897,6 +1925,44 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dimensions_above_the_limit_are_rejected_before_allocation() {
+        // Each of these would otherwise allocate a dense dim x dim covariance
+        // (128 GiB at this size) or factorize one.
+        let dim = 131_072;
+        let too_large = |result: Result<(), GmmError>| {
+            assert_eq!(
+                result,
+                Err(GmmError::InvalidCount {
+                    parameter: "GMM dimensions",
+                    value: dim,
+                    maximum: Some(MAX_GMM_DIMS),
+                })
+            );
+        };
+        too_large(GmmParams::uniform_prior(dim, 0.1).map(|_| ()));
+        too_large(GmmStrategy::<()>::uniform_prior(7, dim, 0.1).map(|_| ()));
+        too_large(GaussianComponent::isotropic(DVector::from_element(dim, 0.5), 0.1).map(|_| ()));
+        too_large(
+            GaussianComponent::diagonal(
+                DVector::from_element(dim, 0.5),
+                DVector::from_element(dim, 0.1),
+            )
+            .map(|_| ()),
+        );
+        too_large(
+            GmmParams::fit(&[vec![0.5; dim], vec![0.25; dim]], 1, 10, 1e-6, 1e-6, 0).map(|_| ()),
+        );
+        // A component rebuilt from persisted parts is checked before its
+        // covariance is validated or factorized.
+        let over = MAX_GMM_DIMS + 1;
+        assert!(matches!(
+            GaussianComponent::new(DVector::from_element(over, 0.5), DMatrix::identity(over, over)),
+            Err(GmmError::InvalidCount { value, .. }) if value == over
+        ));
+        assert!(GmmParams::uniform_prior(8, 0.1).is_ok());
+    }
     use crate::test_helpers::UnitSquare;
     use crate::traits::SampleSpace;
 
