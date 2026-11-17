@@ -13,6 +13,12 @@
   daily workflow reports any `hola-opt` registration or file on PyPI that this
   repository did not release. When this change was made the name was still
   unregistered on PyPI, so no impostor package is known to have existed.
+- Updated locked dependencies with published advisories: rustls 0.23.46,
+  rustls-webpki 0.103.17, webpki-roots 1.0.12, quinn-proto 0.11.19, and
+  quinn-udp 0.5.16 for the Rust clients, and certifi 2026.10.23 and Pillow
+  13.0.0 in the development and benchmark environments. Pillow 13 requires
+  Python 3.11, and no patched 12.x release exists, so Python 3.10 benchmark
+  environments stay on Pillow 12.3.0.
 
 ## 1.0.1-rc9
 
