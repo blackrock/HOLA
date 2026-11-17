@@ -29,8 +29,11 @@ function buildHtml() {
     const bridge = `
         window.S = S;
         for (const name of [
+            'apiFetch',
+            'apiJson',
             'applyCheckpointData',
             'checkpointDataToDashboard',
+            'clearApiToken',
             'computeRanksIfMissing',
             'connectToServer',
             'handleEngineEvent',
@@ -48,10 +51,14 @@ function buildHtml() {
             'replaceTrials',
             'sortTable',
             'resyncLiveState',
+            'startStream',
             'stopStream',
             'upsertTrial',
         ]) window[name] = eval(name);
         window.MAX_CHECKPOINT_BYTES = MAX_CHECKPOINT_BYTES;
+        window.MAX_SSE_RECORD_CHARS = MAX_SSE_RECORD_CHARS;
+        window.MAX_SSE_RECORDS_PER_READ = MAX_SSE_RECORDS_PER_READ;
+        window.MAX_EVENT_FETCHES = MAX_EVENT_FETCHES;
     `;
     return readFileSync(INDEX_HTML, 'utf8').replace(
         /<script\b[^>]*\bsrc=["']app\.js["']><\/script>/i,
@@ -60,11 +67,11 @@ function buildHtml() {
     );
 }
 
-function createDom(fetchImpl = () => new Promise(() => {})) {
+function createDom(fetchImpl = () => new Promise(() => {}), url = pathToFileURL(INDEX_HTML).href) {
     const alerts = [];
     const canvasCalls = [];
     const dom = new JSDOM(buildHtml(), {
-        url: pathToFileURL(INDEX_HTML).href,
+        url,
         runScripts: 'dangerously',
         pretendToBeVisual: true,
         beforeParse(window) {
@@ -1486,6 +1493,455 @@ test('event watermark replays a completion racing the initial REST snapshot', as
         assert.equal(window.S.trials[0].trial_id, 41);
         assert.equal(window.S.lastEventId, '1');
         assert.deepEqual(alerts, []);
+    } finally {
+        window.stopStream();
+        dom.window.close();
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Credentials, redirects, and bounds on what a server can make the page hold.
+// ---------------------------------------------------------------------------
+
+const tick = () => new Promise(resolvePromise => setImmediate(resolvePromise));
+
+// Start a connection and return its first request. The connection itself is
+// left waiting on that request; closing the window discards it.
+async function firstRequest(window, router, server, token = '', occurrence = 0) {
+    window.document.getElementById('server-url').value = server;
+    window.document.getElementById('api-token').value = token;
+    void window.connectToServer();
+    return router.waitFor(`${server}/api/event_cursor`, occurrence);
+}
+
+function authorization(request) {
+    return request.options.headers.get('Authorization');
+}
+
+function streamBody(...chunks) {
+    const pending = chunks.map(chunk => new TextEncoder().encode(chunk));
+    const state = { cancelled: false, reads: 0 };
+    return {
+        state,
+        body: {
+            getReader() {
+                return {
+                    read() {
+                        state.reads++;
+                        if (pending.length === 0) return Promise.resolve({ done: true });
+                        return Promise.resolve({ value: pending.shift(), done: false });
+                    },
+                    cancel() {
+                        state.cancelled = true;
+                        return Promise.resolve();
+                    },
+                };
+            },
+        },
+    };
+}
+
+test('a token in the query string is refused, stripped and reported', async () => {
+    const router = requestRouter();
+    const { dom, window } = createDom(
+        router.fetch, 'http://hola.test:8000/index.html?token=query-secret&view=1',
+    );
+    try {
+        assert.equal(window.location.href, 'http://hola.test:8000/index.html?view=1');
+        const notice = window.document.getElementById('connection-notice');
+        assert.equal(notice.hidden, false);
+        assert.match(notice.textContent, /\?token=/);
+        assert.match(notice.textContent, /rotate/);
+        assert.equal(notice.textContent.includes('query-secret'), false);
+        assert.equal(window.document.getElementById('token-status').textContent, '');
+
+        const request = await firstRequest(window, router, 'http://hola.test:8000');
+        assert.equal(authorization(request), null);
+    } finally {
+        dom.window.close();
+    }
+});
+
+test('a fragment token is erased at load and bound to the server that served the page', async () => {
+    const router = requestRouter();
+    const { dom, window } = createDom(
+        router.fetch, 'http://hola.test:8000/#token=frag%2Bsecret%20x&panel=pareto',
+    );
+    try {
+        assert.equal(window.location.href, 'http://hola.test:8000/#panel=pareto');
+        assert.equal(router.requests.size, 0, 'no request may precede erasing the token');
+        const status = window.document.getElementById('token-status');
+        assert.equal(status.textContent, 'Token set for http://hola.test:8000');
+        assert.equal(window.document.getElementById('api-token').value, '');
+        assert.equal(window.document.documentElement.outerHTML.includes('frag+secret'), false);
+
+        // An empty URL field falls back to localhost, which is not the server
+        // the link named: the token must not follow it there.
+        window.document.getElementById('server-url').value = '';
+        void window.connectToServer();
+        const local = await router.waitFor('http://localhost:8000/api/event_cursor');
+        assert.equal(authorization(local), null);
+        assert.equal(status.textContent, '');
+
+        // Dropped means dropped: returning to the original origin does not
+        // resurrect it.
+        const back = await firstRequest(window, router, 'http://hola.test:8000');
+        assert.equal(authorization(back), null);
+    } finally {
+        dom.window.close();
+    }
+});
+
+test('a fragment token follows ?server= and the page auto-connects with it', async () => {
+    const router = requestRouter();
+    const { dom, window } = createDom(
+        router.fetch, 'http://dash.test/?server=http%3A%2F%2Fapi.test%3A8000#token=link-token',
+    );
+    try {
+        assert.equal(window.location.href, 'http://dash.test/?server=http%3A%2F%2Fapi.test%3A8000');
+        const request = await router.waitFor('http://api.test:8000/api/event_cursor');
+        assert.equal(authorization(request), 'Bearer link-token');
+        // The dashboard's own origin is a different origin and gets nothing.
+        void window.apiFetch('http://dash.test/api/space');
+        assert.equal(authorization(await router.waitFor('http://dash.test/api/space')), null);
+    } finally {
+        dom.window.close();
+    }
+});
+
+test('a fragment token on a page opened from disk binds to the first connection only', async () => {
+    const router = requestRouter();
+    const { dom, window } = createDom(
+        router.fetch, `${pathToFileURL(INDEX_HTML).href}#token=disk-token`,
+    );
+    try {
+        assert.equal(window.location.hash, '');
+        assert.match(
+            window.document.getElementById('token-status').textContent, /next server you connect to/,
+        );
+        const first = await firstRequest(window, router, 'http://first.test');
+        assert.equal(authorization(first), 'Bearer disk-token');
+        const second = await firstRequest(window, router, 'http://second.test');
+        assert.equal(authorization(second), null);
+    } finally {
+        dom.window.close();
+    }
+});
+
+test('a token navigated to in the fragment of an open page is captured and erased', async () => {
+    const router = requestRouter();
+    const { dom, window } = createDom(router.fetch, 'http://hola.test:8000/');
+    try {
+        window.location.hash = '#token=late-token';
+        for (let i = 0; i < 20 && window.location.hash !== ''; i++) await tick();
+        assert.equal(window.location.href, 'http://hola.test:8000/');
+        const request = await firstRequest(window, router, 'http://hola.test:8000');
+        assert.equal(authorization(request), 'Bearer late-token');
+    } finally {
+        dom.window.close();
+    }
+});
+
+test('a typed token leaves the form field and never reaches another origin', async () => {
+    const router = requestRouter();
+    const { dom, window } = createDom(router.fetch);
+    const field = window.document.getElementById('api-token');
+    const status = window.document.getElementById('token-status');
+    try {
+        const a = await firstRequest(window, router, 'https://a.test', 'token-for-a');
+        assert.equal(authorization(a), 'Bearer token-for-a');
+        assert.equal(field.value, '', 'the token must not linger in the form');
+        assert.equal(status.textContent, 'Token set for https://a.test');
+
+        // While bound to A, no request to another origin carries the token:
+        // a different host, a different port, and a scheme downgrade.
+        for (const url of ['https://b.test/api/space', 'https://a.test:8443/api/space',
+            'http://a.test/api/space']) {
+            void window.apiFetch(url);
+            assert.equal(authorization(await router.waitFor(url)), null, url);
+        }
+
+        // Reconnecting to the same origin keeps it without retyping.
+        const again = await firstRequest(window, router, 'https://a.test', '', 1);
+        assert.equal(authorization(again), 'Bearer token-for-a');
+
+        // Changing the server without supplying a token drops it.
+        const b = await firstRequest(window, router, 'https://b.test');
+        assert.equal(authorization(b), null);
+        assert.equal(status.textContent, '');
+
+        // A token supplied for the new origin is used there, and only there.
+        const c = await firstRequest(window, router, 'https://c.test', 'token-for-c');
+        assert.equal(authorization(c), 'Bearer token-for-c');
+        void window.apiFetch('https://a.test/api/objectives');
+        assert.equal(authorization(await router.waitFor('https://a.test/api/objectives')), null);
+
+        window.clearApiToken();
+        void window.apiFetch('https://c.test/api/space');
+        assert.equal(authorization(await router.waitFor('https://c.test/api/space')), null);
+        assert.equal(status.textContent, '');
+    } finally {
+        dom.window.close();
+    }
+});
+
+test('a token sent over unencrypted HTTP beyond this machine raises a visible warning', async () => {
+    const router = requestRouter();
+    const { dom, window, alerts } = createDom(router.fetch);
+    const notice = window.document.getElementById('connection-notice');
+    try {
+        for (const server of ['http://127.0.0.1:8000', 'http://localhost:8000',
+            'http://[::1]:8000', 'https://remote.test']) {
+            assert.equal(authorization(await firstRequest(window, router, server, 't')), 'Bearer t');
+            assert.equal(notice.hidden, true, server);
+        }
+        // Without a token there is nothing to expose.
+        await firstRequest(window, router, 'http://remote.test:8000');
+        assert.equal(notice.hidden, true);
+        // The warning informs; it does not block the request.
+        const remote = await firstRequest(window, router, 'http://remote.test:8000', 't', 1);
+        assert.equal(authorization(remote), 'Bearer t');
+        assert.equal(notice.hidden, false);
+        assert.match(notice.textContent, /not encrypted/);
+        assert.match(notice.textContent, /http:\/\/remote\.test:8000/);
+        window.clearApiToken();
+        assert.equal(notice.hidden, true);
+
+        // A URL without an http(s) origin cannot hold a token and is refused.
+        window.document.getElementById('server-url').value = 'remote.test:8000';
+        await window.connectToServer();
+        assert.match(alerts.at(-1), /must start with http/);
+    } finally {
+        dom.window.close();
+    }
+});
+
+test('every API request, including the event stream, refuses redirects', async () => {
+    const router = requestRouter();
+    const { dom, window } = createDom(router.fetch);
+    const server = 'http://redirect.test';
+    try {
+        const cursor = await firstRequest(window, router, server);
+        assert.equal(cursor.options.redirect, 'error');
+
+        window.S.mode = 'live';
+        window.S.objectives = [{ field: 'loss', type: 'minimize', priority: 1 }];
+        void window.applyObjectives();
+        const patch = await router.waitFor(`${server}/api/objectives`);
+        assert.equal(patch.options.method, 'PATCH');
+        assert.equal(patch.options.redirect, 'error');
+
+        window.startStream();
+        const stream = await router.waitFor(`${server}/api/events`);
+        assert.equal(stream.options.redirect, 'error');
+    } finally {
+        window.stopStream();
+        dom.window.close();
+    }
+});
+
+test('REST bodies are counted while they arrive and cut off at the cap', async () => {
+    let response;
+    const { dom, window } = createDom(() => Promise.resolve(response));
+    const url = 'http://cap.test/api/space';
+    try {
+        // No Content-Length at all: the cap still applies to the bytes read.
+        const flood = streamBody('{"params":[', '"aaaaaaaaaaaaaaaa",', '"bbbbbbbbbbbbbbbb"]}');
+        response = { ok: true, status: 200, body: flood.body };
+        await assert.rejects(window.apiJson(url, { maxBytes: 32 }), /exceeds the/);
+        assert.equal(flood.state.cancelled, true);
+        assert.equal(flood.state.reads, 3, 'reading stops at the chunk that crosses the cap');
+
+        // An honest oversized Content-Length is rejected before reading.
+        const declared = streamBody('{}');
+        response = {
+            ok: true, status: 200, body: declared.body,
+            headers: new Headers({ 'Content-Length': '1000' }),
+        };
+        await assert.rejects(window.apiJson(url, { maxBytes: 32 }), /exceeds the/);
+        assert.equal(declared.state.reads, 0);
+        assert.equal(declared.state.cancelled, true);
+
+        // Within the cap, a body split inside a multi-byte character parses.
+        const bytes = new TextEncoder().encode('{"name":"é"}');
+        const pieces = [bytes.slice(0, 10), bytes.slice(10)];
+        response = {
+            ok: true, status: 200,
+            body: { getReader: () => ({ read: async () => (pieces.length
+                ? { value: pieces.shift(), done: false } : { done: true }) }) },
+        };
+        const parsed = await window.apiJson(url, { maxBytes: 32 });
+        assert.equal(parsed.ok, true);
+        assert.equal(parsed.data.name, 'é');
+
+        // An oversized error body is discarded; the status still comes back.
+        response = { ok: false, status: 500, body: streamBody('x'.repeat(64)).body };
+        assert.deepEqual({ ...await window.apiJson(url, { maxBytes: 32 }) },
+            { ok: false, status: 500, data: null });
+    } finally {
+        dom.window.close();
+    }
+});
+
+test('a REST request that is never answered fails at its deadline', async () => {
+    let signal;
+    const { dom, window } = createDom((_url, options) => new Promise((_resolve, reject) => {
+        signal = options.signal;
+        signal.addEventListener('abort', () => reject(new Error('aborted')));
+    }));
+    try {
+        await assert.rejects(
+            window.apiJson('http://slow.test/api/space', { timeoutMs: 20 }),
+            /did not answer within/,
+        );
+        assert.equal(signal.aborted, true);
+    } finally {
+        dom.window.close();
+    }
+});
+
+test('a body that stalls after the headers also fails at the deadline', async () => {
+    const { dom, window } = createDom((_url, options) => Promise.resolve({
+        ok: true, status: 200,
+        body: { getReader: () => ({
+            read: () => new Promise((_resolve, reject) => {
+                options.signal.addEventListener('abort', () => reject(new Error('aborted')));
+            }),
+        }) },
+    }));
+    try {
+        await assert.rejects(
+            window.apiJson('http://slow.test/api/trials', { timeoutMs: 20 }),
+            /did not answer within/,
+        );
+    } finally {
+        dom.window.close();
+    }
+});
+
+async function openStream(window, router, server, occurrence = 0) {
+    window.S.mode = 'live';
+    window.S.serverUrl = server;
+    window.startStream();
+    return router.waitFor(`${server}/api/events`, occurrence);
+}
+
+function endlessBody(...chunks) {
+    const pending = chunks.map(chunk => new TextEncoder().encode(chunk));
+    return {
+        getReader: () => ({
+            read: () => (pending.length
+                ? Promise.resolve({ value: pending.shift(), done: false })
+                : new Promise(() => {})),
+        }),
+    };
+}
+
+test('an event stream record larger than the cap drops the stream and resyncs', async () => {
+    for (const oversized of [
+        // Never terminated: the buffer would otherwise grow without bound.
+        ['data: ' + 'x'.repeat(600_000), 'x'.repeat(600_000)],
+        // Terminated, but delivered in one read.
+        ['data: ' + 'x'.repeat(1_100_000) + '\n\n'],
+    ]) {
+        const router = requestRouter();
+        const { dom, window } = createDom(router.fetch);
+        const server = 'http://flood.test';
+        try {
+            assert.equal(window.MAX_SSE_RECORD_CHARS, 1024 * 1024);
+            const stream = await openStream(window, router, server);
+            const active = window.S.sse;
+            stream.resolve({ ok: true, status: 200, body: endlessBody(...oversized) });
+            for (let i = 0; i < 50 && window.S.sse === active; i++) await tick();
+            assert.equal(window.S.sse, null, 'the oversized stream must be stopped');
+            assert.equal(active.signal.aborted, true);
+            assert.notEqual(window.S.resyncRetryTimer, null, 'a delayed resync must be scheduled');
+            assert.equal(router.requests.has(`${server}/api/event_cursor`), false,
+                'the resync waits for its delay instead of looping immediately');
+            assert.match(window.document.getElementById('sse-dot').className, /disconnected/);
+        } finally {
+            window.stopStream();
+            dom.window.close();
+        }
+    }
+});
+
+test('a burst of more records than one read may apply drops the stream', async () => {
+    const router = requestRouter();
+    const { dom, window } = createDom(router.fetch);
+    const server = 'http://burst.test';
+    const record = id => `id: ${id}\ndata: {"type":"TrialCompleted","trial_id":${id},`
+        + `"trial":{"trial_id":${id},"metrics":{"loss":1},"score_vector":{"loss":1}}}\n\n`;
+    try {
+        const limit = window.MAX_SSE_RECORDS_PER_READ;
+        // Exactly the limit is applied in full.
+        const within = await openStream(window, router, server);
+        const first = window.S.sse;
+        within.resolve({
+            ok: true, status: 200,
+            body: endlessBody(Array.from({ length: limit }, (_, id) => record(id)).join('')),
+        });
+        for (let i = 0; i < 50 && window.S.trials.length < limit; i++) await tick();
+        assert.equal(window.S.trials.length, limit);
+        assert.equal(window.S.sse, first, 'a burst within the limit keeps the stream');
+
+        // One more than the limit stops applying records and schedules a resync.
+        const beyond = await openStream(window, router, server, 1);
+        const second = window.S.sse;
+        beyond.resolve({
+            ok: true, status: 200,
+            body: endlessBody(
+                Array.from({ length: limit + 1 }, (_, id) => record(limit + id)).join(''),
+            ),
+        });
+        for (let i = 0; i < 50 && window.S.sse === second; i++) await tick();
+        assert.equal(window.S.sse, null);
+        assert.equal(window.S.trials.length, 2 * limit, 'the record past the limit is not applied');
+        assert.notEqual(window.S.resyncRetryTimer, null);
+    } finally {
+        window.stopStream();
+        dom.window.close();
+    }
+});
+
+test('events that need a trial fetch run a bounded number of requests', async () => {
+    const router = requestRouter();
+    const { dom, window } = createDom(router.fetch);
+    const server = 'http://fetches.test';
+    const trialUrl = id => `${server}/api/trial/${id}?include_infeasible=true`;
+    const trialRequests = () => Array.from(router.requests.keys())
+        .filter(key => key.startsWith(`${server}/api/trial/`)).length;
+    try {
+        window.S.mode = 'live';
+        window.S.serverUrl = server;
+        const limit = window.MAX_EVENT_FETCHES;
+        for (let id = 0; id < limit + 20; id++) {
+            void window.handleEngineEvent({ type: 'TrialCompleted', trial_id: id });
+        }
+        await tick();
+        assert.equal(trialRequests(), limit, 'no more than the limit may be in flight');
+        // The overflow collapses into a single snapshot refresh.
+        assert.equal(router.requests.get(`${server}/api/event_cursor`).length, 1);
+
+        // Finishing one request frees one slot.
+        (await router.waitFor(trialUrl(0))).resolve(jsonResponse({
+            trial_id: 0, metrics: { loss: 1 }, score_vector: { loss: 1 }, rank: 0, pareto_front: 0,
+        }));
+        for (let i = 0; i < 20 && window.S.trials.length === 0; i++) await tick();
+        assert.equal(window.S.trials.length, 1);
+        void window.handleEngineEvent({ type: 'TrialCompleted', trial_id: 500 });
+        void window.handleEngineEvent({ type: 'TrialCompleted', trial_id: 501 });
+        await tick();
+        assert.equal(trialRequests(), limit + 1);
+        assert.equal(router.requests.has(trialUrl(500)), true);
+        assert.equal(router.requests.has(trialUrl(501)), false);
+
+        // A failed fetch frees its slot too and does not surface as an error.
+        (await router.waitFor(trialUrl(1))).reject(new Error('network down'));
+        await tick();
+        void window.handleEngineEvent({ type: 'TrialCompleted', trial_id: 502 });
+        await tick();
+        assert.equal(router.requests.has(trialUrl(502)), true);
     } finally {
         window.stopStream();
         dom.window.close();

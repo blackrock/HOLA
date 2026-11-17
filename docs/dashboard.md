@@ -38,6 +38,60 @@ and loads the current state from `/api/trials`, `/api/space`, and
 `/api/objectives`. New trials appear in real time as workers report
 results.
 
+### API tokens
+
+When the server requires a token, type it into the **API token**
+field before clicking **Connect**. The dashboard keeps the token in
+memory only: it is not written to browser storage, and the field is
+emptied once the token has been read. The top bar then shows which
+server the token is set for. **Clear token** forgets it.
+
+A token belongs to the server it was entered for. The dashboard sends
+it only to that server's origin (scheme, host, and port). If you
+connect to a different server, the token is dropped and you must enter
+the token for the new one.
+
+A link can carry the token in the URL fragment, after `#`:
+
+```text
+http://localhost:8000/#token=YOUR_TOKEN
+```
+
+Browsers never send the fragment to a server, so the token does not
+reach an access log. The dashboard reads it before making any request
+and removes it from the address bar immediately. Such a token is used
+for the server named by `?server=` in the same link, or otherwise for
+the server that delivered the page. Opened from a file on disk with no
+`?server=`, it is used for the first server you connect to.
+
+Do not put the token in the query string (`?token=`). A query string
+is part of the request for the page itself, so the token has already
+been sent, and possibly logged, before the dashboard can remove it.
+The dashboard ignores such a token, removes it from the address bar,
+and asks you to rotate it.
+
+If a token would be sent over plain `http://` to a server that is not
+on this machine, the top bar warns that the connection is not
+encrypted. The request is still made. Put the server behind HTTPS when
+traffic leaves the host; see [Operations](operations.md).
+
+### Limits on server responses
+
+The dashboard refuses HTTP redirects on every API request, so enter the
+server's final address (for example its `https://` URL). It also bounds
+what one server can make the page download and process:
+
+| Limit | Value |
+|-------|-------|
+| `/api/trials` snapshot | 256 MiB, 120 s |
+| Any other API response | 4 MiB, 30 s (120 s to apply objectives or save a checkpoint) |
+| One event-stream record | 1 MiB |
+| Event-stream records applied per network read | 1,024 |
+
+A response over a limit fails with an error instead of loading. When
+the event stream exceeds a limit, the dashboard drops it, shows the
+disconnected state, and reloads a fresh snapshot a moment later.
+
 The status bar shows the following.
 
 **Connection status.**
