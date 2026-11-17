@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Security: the documented install command no longer uses
+  `--extra-index-url`. The `hola-opt` name is not registered on PyPI, and pip
+  treats every configured index as equally authoritative, so anyone
+  registering that name could have had their upload installed in place of
+  ours. Install with the hash-locked `install/hola-opt-requirements.txt`
+  instead, which resolves from this project's index only and pins the SHA-256
+  of every wheel. CI now rejects install instructions that add a second index
+  for `hola-opt` or install it by name from an index we do not control, and a
+  daily workflow reports any `hola-opt` registration or file on PyPI that this
+  repository did not release. When this change was made the name was still
+  unregistered on PyPI, so no impostor package is known to have existed.
+
 ## 1.0.1-rc9
 
 Development source version. The first official release remains pending the

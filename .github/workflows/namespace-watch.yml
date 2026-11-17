@@ -1,0 +1,83 @@
+name: Package Namespace Watch
+
+# hola-opt is installed from this repository's releases, and its name is not
+# registered on PyPI. This workflow reports the day that changes, or the day
+# PyPI offers a hola-opt file this repository did not release.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 7 * * *" # Daily, 07:23 UTC
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/namespace-watch.yml"
+      - ".github/scripts/check_pypi_namespace.py"
+      - ".github/scripts/check_install_docs.py"
+      - "install/**"
+  pull_request:
+    paths:
+      - ".github/workflows/namespace-watch.yml"
+      - ".github/scripts/check_pypi_namespace.py"
+      - ".github/scripts/check_install_docs.py"
+      - "install/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: namespace-watch-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pypi:
+    name: PyPI namespace
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Compare PyPI with this repository's releases
+        id: watch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/check_pypi_namespace.py 2>&1 | tee "$RUNNER_TEMP/namespace-watch.log"
+        shell: bash -eo pipefail {0}
+
+      # An alert is filed once and stays open until a maintainer has
+      # investigated. A run that merely could not reach PyPI or GitHub fails
+      # without filing anything.
+      - name: File an alert issue
+        if: failure() && steps.watch.outputs.alert == 'true' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="Unexpected hola-opt registration or release on PyPI"
+          open="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$title\"" --json number --jq 'length')"
+          if [[ "$open" != "0" ]]; then
+            echo "An alert issue is already open."
+            exit 0
+          fi
+          {
+            echo "The scheduled namespace watch found a state of PyPI that this"
+            echo "repository's releases do not explain:"
+            echo
+            echo '```'
+            grep '^ALERT:' "$RUNNER_TEMP/namespace-watch.log"
+            echo '```'
+            echo
+            echo "Do not direct users to install from PyPI until this has been"
+            echo "investigated. If the project or file is not ours, report it to"
+            echo "PyPI (https://pypi.org/security/) and keep the hash-locked"
+            echo "install command in the documentation."
+            echo
+            echo "Run: $RUN_URL"
+          } > "$RUNNER_TEMP/alert.md"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+            --body-file "$RUNNER_TEMP/alert.md"
