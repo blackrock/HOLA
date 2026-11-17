@@ -118,3 +118,35 @@ peak heap and compare it with the previous release.
     --signer-workflow blackrock/HOLA/.github/workflows/release.yml \
     --source-digest RELEASE_SHA
   ```
+
+## Install instructions and the public package namespace
+
+`hola-opt` is installed from this repository's releases, and the name is not
+registered on PyPI. Anyone who registers it there could have their upload
+installed by a command that consults PyPI, so the documented command is
+hash-locked and CI rejects any instruction that adds a second index.
+
+- Before pointing users at a new release, confirm the latest
+  [Package Namespace Watch](https://github.com/blackrock/HOLA/actions/workflows/namespace-watch.yml)
+  run is green and no alert issue is open. If `hola-opt` appears on PyPI and
+  we did not publish it, investigate and report it to PyPI before announcing
+  anything.
+- After the release is published, regenerate the hash-locked install file from
+  the digests GitHub recorded for the release assets, and merge it:
+
+  ```bash
+  gh api repos/blackrock/HOLA/releases/tags/vRELEASE_VERSION \
+    | python3 .github/scripts/build_install_requirements.py \
+    > install/hola-opt-requirements.txt
+  python3 .github/scripts/check_install_docs.py
+  ```
+
+  Until that merge, the documented command keeps installing the previous
+  release.
+- In a clean environment, run the install command from the README and confirm
+  it installs the new version.
+- Publishing to PyPI needs an account controlled by the project's owners and
+  the same artifacts this workflow built; never upload a placeholder. Once the
+  PyPI project is ours, set `PUBLIC_INDEX_IS_AUTHORITATIVE` in
+  `.github/scripts/check_install_docs.py` and update the install command in
+  `README.md`, `docs/getting-started.md`, and `docs/index.md` together.

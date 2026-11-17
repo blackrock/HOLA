@@ -14,11 +14,20 @@ Pre-built wheels are available for Linux, macOS, and Windows
 (Python 3.10+).
 
 ```bash
-pip install hola-opt --extra-index-url https://blackrock.github.io/HOLA/simple/
+pip install --require-hashes -r https://raw.githubusercontent.com/blackrock/HOLA/main/install/hola-opt-requirements.txt
 ```
 
-To build from source instead, see the
-[Getting Started](docs/getting-started.md) guide.
+This installs the latest published build, currently a release candidate.
+The [requirements file](install/hola-opt-requirements.txt) pins the
+version and the SHA-256 digest of every wheel, and resolves `hola-opt`
+from this project's package index only.
+
+`hola-opt` is not published on PyPI. A project with that name on PyPI
+or on any other index is not ours, so install only with the command
+above and never add this project's index to an install with
+`--extra-index-url`. The
+[Getting Started](docs/getting-started.md#installation) guide explains
+why, and covers verifying a download and building from source.
 
 ## Quick Start
 

@@ -11,11 +11,51 @@ We publish pre-built wheels so you do not need a Rust toolchain.
 pip automatically selects the right wheel for your platform.
 
 ```bash
-pip install hola-opt --extra-index-url https://blackrock.github.io/HOLA/simple/
+pip install --require-hashes -r https://raw.githubusercontent.com/blackrock/HOLA/main/install/hola-opt-requirements.txt
 ```
 
 We support Python 3.10+ on Linux (x86_64, aarch64), macOS (Intel,
-Apple Silicon), and Windows (x86_64).
+Apple Silicon), and Windows (x86_64). The command installs the latest
+published build, currently a release candidate. `uv pip install`
+accepts the same arguments.
+
+The
+[requirements file](https://github.com/blackrock/HOLA/blob/main/install/hola-opt-requirements.txt)
+pins the version and lists the SHA-256 digest of every wheel built by
+this repository's release workflow. It also tells pip to resolve
+`hola-opt` from this project's package index only and to accept wheels
+only. pip therefore refuses any file whose digest is not listed, no
+matter which index offers it. `hola-opt` has no runtime dependencies,
+so nothing else is downloaded.
+
+#### `hola-opt` is not on PyPI
+
+`hola-opt` is published from this repository, not on PyPI. Until an
+official PyPI release is announced here, treat any project named
+`hola-opt` on PyPI or on another index as unrelated to HOLA and do not
+install it.
+
+Do not add this project's index to an install with
+`--extra-index-url`, in a command, in `pip.conf`, or through
+`PIP_EXTRA_INDEX_URL`. pip does not prefer one index over another: it
+collects candidates from every configured index and installs the
+highest version it finds. Whoever registers the same name on a public
+index could then have their upload installed in place of ours. Pinning
+an exact version or passing `--pre` does not prevent this, because the
+other index can offer a file for the same version. Only the pinned
+digests do.
+
+#### Verifying a download
+
+Every wheel, source distribution, and CLI archive attached to a
+[GitHub release](https://github.com/blackrock/HOLA/releases) carries
+build provenance. To check a file you downloaded yourself, and then
+install exactly that file:
+
+```bash
+gh attestation verify hola_opt-VERSION-PLATFORM.whl --repo blackrock/HOLA
+pip install ./hola_opt-VERSION-PLATFORM.whl
+```
 
 ### CLI binary
 

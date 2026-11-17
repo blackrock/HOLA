@@ -250,6 +250,12 @@ jobs:
         if: matrix.python-version == '3.12'
         run: python3 .github/scripts/test_build_simple_index.py
 
+      - name: Check install instructions for package-index confusion
+        if: matrix.python-version == '3.12'
+        run: |
+          python3 .github/scripts/test_check_install_docs.py
+          python3 .github/scripts/check_install_docs.py
+
       - name: Test native CLI artifact staging
         if: matrix.python-version == '3.12'
         run: python3 .github/scripts/test_stage_cli_for_tests.py
