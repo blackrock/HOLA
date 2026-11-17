@@ -19,6 +19,34 @@
   13.0.0 in the development and benchmark environments. Pillow 13 requires
   Python 3.11, and no patched 12.x release exists, so Python 3.10 benchmark
   environments stay on Pillow 12.3.0.
+- Security: a server without an auth token now only answers requests whose
+  `Host` names `localhost` or a loopback address, and answers anything else
+  with HTTP 403 `host_forbidden`. A web page could previously reach the default
+  local server through DNS rebinding and read or change the study. Servers with
+  a token accept any host name, as before.
+- The server now bounds slow and numerous clients. A request head must arrive
+  within 120 seconds and idle connections close after the same time, at most
+  1024 connections and 64 event streams are open at once, and ranked reads
+  (`top_k`, `pareto_front`, `trials`, single trial) run four at a time away
+  from the request workers. See the limits table in the REST API reference.
+- `POST /api/checkpoint/save` runs one save at a time (HTTP 409
+  `checkpoint_in_progress` otherwise) and stops at 32 saved files (HTTP 409
+  `checkpoint_quota_exceeded`, configurable with `--max-saved-checkpoints`).
+  The server never deletes a saved checkpoint itself.
+- Checkpoint files are created with mode 0600 and new checkpoint directories
+  with mode 0700 on Linux and macOS. Existing directories keep their
+  permissions. A save that would exceed the 512 MiB the loader accepts now
+  fails instead of writing a checkpoint that cannot be loaded.
+- The server refuses to start when the `--dashboard` directory contains a
+  checkpoint directory, because files under it are served without a token.
+- The `gmm` and `auto` strategies reject spaces with more than 1024 parameters
+  instead of allocating a dense covariance for them.
+- Dashboard: an API token is bound to the server it was entered for and is no
+  longer sent after connecting to a different server. A token in a link must
+  use the URL fragment (`#token=...`); a `?token=` query parameter is ignored
+  and reported, because it has already been sent to the web server. API
+  requests refuse redirects, and response sizes, event-stream records, and
+  request durations are bounded.
 
 ## 1.0.1-rc9
 
