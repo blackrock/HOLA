@@ -618,8 +618,9 @@ Study(strategy=Random(), ...)
 
 You can start a REST server directly from a local `Study`. It binds to
 `127.0.0.1` by default, so clients on the same machine can connect. Set `host`
-and an `auth_token` explicitly for network access, and terminate TLS at a
-trusted reverse proxy when traffic leaves the host.
+and an `auth_token` explicitly for network access. The server speaks plain
+HTTP and has no TLS of its own, so terminate TLS at a trusted reverse proxy
+when traffic leaves the host.
 
 ```python
 study = Study(space=space, objectives=objectives)
@@ -708,6 +709,33 @@ remote = Study.connect(
     request_timeout=60.0,
 )
 ```
+
+The client protects the token and itself from the server it talks to:
+
+- **Token transport.** A token is sent only over `https://`, or over
+  `http://` to a loopback address such as `localhost`. For any other
+  `http://` URL, `Study.connect()` raises `ConfigurationError`, because the
+  token would cross the network unencrypted. On a network where you accept
+  that, pass `allow_insecure_http=True`.
+- **Redirects.** The client never follows an HTTP redirect. A 3xx response
+  raises `RemoteError` naming the target; connect to that final URL instead.
+- **Response size.** Acknowledgements and single-trial responses are limited
+  to 1 MiB and quoted error bodies to 64 KiB. The bulk reads `trials()`,
+  `top_k()`, and `pareto_front()` are limited to `max_response_bytes`, which
+  defaults to 268,435,456 bytes (256 MiB). A larger response raises
+  `RemoteError`; raise the limit for a study whose listing is larger.
+- **Server text.** Error details and post-commit warnings from the server
+  have control characters escaped and are truncated before they appear in an
+  exception or warning.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `url` | `str` | required | Base URL of the server; an `http` or `https` URL without query, fragment, or userinfo |
+| `token` | `str` or `None` | `None` | Bearer token sent with every request |
+| `connect_timeout` | `float` | `10.0` | Keyword-only seconds allowed to establish a connection |
+| `request_timeout` | `float` | `30.0` | Keyword-only seconds allowed for a whole request |
+| `allow_insecure_http` | `bool` | `False` | Keyword-only opt-in to send `token` to a non-loopback `http://` URL |
+| `max_response_bytes` | `int` | `268435456` | Keyword-only byte limit for `trials()`, `top_k()`, and `pareto_front()` responses |
 
 Switching from local to distributed is mostly **replacing**
 `Study(...)` **with** `Study.connect("http://...")` (you no

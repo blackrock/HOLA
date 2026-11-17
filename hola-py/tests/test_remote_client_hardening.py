@@ -489,3 +489,247 @@ def test_many_studies_share_one_bounded_runtime_worker_pool():
     del studies, first
     gc.collect()
     assert runtime_worker_count() == before  # process-owned pool, no per-Study leak
+
+
+# ── Bearer token transport ──────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://machine-a:8000",
+        "http://192.168.1.20:8000",
+        "http://[2001:db8::1]:8000",
+        "http://localhost.example.com/prefix",
+    ],
+)
+def test_token_is_refused_over_plain_http_to_a_non_loopback_server(url):
+    with pytest.raises(ConfigurationError, match="unencrypted HTTP") as refused:
+        Study.connect(url, token="test-secret")
+    message = str(refused.value)
+    assert "allow_insecure_http=True" in message
+    assert "https://" in message
+    assert "test-secret" not in message
+
+    # The explicit opt-in sends it; without a token there is nothing to protect.
+    assert isinstance(Study.connect(url, token="test-secret", allow_insecure_http=True), Study)
+    assert isinstance(Study.connect(url), Study)
+    assert isinstance(Study.connect(url, token=""), Study)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://127.9.9.9:8000",
+        "http://[::1]:8000",
+        "https://machine-a:8443",
+        "https://hola.example.com/prefix",
+    ],
+)
+def test_token_is_allowed_over_loopback_http_and_any_https(url):
+    assert isinstance(Study.connect(url, token="test-secret"), Study)
+
+
+# ── Redirects ───────────────────────────────────────────────────────────────
+
+
+class _AnyMethodHandler(_JsonHandler):
+    def reply(self):
+        raise NotImplementedError
+
+    def handle_any(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.reply()
+
+    do_GET = handle_any  # noqa: N815 - stdlib handler API
+    do_POST = handle_any  # noqa: N815 - stdlib handler API
+    do_PATCH = handle_any  # noqa: N815 - stdlib handler API
+
+
+class _RedirectHandler(_AnyMethodHandler):
+    status = 307
+    location = ""
+
+    def reply(self):
+        self.send_response(type(self).status)
+        self.send_header("Location", type(self).location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+class _RedirectTargetHandler(_AnyMethodHandler):
+    seen = []
+
+    def reply(self):
+        type(self).seen.append((self.command, self.path, self.headers.get("Authorization")))
+        # A plausible answer to every call, so a followed redirect would succeed.
+        self.send_json(
+            200,
+            {
+                "status": "ok",
+                "trial_id": 7,
+                "params": {"x": 0.5},
+                "trial": _COMPLETED_TRIAL,
+                "trial_count": 1,
+                "rescalarized_trials": 1,
+                "lease_expires_at_ms": 1_900_000_000_000,
+            },
+        )
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_redirects_are_reported_and_never_followed(status):
+    _RedirectTargetHandler.seen = []
+    _RedirectHandler.status = status
+    with (
+        _running_http_server(_RedirectTargetHandler) as target,
+        _running_http_server(_RedirectHandler) as url,
+    ):
+        _RedirectHandler.location = f"{target}/api/ask"
+        remote = Study.connect(url, token="test-secret")
+        calls = [
+            remote.ask,
+            lambda: remote.tell(7, {"loss": 0.25}),
+            lambda: remote.cancel(7),
+            lambda: remote.heartbeat(7),
+            lambda: remote.update_objectives([Minimize("loss")]),
+            remote.trial_count,
+            lambda: remote.top_k(1),
+            remote.trials,
+            lambda: remote.run(lambda params: {"loss": 0.0}, n_trials=1),
+        ]
+        for call in calls:
+            with pytest.raises(RemoteError, match="does not follow redirects") as redirected:
+                call()
+            assert f"HTTP {status}" in str(redirected.value)
+            assert f"{target}/api/ask" in str(redirected.value)
+
+    assert _RedirectTargetHandler.seen == [], "a redirect target received a request"
+
+
+# ── Bounded response bodies ─────────────────────────────────────────────────
+
+
+class _FixedBodyHandler(_AnyMethodHandler):
+    status = 200
+    body = b""
+    declare_length = True
+
+    def reply(self):
+        self.send_response(type(self).status)
+        self.send_header("Content-Type", "application/json")
+        if type(self).declare_length:
+            self.send_header("Content-Length", str(len(type(self).body)))
+        self.end_headers()
+        # The client stops reading an oversized body and closes the socket.
+        with suppress(BrokenPipeError, ConnectionResetError):
+            self.wfile.write(type(self).body)
+
+
+@contextmanager
+def _fixed_body_server(body, *, status=200, declare_length=True):
+    _FixedBodyHandler.status = status
+    _FixedBodyHandler.body = body if isinstance(body, bytes) else json.dumps(body).encode()
+    _FixedBodyHandler.declare_length = declare_length
+    with _running_http_server(_FixedBodyHandler) as url:
+        yield url
+
+
+@pytest.mark.parametrize("declare_length", [True, False])
+def test_oversized_acknowledgements_are_rejected_before_and_while_reading(declare_length):
+    oversized = {"trial_id": 1, "params": {"x": 0.5}, "padding": "x" * (1 << 20)}
+    with _fixed_body_server(oversized, declare_length=declare_length) as url:
+        remote = Study.connect(url)
+        for call in (remote.ask, remote.trial_count, lambda: remote.cancel(1)):
+            with pytest.raises(RemoteError, match="exceeds the 1048576-byte limit"):
+                call()
+
+
+@pytest.mark.parametrize("declare_length", [True, False])
+def test_bulk_read_limit_is_configurable(declare_length):
+    trials = [{**_COMPLETED_TRIAL, "trial_id": index} for index in range(100)]
+    assert len(json.dumps(trials)) > 4096
+    with _fixed_body_server(trials, declare_length=declare_length) as url:
+        assert len(Study.connect(url).trials()) == 100
+
+        limited = Study.connect(url, max_response_bytes=4096)
+        for call in (limited.trials, lambda: limited.top_k(100), limited.pareto_front):
+            with pytest.raises(RemoteError, match="exceeds the 4096-byte limit"):
+                call()
+
+
+def test_bulk_read_limit_must_be_positive():
+    with pytest.raises(ConfigurationError, match="max_response_bytes"):
+        Study.connect("http://127.0.0.1:8000", max_response_bytes=0)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"E" * (1 << 20),
+        json.dumps({"error": "E" * 50_000}).encode(),
+        json.dumps({"error": "E" * 500_000}).encode(),
+    ],
+    ids=["raw-1MiB", "json-detail-50k", "json-body-500k"],
+)
+def test_oversized_error_bodies_are_cut_instead_of_buffered(body):
+    with (
+        _fixed_body_server(body, status=503, declare_length=False) as url,
+        pytest.raises(RemoteError, match="HTTP 503 Service Unavailable") as failed,
+    ):
+        Study.connect(url).top_k(1)
+    message = str(failed.value)
+    assert len(message) < 4096 + 256
+    assert message.endswith("...")
+
+
+# ── Server-controlled text ──────────────────────────────────────────────────
+
+
+def _has_terminal_controls(text):
+    return any(ord(char) < 0x20 or 0x7F <= ord(char) < 0xA0 or char in "  ‮⁦" for char in text)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": "denied\x1b[2J\r\nTrial 7 completed ‮successfully\x9b31m"},
+        b"denied\x1b[2J\r\nTrial 7 completed \xe2\x80\xaesuccessfully\xc2\x9b31m",
+    ],
+    ids=["json-error-field", "raw-body"],
+)
+def test_server_error_text_cannot_inject_terminal_controls(body):
+    with (
+        _fixed_body_server(body, status=503) as url,
+        pytest.raises(RemoteError) as failed,
+    ):
+        Study.connect(url).top_k(1)
+    message = str(failed.value)
+    assert not _has_terminal_controls(message), repr(message)
+    assert "denied\\u{001b}[2J\\r\\nTrial 7 completed \\u{202e}successfully\\u{009b}31m" in message
+
+
+def test_post_commit_warnings_are_neutralized_and_bounded():
+    _TellWarningsHandler.payload = {
+        "status": "ok",
+        "trial": _COMPLETED_TRIAL,
+        "post_commit_warnings": [
+            "refit failed\r\n\x1b[1mCompleted trial 9",
+            "w" * 5000,
+            *["another"] * 38,
+        ],
+    }
+    with _running_http_server(_TellWarningsHandler) as url:
+        remote = Study.connect(url)
+        with pytest.warns(RuntimeWarning) as emitted:
+            completed = remote.tell(7, {"loss": 0.25})
+
+    assert completed.trial_id == 7
+    messages = [str(item.message) for item in emitted]
+    assert len(messages) == 17
+    assert messages[0] == "refit failed\\r\\n\\u{001b}[1mCompleted trial 9"
+    assert messages[1] == "w" * 512 + "..."
+    assert messages[-1] == "24 further post-commit warnings were not shown"
+    assert not any(_has_terminal_controls(message) for message in messages)

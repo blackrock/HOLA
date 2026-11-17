@@ -23,16 +23,26 @@ The port is configurable via `hola serve --port <PORT>`.
 ## Authentication
 
 By default, a local HOLA server does not require authentication.
-When the server is started with `--auth-token <TOKEN>`, all API
-endpoints require this header:
+When the server is started with an API token (the `HOLA_API_TOKEN`
+environment variable or `--auth-token-file`), all API endpoints require
+this header:
 
 ```http
 Authorization: Bearer <TOKEN>
 ```
 
-Operators may configure a separate `--read-token` for dashboards and
+Operators may configure a separate read-only token (`HOLA_READ_TOKEN` or
+`--read-token-file`) for dashboards and
 monitoring. That role can use GET endpoints, SSE, and metrics, but receives HTTP
 401 from ask, tell, cancel, heartbeat, objective updates, and checkpoint saves.
+
+The server speaks plain HTTP. A bearer token sent to it from another machine
+is readable on the network unless a TLS-terminating reverse proxy sits in
+front of it, so the `hola worker` and `Study.connect()` clients refuse to
+send a token to a non-loopback `http://` URL without an explicit override.
+They also do not follow redirects: the HOLA API does not use them, so a 3xx
+response is reported as an error. See
+[Multi-Machine Setup](cli-guide.md#multi-machine-setup).
 
 This includes mutation endpoints, read-only endpoints, and the
 `GET /api/events` SSE stream. Operators can deliberately leave reads

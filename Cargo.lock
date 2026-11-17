@@ -580,6 +580,7 @@ dependencies = [
  "clap",
  "command-group",
  "hola",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

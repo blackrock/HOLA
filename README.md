@@ -87,6 +87,12 @@ parameters from `HOLA_PARAMS` and calls `POST /api/tell` on the
 server to report results. See the [CLI guide](docs/cli-guide.md)
 for details.
 
+The server speaks plain HTTP. To run workers on other machines, protect it
+with an API token and put a TLS-terminating proxy in front of it; workers
+and Python clients refuse to send a token over unencrypted HTTP to another
+host unless you opt in. See
+[Multi-Machine Setup](docs/cli-guide.md#multi-machine-setup).
+
 From Python, `Study.connect()` speaks the same REST protocol without
 the CLI.
 

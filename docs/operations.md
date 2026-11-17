@@ -7,7 +7,9 @@ operator explicitly enables unauthenticated reads.
 
 ## Start securely
 
-Keep the token outside shell history and configuration files:
+Keep the tokens outside shell history, configuration files, and the process
+command line. The server reads the write token from `HOLA_API_TOKEN` and the
+read-only token from `HOLA_READ_TOKEN`:
 
 ```bash
 export HOLA_API_TOKEN="$(openssl rand -hex 32)"
@@ -16,14 +18,24 @@ hola serve study.yaml \
   --host 0.0.0.0 \
   --port 8000 \
   --checkpoint-dir ./checkpoints \
-  --auth-token "$HOLA_API_TOKEN" \
-  --read-token "$HOLA_READ_TOKEN" \
   --cors-origin https://optimizer.example.com
 ```
 
-Terminate TLS at a trusted reverse proxy when traffic leaves the host. Do not
-use `--allow-unauthenticated-reads` when parameters, metrics, or study progress
-are sensitive.
+Do not pass a token as the value of `--auth-token`, `--read-token`, or a
+worker's `--token`: a flag value is visible to every local user in the
+process list for as long as the process runs. Where environment variables
+are unsuitable, store each token in a file readable only by the service
+account and use `--auth-token-file`, `--read-token-file`, and the worker's
+`--token-file`.
+
+The server speaks plain HTTP and has no TLS of its own. Terminate TLS at a
+trusted reverse proxy whenever traffic leaves the host, and give workers and
+Python clients the proxy's `https://` URL. They refuse to send a token to a
+non-loopback `http://` address unless started with `--allow-insecure-http`
+(`allow_insecure_http=True` in Python), which is appropriate only on a network
+where the token may be read in transit. They also never follow redirects, so
+configure the final URL. Do not use `--allow-unauthenticated-reads` when
+parameters, metrics, or study progress are sensitive.
 
 A server started without a token binds to loopback and only answers requests
 whose `Host` header names `localhost` or a loopback IP address. Other host
@@ -84,7 +96,10 @@ Use `hola worker --mode exec` when possible. It validates command output and
 persists a successful result to its server-scoped outbox before sending it.
 After a crash or uncertain network response, restart with the same
 `--outbox-dir`; queued tells are replayed before new work is requested. Exact
-duplicate tells are accepted, while conflicting metrics are rejected.
+duplicate tells are accepted, while conflicting metrics are rejected. Queued
+tells are sent with the worker's token, so on Unix the worker requires the
+outbox to be a real directory (not a symbolic link) owned by its own user or
+by root and not writable by anyone else, and refuses to start otherwise.
 
 Workers reuse an `Idempotency-Key` while retrying an uncertain ask, so a lost
 response does not allocate another trial. Ask keys and lease deadlines are

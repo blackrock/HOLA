@@ -291,6 +291,8 @@ class Study:
         *,
         connect_timeout: float = 10.0,
         request_timeout: float = 30.0,
+        allow_insecure_http: bool = False,
+        max_response_bytes: int = 268_435_456,
     ) -> Study:
         """Connect to an existing HOLA server.
 
@@ -301,9 +303,21 @@ class Study:
         finite numbers representing at least one nanosecond and no more than
         3,153,600,000 seconds (100 years of 365 days).
 
+        A token is sent only over ``https://`` or to a loopback ``http://``
+        address. The HOLA server does not speak TLS, so a token sent to any
+        other ``http://`` URL would cross the network unencrypted; pass
+        ``allow_insecure_http=True`` to accept that on a network you trust.
+
+        The client never follows HTTP redirects: a 3xx response raises
+        ``RemoteError``. Responses are size-limited. ``max_response_bytes``
+        bounds the bulk reads (``trials``, ``top_k``, ``pareto_front``);
+        acknowledgements and single-trial responses are limited to 1 MiB.
+
         Raises:
             ConfigurationError: If ``url`` is malformed or does not use the ``http`` or
-                ``https`` scheme, or if either timeout is invalid.
+                ``https`` scheme, if either timeout is invalid, if
+                ``max_response_bytes`` is zero, or if ``token`` would be sent
+                over unencrypted HTTP without ``allow_insecure_http=True``.
         """
         ...
     @staticmethod
